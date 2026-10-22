@@ -12,10 +12,17 @@ import (
 // and re-read whenever the file changes; later the master pushes the same
 // structure over its control connection.
 type Config struct {
+	// Rev is set by the master; a node reports the rev it runs.
+	Rev       int64            `json:"rev,omitempty"`
 	Route     RouteConfig      `json:"route"`
 	Outbounds []OutboundConfig `json:"outbounds,omitempty"`
 	Inbounds  []InboundConfig  `json:"inbounds"`
 	Users     []UserConfig     `json:"users"`
+	// Probes are TCPing targets (China Telecom / Unicom / Mobile) reported
+	// with latency, jitter and loss.
+	Probes []ProbeTarget `json:"probes,omitempty"`
+	// ProbeInterval is the time between probe rounds; default 30s.
+	ProbeInterval Duration `json:"probe_interval,omitempty"`
 }
 
 // RouteConfig picks an outbound for each connection: the first rule whose
@@ -109,19 +116,35 @@ func (c InboundConfig) equal(other InboundConfig) bool {
 	return bytes.Equal(a, b)
 }
 
-func loadConfig(path string) (*Config, error) {
+// loadConfig reads a config file. strict rejects unknown fields, which
+// catches typos in hand-written files; a master's cached config may carry
+// fields from a newer master and is loaded with strict false.
+func loadConfig(path string, strict bool) (*Config, error) {
 	content, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
+	config, err := parseConfig(content, strict)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return config, nil
+}
+
+// parseConfig decodes and validates a config. strict rejects unknown fields
+// (to catch typos in hand-written files); configs from the master are read
+// leniently so a newer master can add fields older nodes ignore.
+func parseConfig(content []byte, strict bool) (*Config, error) {
 	var config Config
 	decoder := json.NewDecoder(bytes.NewReader(content))
-	decoder.DisallowUnknownFields()
-	if err = decoder.Decode(&config); err != nil {
-		return nil, fmt.Errorf("parse %s: %w", path, err)
+	if strict {
+		decoder.DisallowUnknownFields()
 	}
-	if err = config.validate(); err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
+	if err := decoder.Decode(&config); err != nil {
+		return nil, fmt.Errorf("parse: %w", err)
+	}
+	if err := config.validate(); err != nil {
+		return nil, err
 	}
 	return &config, nil
 }

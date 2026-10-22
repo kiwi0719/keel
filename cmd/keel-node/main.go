@@ -11,11 +11,17 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"flag"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -29,22 +35,54 @@ const (
 )
 
 func main() {
-	configPath := flag.String("c", "/etc/keel/node.json", "config file, reloaded when it changes")
+	configPath := flag.String("c", "/etc/keel/node.json", "config file, reloaded when it changes; with -master it caches the master's config")
 	statePath := flag.String("state", "/var/lib/keel/usage.json", "where per-user traffic counters are kept across restarts")
+	master := flag.String("master", "", "master address, e.g. https://panel.example.com:8443; the node connects out to it")
+	token := flag.String("token", "", "this node's token on the master (or env KEEL_TOKEN)")
+	fingerprint := flag.String("fingerprint", "", "hex SHA-256 of the master's certificate; when set it replaces CA verification")
 	flag.BoolVar(&verbose, "v", false, "log every connection")
 	flag.Parse()
-	log.Print("keel-node protocols: ", builtProtocols())
+	log.Print("keel-node ", version, " protocols: ", builtProtocols())
 
-	n := &node{users: newRegistry(*statePath), running: make(map[string]*runningInbound)}
+	n := &node{users: newRegistry(*statePath), running: make(map[string]*runningInbound), prober: newProber()}
 	n.handler = &handler{users: n.users}
-	config, err := loadConfig(*configPath)
-	if err != nil {
+	config, err := loadConfig(*configPath, *master == "")
+	n.strict = *master == ""
+	switch {
+	case err == nil:
+	case *master != "" && errors.Is(err, os.ErrNotExist):
+		log.Print("no cached config yet, waiting for the master")
+		config = &Config{}
+	default:
 		log.Fatal(err)
 	}
 	if err = n.reload(config); err != nil {
 		log.Fatal(err)
 	}
 	configStat, _ := os.Stat(*configPath)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go n.prober.run(ctx)
+	masterConfigs := make(chan masterConfig)
+	if *master != "" {
+		if *token == "" {
+			*token = os.Getenv("KEEL_TOKEN")
+		}
+		wsURL, err := masterWebSocketURL(*master)
+		if err != nil {
+			log.Fatal(err)
+		}
+		pin, err := parseFingerprint(*fingerprint)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if *token == "" {
+			log.Fatal("-master needs -token or KEEL_TOKEN")
+		}
+		client := &masterClient{url: wsURL, token: *token, pin: pin, node: n, configs: masterConfigs}
+		go client.run(ctx)
+	}
 
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGUSR1)
@@ -66,6 +104,12 @@ func main() {
 			}
 			n.shutdown()
 			return
+		case mc := <-masterConfigs:
+			err := n.applyMaster(mc.content, mc.rev, *configPath)
+			if stat, statErr := os.Stat(*configPath); statErr == nil {
+				configStat = stat // our own write must not trigger a reload
+			}
+			mc.result <- err
 		case <-configTicker.C:
 			stat, err := os.Stat(*configPath)
 			if err != nil || (configStat != nil && stat.ModTime().Equal(configStat.ModTime()) && stat.Size() == configStat.Size()) {
@@ -90,11 +134,78 @@ func main() {
 	}
 }
 
+// applyMaster applies a config pushed by the master and caches it at path,
+// so the node comes back with it after a restart even if the master is down.
+func (n *node) applyMaster(content []byte, rev int64, path string) error {
+	config, err := parseConfig(content, false)
+	if err != nil {
+		return err
+	}
+	if rev != 0 && config.Rev != rev {
+		// The message's rev wins; keep it in the cached copy so the node
+		// reports it again after a restart.
+		config.Rev = rev
+		var fields map[string]json.RawMessage
+		if json.Unmarshal(content, &fields) == nil {
+			fields["rev"], _ = json.Marshal(rev)
+			if updated, err := json.Marshal(fields); err == nil {
+				content = updated
+			}
+		}
+	}
+	if err = n.reload(config); err != nil {
+		return err
+	}
+	if err = writeFileAtomic(path, content, 0o600); err != nil {
+		log.Print("cache config: ", err)
+	}
+	log.Print("applied config rev ", config.Rev, " from master")
+	if problems := n.problems(); len(problems) > 0 {
+		return errors.New(strings.Join(problems, "; "))
+	}
+	return nil
+}
+
+func writeFileAtomic(path string, content []byte, perm os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, content, perm); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
 type node struct {
+	strict  bool // config file is hand-written, not a master's cache
 	mu      sync.Mutex
 	running map[string]*runningInbound
+	failed  map[string]string // inbounds of the current config that did not start
 	users   *registry
 	handler *handler
+	prober  *prober
+	config  atomic.Pointer[Config]
+}
+
+// rev is the master revision of the running config (0 for a local file).
+func (n *node) rev() int64 {
+	if c := n.config.Load(); c != nil {
+		return c.Rev
+	}
+	return 0
+}
+
+// problems lists inbounds of the current config that failed to start.
+func (n *node) problems() []string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	var list []string
+	for key, err := range n.failed {
+		list = append(list, key+": "+err)
+	}
+	sort.Strings(list)
+	return list
 }
 
 type runningInbound struct {
@@ -103,7 +214,7 @@ type runningInbound struct {
 }
 
 func (n *node) reloadFile(path string) {
-	config, err := loadConfig(path)
+	config, err := loadConfig(path, n.strict)
 	if err != nil {
 		log.Print("reload: ", err, " (keeping current config)")
 		return
@@ -126,6 +237,9 @@ func (n *node) reload(config *Config) error {
 		return err
 	}
 	currentRouter.Store(r)
+	n.config.Store(config)
+	n.prober.setTargets(config.Probes, config.Route.IPv4Only, time.Duration(config.ProbeInterval))
+	n.failed = make(map[string]string)
 	n.users.apply(config.Users)
 	active := n.users.active()
 
@@ -151,6 +265,7 @@ func (n *node) reload(config *Config) error {
 		in, err := protocols[c.Type](c, n.handler)
 		if err != nil {
 			log.Print(key, ": ", err)
+			n.failed[key] = err.Error()
 			continue
 		}
 		if err = in.updateUsers(active); err != nil {
