@@ -807,10 +807,6 @@ function settingsDrawer() {
       </div>
       <p class="small muted" style="margin:0">填了 Token（权限：Zone → DNS → Edit）就用 DNS 验证，不用开端口，NAT 机也能签。所有节点共用，只存在主控里，不会再显示出来。${st.cf_token_tail ? '<button type="button" class="text-btn" data-act="cf-clear">清除 Token</button>' : ''}</p>
       </section>
-      <section class="sec"><h3>订阅分流</h3>
-        <label class="field">额外走「流媒体」的域名<textarea name="sub_media" rows="3" placeholder="emby.example.com（一行一个，含子域名）">${esc(st.sub_media || '')}</textarea></label>
-        <p class="small muted" style="margin:0">订阅里流媒体、AI 各有一个可选的组，国内和局域网直连，其他走 PROXY。自建 Emby 之类的域名填在这里。</p>
-      </section>
       <section class="sec"><h3>登录</h3><div class="fields two">
         ${field('用户名', 'username', st.username, { full: true })}
         ${field('当前密码', 'current_password', '', { type: 'password' })}
@@ -1072,7 +1068,6 @@ const actions = {
       probe_targets: st.probe_targets.map(t => ({ name: t.name, label: t.label, host: (f['probe_' + t.name] || '').trim() }))
     };
     body.acme_email = (f.acme_email || '').trim();
-    body.sub_media = f.sub_media || '';
     if (f.cf_token) body.cf_token = f.cf_token.trim();
     body.username = f.username.trim(); body.current_password = f.current_password;
     if (f.password) body.password = f.password;

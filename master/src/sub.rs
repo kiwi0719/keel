@@ -96,8 +96,6 @@ fn proxies(user: &User, entries: &[&Node], trusted: &[i64]) -> Vec<Proxy> {
 /// What every format renders.
 struct Plan {
     proxies: Vec<Proxy>,
-    /// Extra domain suffixes for 流媒体 (a self-hosted Emby, say).
-    media: Vec<String>,
     /// This subscription's own URL, for Surge's managed profile.
     url: String,
 }
@@ -199,9 +197,6 @@ fn clash(plan: &Plan, stash: bool) -> String {
         }
     }
     y.push_str("rules:\n");
-    for d in &plan.media {
-        let _ = writeln!(y, "  - {}", q(&format!("DOMAIN-SUFFIX,{d},{MEDIA}")));
-    }
     let _ = write!(y, "  - RULE-SET,GlobalMedia,{MEDIA}\n  - RULE-SET,YouTube,{MEDIA}\n  - RULE-SET,AI,{AI}\n");
     for c in PRIVATE_V4 {
         let _ = writeln!(y, "  - IP-CIDR,{c},DIRECT,no-resolve");
@@ -256,9 +251,6 @@ fn singbox(plan: &Plan) -> String {
         json!({"protocol": "dns", "action": "hijack-dns"}),
         json!({"ip_is_private": true, "outbound": "direct"}),
     ];
-    if !plan.media.is_empty() {
-        rules.push(json!({"domain_suffix": plan.media, "outbound": MEDIA}));
-    }
     rules.push(json!({"rule_set": ["youtube", "media"], "outbound": MEDIA}));
     rules.push(json!({"rule_set": ["ai"], "outbound": AI}));
     rules.push(json!({"rule_set": ["cn", "cn-ip"], "outbound": "direct"}));
@@ -327,9 +319,6 @@ fn surge(plan: &Plan) -> String {
     }
     let all = if names.is_empty() { "DIRECT".to_string() } else { names.join(", ") };
     let _ = write!(s, "\n[Proxy Group]\n{PROXY} = select, {all}\n{MEDIA} = select, {PROXY}, {all}\n{AI} = select, {PROXY}, {all}\n\n[Rule]\n");
-    for d in &plan.media {
-        let _ = writeln!(s, "DOMAIN-SUFFIX,{d},{MEDIA}");
-    }
     let _ = writeln!(s, "RULE-SET,{BM}/Surge/GlobalMedia/GlobalMedia_All_No_Resolve.list,{MEDIA}");
     let _ = writeln!(s, "RULE-SET,{BM}/Surge/YouTube/YouTube.list,{MEDIA}");
     for set in ["OpenAI", "Claude", "Gemini", "Copilot"] {
@@ -405,14 +394,6 @@ impl Format {
     }
 }
 
-/// Extra 流媒体 domains from settings: one per line or comma separated.
-pub fn media_domains(raw: &str) -> Vec<String> {
-    raw.split([',', '\n', ' '])
-        .map(|d| d.trim().trim_start_matches("*.").trim_start_matches('.').to_lowercase())
-        .filter(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-'))
-        .collect()
-}
-
 #[derive(Deserialize)]
 pub struct SubQuery {
     format: Option<String>,
@@ -431,7 +412,6 @@ pub async fn subscription(
     let Ok(world) = db::load_world(&conn) else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
-    let media = media_domains(&db::get_setting(&conn, "sub_media").ok().flatten().unwrap_or_default());
     drop(conn);
     let allowed = world.user_entries.get(&user.id).cloned().unwrap_or_default();
     let entries: Vec<&Node> = world.nodes.iter().filter(|n| n.is_entry() && allowed.contains(&n.id)).collect();
@@ -452,7 +432,7 @@ pub async fn subscription(
 
     let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("").to_lowercase();
     let format = query.format.as_deref().and_then(Format::parse).unwrap_or_else(|| Format::from_agent(&ua));
-    let plan = Plan { proxies: list, media, url: format!("{}/s/{token}?format=surge", api::base_url(&app, &headers)) };
+    let plan = Plan { proxies: list, url: format!("{}/s/{token}?format=surge", api::base_url(&app, &headers)) };
 
     let used = nodecfg::user_used(&world, &user, now());
     let mut info = format!("upload=0; download={used}; total={}", user.quota_bytes);
@@ -508,7 +488,6 @@ mod tests {
                     port: 8443,
                 },
             ],
-            media: media_domains("emby.example.com, *.jellyfin.example.org"),
             url: "https://panel.example.com/s/t?format=surge".into(),
         }
     }
@@ -529,12 +508,11 @@ mod tests {
         let s = surge(&plan());
         assert!(s.contains("东京 · AnyTLS = anytls, a.example.com, 443"));
         assert!(!s.contains("Reality"));
-        assert!(s.contains("DOMAIN-SUFFIX,jellyfin.example.org,流媒体"));
     }
 
     #[test]
     fn empty_groups_fall_back_to_direct() {
-        let p = Plan { proxies: Vec::new(), media: Vec::new(), url: String::new() };
+        let p = Plan { proxies: Vec::new(), url: String::new() };
         assert!(clash(&p, false).contains("proxies: [DIRECT]"));
         assert!(surge(&p).contains("PROXY = select, DIRECT"));
         assert!(singbox(&p).contains("\"direct\""));
