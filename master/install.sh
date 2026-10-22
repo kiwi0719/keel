@@ -106,3 +106,18 @@ else
 	exit 1
 fi
 echo "keel-node installed; it should show up as online in the panel within a few seconds."
+# Ports to open or map at the provider (NAT boxes: public -> listen).
+if [ -n "$PIN" ]; then
+	PORTS=$(curl -fsSk --pinnedpubkey "sha256//$PIN" -H "Authorization: Bearer $TOKEN" "$MASTER/api/node/ports" 2>/dev/null || true)
+else
+	PORTS=$(curl -fsS -H "Authorization: Bearer $TOKEN" "$MASTER/api/node/ports" 2>/dev/null || true)
+fi
+if [ -n "$PORTS" ]; then
+	echo
+	echo "ports (open TCP+UDP; on a NAT box map public -> listen):"
+	echo "$PORTS" | while read -r what listen public; do
+		if [ "$listen" = "$public" ]; then printf '  %-24s %s\n' "$what" "$listen"
+		else printf '  %-24s listen %s, public %s\n' "$what" "$listen" "$public"; fi
+	done
+	echo "change them in the panel; the node picks up new ports by itself."
+fi
