@@ -152,6 +152,32 @@ async fn install_script() -> Response {
     static_file(INSTALL_SH, "text/x-shellscript; charset=utf-8")
 }
 
+/// What a node listens on, for install.sh to print: one line per port,
+/// "<what> <listen port> <public port>". Authenticated by the node token.
+async fn node_ports(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    let token = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("").trim();
+    let node = if token.is_empty() { None } else { db::node_by_token(&app.db(), token).ok().flatten() };
+    let Some(n) = node else {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        return (StatusCode::UNAUTHORIZED, "bad token\n").into_response();
+    };
+    let mut out = String::new();
+    let pick = |p: i64, pub_: i64| if pub_ > 0 { pub_ } else { p };
+    if n.is_entry() {
+        if n.anytls_on && n.anytls_port > 0 {
+            out.push_str(&format!("AnyTLS {} {}\n", n.anytls_port, pick(n.anytls_port, n.anytls_pub)));
+        }
+        if n.vless_on && n.vless_port > 0 {
+            out.push_str(&format!("VLESS-Reality {} {}\n", n.vless_port, pick(n.vless_port, n.vless_pub)));
+        }
+    } else if let Ok(w) = db::load_world(&app.db()) {
+        for e in w.exits.iter().filter(|e| e.node_id == n.id) {
+            out.push_str(&format!("SS-2022({}) {} {}\n", e.name.replace(' ', "_"), e.port, e.public_port()));
+        }
+    }
+    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], out).into_response()
+}
+
 /// Node binaries placed in DIR/dist, e.g. keel-node-linux-amd64.
 async fn download(State(app): State<Arc<App>>, UrlPath(name): UrlPath<String>) -> Response {
     let valid = name.starts_with("keel-node-") && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_');
@@ -210,6 +236,7 @@ fn router(app: Arc<App>) -> Router {
             axum::Json(serde_json::json!({"logged_in": api::logged_in(&app, &h)}))
         }))
         .route("/api/node/ws", get(ws::handler))
+        .route("/api/node/ports", get(node_ports))
         .merge(private)
         .layer(axum::middleware::from_fn(security_headers))
         .with_state(app)
