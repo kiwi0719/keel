@@ -164,7 +164,7 @@ function render() {
         ${tab('lines', '线路', shape({ color: C.red, shape: 'square' }, 10))}
         ${tab('users', '用户', shape({ color: C.yellow, shape: 'tri' }, 10))}
       </nav>
-      <button class="icon-btn" data-act="settings" aria-label="设置" title="设置"><svg width="20" height="20" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="3" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M10 1.5v3M10 15.5v3M1.5 10h3M15.5 10h3M4 4l2.1 2.1M13.9 13.9L16 16M4 16l2.1-2.1M13.9 6.1L16 4" stroke="currentColor" stroke-width="1.4"/></svg></button>
+      <button class="icon-btn" data-act="settings" aria-label="设置" title="设置"><svg width="20" height="20" viewBox="0 0 20 20" aria-hidden="true"><path d="M2 5h16M2 10h16M2 15h16" stroke="currentColor" stroke-width="1.4"/><rect x="5" y="3" width="4" height="4" fill="var(--ground)" stroke="currentColor" stroke-width="1.4"/><rect x="11" y="8" width="4" height="4" fill="var(--ground)" stroke="currentColor" stroke-width="1.4"/><rect x="7" y="13" width="4" height="4" fill="var(--ground)" stroke="currentColor" stroke-width="1.4"/></svg></button>
     </header>
     <main>${t === 'probe' ? probePage() : t === 'lines' ? linesPage() : usersPage()}</main>`;
   // The drawer is left alone here so typing in it survives the 2 s refresh.
@@ -658,14 +658,12 @@ function userDrawer(d) {
 function settingsDrawer() {
   const st = S.data.settings;
   const tz = st.tz_offset / 60;
-  const tzOpts = [];
-  for (let h = -12; h <= 14; h++) tzOpts.push(`<option value="${h * 60}" ${h === tz ? 'selected' : ''}>UTC${h >= 0 ? '+' : ''}${h}</option>`);
   const targets = st.probe_targets.map(t => field(`${esc(t.label)}（IP:端口）`, `probe_${t.name}`, t.host, { full: true, placeholder: 'sh-' + t.name + '-v4.ip.zstaticcdn.com:80' })).join('');
   return {
     title: '设置', mark: shape({ color: C.ink, shape: 'circle' }, 16),
     body: `<section class="sec"><div class="fields two">
         ${field('面板地址（订阅和节点安装用）', 'panel_url', st.panel_url, { full: true, placeholder: st.base_url })}
-        <label class="field">时区（重置日按它算）<select name="tz_offset">${tzOpts.join('')}</select></label>
+        <div class="field">时区（重置日按它算）<div class="stepper"><button type="button" data-act="tz-step" data-d="-1" aria-label="减一小时">−</button><output id="tz-label">${tzLabel(tz)}</output><button type="button" data-act="tz-step" data-d="1" aria-label="加一小时">+</button></div><input type="hidden" name="tz_offset" value="${tz * 60}"></div>
       </div></section>
       <section class="sec"><h3>三网测速目标</h3><div class="fields">${targets}</div>
         <p class="small muted" style="margin:0">默认是上海三网（Zstatic 公开的 TCPing 节点，地址由对方自动更新）。换省份就把 sh 改成对应代号。节点每 30 秒对每个目标 TCP 连 10 次，算延迟、波动和重传。留空就不测。</p></section>
@@ -679,6 +677,8 @@ function settingsDrawer() {
       <button class="btn" data-act="logout">退出登录</button>`
   };
 }
+
+function tzLabel(h) { return 'UTC' + (h >= 0 ? '+' : '') + h; }
 
 function form() {
   const f = document.getElementById('drawer-form');
@@ -709,6 +709,12 @@ function keepUserDraft() {
 const actions = {
   tab(el) { S.tab = el.dataset.tab; save('tab', S.tab); S.toast = ''; render(); window.scrollTo(0, 0); },
   settings() { openDrawer({ kind: 'settings' }); },
+  'tz-step'(el) {
+    const inp = document.querySelector('#drawer-form [name="tz_offset"]');
+    const h = Math.max(-12, Math.min(14, Math.round(+inp.value / 60) + +el.dataset.d));
+    inp.value = h * 60;
+    document.getElementById('tz-label').textContent = tzLabel(h);
+  },
   close() { closeDrawer(); },
   pick(el) {
     const p = { id: +el.dataset.id, kind: el.dataset.kind, rule: el.dataset.rule || '' };
