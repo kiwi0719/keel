@@ -219,7 +219,6 @@ pub async fn state(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult
     let targets = App::probe_targets(&conn);
     let panel_url = db::get_setting(&conn, "panel_url").ok().flatten().unwrap_or_default();
     let username = admin_user(&conn);
-    let sub_media = db::get_setting(&conn, "sub_media").ok().flatten().unwrap_or_default();
     drop(conn);
     let live = app.live();
 
@@ -346,7 +345,6 @@ pub async fn state(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult
             "probe_targets": targets,
             "fingerprint": app.tls.as_ref().map(|t| t.cert_sha256.clone()),
             "acme_email": w.acme_email,
-            "sub_media": sub_media,
             // Never sent back: only whether it is set and its last 4 chars.
             "cf_token_tail": if w.cf_token.is_empty() { String::new() } else { w.cf_token[w.cf_token.len().saturating_sub(4)..].to_string() },
         },
@@ -889,10 +887,6 @@ pub async fn update_settings(State(app): State<Arc<App>>, Json(b): Json<Map<Stri
                 return Err(bad("邮箱格式不对"));
             }
             db::set_setting(&conn, "acme_email", &s).map_err(internal)?;
-        }
-        if let Some(v) = b.get("sub_media") {
-            let s = str_field(v, 2000)?;
-            db::set_setting(&conn, "sub_media", &crate::sub::media_domains(&s).join("\n")).map_err(internal)?;
         }
         // Empty or missing leaves the token as is; "-" clears it.
         if let Some(v) = b.get("cf_token") {
