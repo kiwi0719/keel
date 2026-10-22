@@ -6,7 +6,10 @@ PROTOCOLS ?= anytls,vless,ss
 # VLESS Vision needs sing-vmess built with_utls to recognize Reality connections.
 TAGS := $(PROTOCOLS)$(if $(findstring vless,$(PROTOCOLS)),$(comma)with_utls)
 SUFFIX := $(subst $(comma),-,$(PROTOCOLS))
-GOFLAGS_BUILD := -trimpath -ldflags "-s -w -buildid=" -tags "$(TAGS)"
+# The version is the commit; without git (or -buildvcs) keel-node falls back
+# to the commit Go embeds, else "dev".
+VERSION ?= $(shell git describe --always --dirty --exclude '*' 2>/dev/null)
+GOFLAGS_BUILD := -trimpath -ldflags "-s -w -buildid= $(if $(VERSION),-X main.version=$(VERSION))" -tags "$(TAGS)"
 
 .PHONY: node node-linux master test compat limits
 

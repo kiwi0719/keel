@@ -69,7 +69,7 @@ keel-node -master https://panel.example:8443 -token <节点令牌> \
            "net_rx":81234567890,"net_tx":79234567890,"rx_rate":152340.5,"tx_rate":148220.1,
            "tcp_conns":42,"udp_conns":5,"uptime_s":864000,"rss":7340032,"tcp_retrans_pct":0.4},
  "probes":[{"name":"ct","host":"203.0.113.1:80","latency_ms":38.2,"jitter_ms":1.7,"loss_pct":0,"samples":10,"at":1761099990},
-           {"name":"cu","host":"203.0.113.2:80","latency_ms":45.0,"jitter_ms":3.1,"loss_pct":10,"samples":9,"at":1761099990},
+           {"name":"cu","host":"203.0.113.2:80","latency_ms":45.0,"jitter_ms":3.1,"loss_pct":10,"samples":10,"at":1761099990},
            {"name":"cm","host":"203.0.113.3:80","latency_ms":61.4,"jitter_ms":8.9,"loss_pct":0,"samples":10,"at":1761099990}]}
 ```
 
@@ -114,7 +114,7 @@ keel-node -master https://panel.example:8443 -token <节点令牌> \
 - 同一轮所有目标的 `at` 相同（这一轮测完的时间）。
 - 每轮对每个目标做 10 次 TCP 连接，间隔 500 ms，单次超时 2 秒。
 - `latency_ms`：成功连接耗时的平均值。`jitter_ms`：相邻两次成功连接耗时之差的平均值。
-- `loss_pct`：超时的次数加上耗时 ≥ 1 秒的次数（说明 SYN 重传过）占总次数的百分比。`samples` 是成功次数，为 0 时延迟和波动没有意义。
+- `loss_pct`：超时的次数加上耗时 ≥ 1 秒的次数（说明 SYN 重传过）占总次数的百分比。`samples` 是尝试次数（10）；`loss_pct` 为 100 时全部失败，延迟和波动没有意义。
 
 ## 配置里和主控相关的字段
 
