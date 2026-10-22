@@ -125,6 +125,11 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     ("nodes", "anytls_key", "TEXT NOT NULL DEFAULT ''"),
     // uTLS fingerprint clients present for Reality (subscription only).
     ("nodes", "reality_fp", "TEXT NOT NULL DEFAULT 'chrome'"),
+    // Public ports for NAT boxes, where the provider maps public -> listen
+    // port. 0 = clients use the listen port.
+    ("nodes", "anytls_pub", "INTEGER NOT NULL DEFAULT 0"),
+    ("nodes", "vless_pub", "INTEGER NOT NULL DEFAULT 0"),
+    ("exits", "pub_port", "INTEGER NOT NULL DEFAULT 0"),
 ];
 
 /// Databases from before external exits have exits.node_id NOT NULL and no
@@ -246,6 +251,7 @@ pub struct Node {
     pub anytls_sni: String,
     pub anytls_cert: String,
     pub anytls_key: String,
+    pub anytls_pub: i64,
     pub vless_on: bool,
     pub vless_port: i64,
     pub reality_dest: String,
@@ -255,6 +261,7 @@ pub struct Node {
     pub reality_public: String,
     pub reality_short_id: String,
     pub reality_fp: String,
+    pub vless_pub: i64,
     // SS entry inbounds are retired (entries speak AnyTLS / Reality only);
     // the columns stay so old databases load.
     pub ss_on: bool,
@@ -290,7 +297,7 @@ impl Node {
     }
 }
 
-const NODE_COLS: &str = "id,code,name,role,host,last_ip,token,sort,ipv4_only,direct_list,anytls_on,anytls_port,anytls_sni,vless_on,vless_port,reality_dest,reality_sni,reality_private,reality_public,reality_short_id,ss_on,ss_port,ss_psk,default_exit,config_rev,default_fallback,anytls_cert,anytls_key,reality_fp";
+const NODE_COLS: &str = "id,code,name,role,host,last_ip,token,sort,ipv4_only,direct_list,anytls_on,anytls_port,anytls_sni,vless_on,vless_port,reality_dest,reality_sni,reality_private,reality_public,reality_short_id,ss_on,ss_port,ss_psk,default_exit,config_rev,default_fallback,anytls_cert,anytls_key,reality_fp,anytls_pub,vless_pub";
 
 fn node_from_row(r: &rusqlite::Row) -> rusqlite::Result<Node> {
     Ok(Node {
@@ -323,6 +330,8 @@ fn node_from_row(r: &rusqlite::Row) -> rusqlite::Result<Node> {
         anytls_cert: r.get(26)?,
         anytls_key: r.get(27)?,
         reality_fp: r.get(28)?,
+        anytls_pub: r.get(29)?,
+        vless_pub: r.get(30)?,
     })
 }
 
@@ -332,6 +341,8 @@ pub struct Exit {
     pub node_id: i64,
     pub name: String,
     pub port: i64,
+    /// Port entries dial when a NAT provider maps it to `port`; 0 = `port`.
+    pub pub_port: i64,
     #[serde(skip)]
     pub psk: String,
     pub quota_bytes: i64,
@@ -350,6 +361,13 @@ pub struct Exit {
 }
 
 impl Exit {
+    pub fn public_port(&self) -> i64 {
+        if self.pub_port > 0 {
+            self.pub_port
+        } else {
+            self.port
+        }
+    }
     pub fn is_external(&self) -> bool {
         self.kind != "ss"
     }
@@ -454,7 +472,7 @@ pub fn load_world(conn: &Connection) -> rusqlite::Result<World> {
     w.tz = get_setting(conn, "tz_offset")?.and_then(|v| v.parse().ok()).unwrap_or(480);
     let mut st = conn.prepare(&format!("SELECT {NODE_COLS} FROM nodes ORDER BY sort, id"))?;
     w.nodes = st.query_map([], node_from_row)?.collect::<Result<_, _>>()?;
-    let mut st = conn.prepare("SELECT id,COALESCE(node_id,0),name,port,psk,quota_bytes,reset_day,udp_over_tcp,sort,kind,server,uuid,method FROM exits ORDER BY sort, id")?;
+    let mut st = conn.prepare("SELECT id,COALESCE(node_id,0),name,port,psk,quota_bytes,reset_day,udp_over_tcp,sort,kind,server,uuid,method,pub_port FROM exits ORDER BY sort, id")?;
     w.exits = st
         .query_map([], |r| {
             Ok(Exit {
@@ -471,6 +489,7 @@ pub fn load_world(conn: &Connection) -> rusqlite::Result<World> {
                 server: r.get(10)?,
                 uuid: r.get(11)?,
                 method: r.get(12)?,
+                pub_port: r.get(13)?,
             })
         })?
         .collect::<Result<_, _>>()?;

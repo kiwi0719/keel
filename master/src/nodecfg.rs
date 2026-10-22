@@ -175,7 +175,7 @@ fn entry(w: &World, node: &Node, secret: &str, now: i64) -> Value {
             let mut o = json!({
                 "tag": format!("x{id}"),
                 "type": "ss2022",
-                "server": format!("{}:{}", n.address(), e.port),
+                "server": format!("{}:{}", n.address(), e.public_port()),
                 "method": SS_METHOD,
                 "password": format!("{}:{}", e.psk, exit_key(secret, node.id, e.id)),
             });
