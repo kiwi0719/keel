@@ -8,6 +8,7 @@ replace github.com/anytls/sing-anytls => ./third_party/sing-anytls
 
 require (
 	github.com/anytls/sing-anytls v0.0.11
+	github.com/coder/websocket v1.8.14
 	github.com/metacubex/utls v1.8.4
 	github.com/sagernet/sing v0.8.12-0.20260702081104-2ded2af32d3d
 	github.com/sagernet/sing-shadowsocks v0.2.8

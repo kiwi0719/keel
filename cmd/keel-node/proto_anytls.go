@@ -24,7 +24,7 @@ type anytlsInbound struct {
 }
 
 func newAnyTLSInbound(config InboundConfig, h *handler) (inbound, error) {
-	cert, err := tls.LoadX509KeyPair(config.Cert, config.Key)
+	cert, err := loadOrCreateCert(config.Cert, config.Key)
 	if err != nil {
 		return nil, err
 	}

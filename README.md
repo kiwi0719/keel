@@ -5,7 +5,7 @@
 - **keel-node**（Go，本仓库 `cmd/keel-node`）：每台服务器一个进程，跑代理、按用户统计流量、在本地执行额度和到期。节点分两种角色，用的是同一个程序：
   - **入口**：用 AnyTLS / VLESS Reality 接客户端，按用户计流量和额度，再按规则把流量分给不同出口（经 SS 2022），或者直连、走 SOCKS。
   - **出口**：只开 SS 2022，每个入口在出口上是一个用户。
-- **主控**（Rust，网页面板 + SQLite）：还没开始写。节点会主动用 TLS 长连接连主控，节点自己不开任何管理端口。
+- **主控**（Rust，网页面板 + SQLite）：正在写。节点主动用 WebSocket over TLS 连主控，节点自己不开任何管理端口。协议见 [docs/node-protocol.md](docs/node-protocol.md)。
 
 ## keel-node
 
@@ -41,6 +41,15 @@ VLESS 必须同时带 `with_utls` 标签（Vision 靠它识别 Reality 连接）
 ```sh
 keel-node -c /etc/keel/node.json -state /var/lib/keel/usage.json
 ```
+
+接主控时，配置由主控下发，`-c` 只是本地缓存（主控连不上时节点照常用它跑）：
+
+```sh
+KEEL_TOKEN=<节点令牌> keel-node -master https://panel.example:8443 \
+    -fingerprint <主控证书 SHA-256> -c /etc/keel/node.json -state /var/lib/keel/usage.json
+```
+
+节点每 5 秒上报一次每个用户的流量、连接数和整机状态（CPU、内存、硬盘、网速、连接数、TCP 重传率、在线时长），配置了 `probes` 时还会定时对电信、联通、移动的目标做 TCPing（延迟、波动、丢包）。AnyTLS 的证书文件不存在时自动生成自签证书。
 
 配置格式见 [examples/entry.json](examples/entry.json)（入口）和 [examples/exit.json](examples/exit.json)（出口）。
 
