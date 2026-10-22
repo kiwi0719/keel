@@ -24,3 +24,5 @@ require (
 	golang.org/x/sys v0.41.0 // indirect
 	lukechampine.com/blake3 v1.3.0 // indirect
 )
+
+replace github.com/sagernet/sing-shadowsocks => ./third_party/sing-shadowsocks

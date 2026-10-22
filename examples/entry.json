@@ -1,0 +1,37 @@
+{
+  "route": {
+    "ipv4_only": true,
+    "rules": [
+      {"name": "direct", "file": "/etc/keel/direct.list", "outbound": "direct"},
+      {"name": "ai", "file": "/etc/keel/rules/ai.list", "outbound": "us"},
+      {"name": "streaming", "file": "/etc/keel/rules/streaming.list", "outbound": "jp-home"}
+    ],
+    "final": "uk"
+  },
+  "outbounds": [
+    {"tag": "us", "type": "ss2022", "server": "us-exit.example.net:20731", "password": "<出口 password>:<这个入口在出口上的 ss_key>"},
+    {"tag": "uk", "type": "ss2022", "server": "uk-exit.example.net:20731", "password": "<psk>:<key>", "udp_over_tcp": true},
+    {"tag": "jp-home", "type": "socks", "server": "127.0.0.1:1081"}
+  ],
+  "inbounds": [
+    {"type": "anytls", "listen": ":719", "cert": "/etc/keel/cert.pem", "key": "/etc/keel/key.pem"},
+    {"type": "vless", "listen": ":443",
+     "reality": {
+       "dest": "www.example.com:443",
+       "server_names": ["www.example.com"],
+       "private_key": "<xray x25519 的 PrivateKey>",
+       "short_ids": ["0123456789abcdef"]
+     }}
+  ],
+  "users": [
+    {
+      "name": "alice",
+      "anytls_password": "<随机字符串>",
+      "uuid": "<xray uuid>",
+      "flow": "xtls-rprx-vision",
+      "quota_bytes": 107374182400,
+      "expire_at": 1798732800,
+      "period": "2026-10"
+    }
+  ]
+}

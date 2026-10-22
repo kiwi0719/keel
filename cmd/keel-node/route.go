@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"io"
 	"log"
+	"net/netip"
 	"os"
 	"strings"
 	"sync"
@@ -11,66 +13,75 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 )
 
-// domainList is a set of domain rules used to steer destinations between the
-// SOCKS5 upstream and direct dialing (socks_domains / direct_domains).
+// ruleList is a set of destinations used by one routing rule.
 //
-// File format, one entry per line ('#' starts a comment):
+// Format, one entry per line ('#' starts a comment):
 //
 //	example.com       matches example.com and any subdomain
 //	=api.example.com  matches that exact name only
 //	~emby             matches any name containing "emby"
+//	91.108.4.0/22     matches IP destinations in that range
 //
-// The file is re-read automatically when its modification time changes.
-type domainList struct {
-	path string
+// Entries come from a file, which is re-read automatically when its
+// modification time changes, and/or from an inline list in the config.
+type ruleList struct {
+	path   string
+	inline []string
 
 	mu       sync.Mutex
 	suffix   map[string]bool
 	exact    map[string]bool
 	keywords []string
+	prefixes []netip.Prefix
 	modTime  time.Time
 	checked  time.Time
 }
 
-const domainListRecheck = time.Minute
+const ruleListRecheck = time.Minute
 
-func newDomainList(path string) *domainList {
-	l := &domainList{path: path}
+func newRuleList(path string, inline []string) *ruleList {
+	l := &ruleList{path: path, inline: inline}
 	l.mu.Lock()
 	l.reloadLocked(true)
 	l.mu.Unlock()
 	return l
 }
 
-func (l *domainList) reloadLocked(force bool) {
+func (l *ruleList) reloadLocked(force bool) {
 	l.checked = time.Now()
-	info, err := os.Stat(l.path)
-	if err != nil {
-		if force {
-			log.Print("domain list: ", err)
+	var file io.Reader
+	var modTime time.Time
+	if l.path != "" {
+		info, err := os.Stat(l.path)
+		if err != nil {
+			if force {
+				log.Print("rule list: ", err)
+			}
+			return
 		}
+		if !force && info.ModTime().Equal(l.modTime) {
+			return
+		}
+		f, err := os.Open(l.path)
+		if err != nil {
+			log.Print("rule list: ", err)
+			return
+		}
+		defer f.Close()
+		file, modTime = f, info.ModTime()
+	} else if !force {
 		return
 	}
-	if !force && info.ModTime().Equal(l.modTime) {
-		return
-	}
-	f, err := os.Open(l.path)
-	if err != nil {
-		log.Print("domain list: ", err)
-		return
-	}
-	defer f.Close()
 	suffix, exact := map[string]bool{}, map[string]bool{}
 	var keywords []string
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := scanner.Text()
+	var prefixes []netip.Prefix
+	add := func(line string) {
 		if i := strings.IndexByte(line, '#'); i >= 0 {
 			line = line[:i]
 		}
 		line = strings.ToLower(strings.TrimSpace(line))
 		if line == "" {
-			continue
+			return
 		}
 		switch {
 		case strings.HasPrefix(line, "="):
@@ -78,25 +89,48 @@ func (l *domainList) reloadLocked(force bool) {
 		case strings.HasPrefix(line, "~"):
 			keywords = append(keywords, line[1:])
 		default:
-			suffix[strings.TrimSuffix(strings.TrimPrefix(line, "."), ".")] = true
+			if prefix, err := netip.ParsePrefix(line); err == nil {
+				prefixes = append(prefixes, prefix.Masked())
+			} else if addr, err := netip.ParseAddr(line); err == nil {
+				prefixes = append(prefixes, netip.PrefixFrom(addr, addr.BitLen()))
+			} else {
+				suffix[strings.TrimSuffix(strings.TrimPrefix(line, "."), ".")] = true
+			}
 		}
 	}
-	l.suffix, l.exact, l.keywords, l.modTime = suffix, exact, keywords, info.ModTime()
-	log.Printf("domain list: loaded %d suffix + %d exact + %d keyword entries from %s", len(suffix), len(exact), len(keywords), l.path)
+	for _, line := range l.inline {
+		add(line)
+	}
+	if file != nil {
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			add(scanner.Text())
+		}
+	}
+	l.suffix, l.exact, l.keywords, l.prefixes, l.modTime = suffix, exact, keywords, prefixes, modTime
+	if l.path != "" {
+		log.Printf("rule list: loaded %d suffix + %d exact + %d keyword + %d ip entries from %s", len(suffix), len(exact), len(keywords), len(prefixes), l.path)
+	}
 }
 
-// match reports whether destination's domain is on the list. IP destinations
-// never match (clients normally send domain names, which is what we route on).
-func (l *domainList) match(destination M.Socksaddr) bool {
+// match reports whether destination is on the list. Domain entries match
+// domain destinations, IP entries match IP destinations.
+func (l *ruleList) match(destination M.Socksaddr) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.path != "" && time.Since(l.checked) > ruleListRecheck {
+		l.reloadLocked(false)
+	}
 	if !destination.IsFqdn() {
+		addr := destination.Addr.Unmap()
+		for _, prefix := range l.prefixes {
+			if prefix.Contains(addr) {
+				return true
+			}
+		}
 		return false
 	}
 	name := strings.ToLower(strings.TrimSuffix(destination.Fqdn, "."))
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if time.Since(l.checked) > domainListRecheck {
-		l.reloadLocked(false)
-	}
 	if l.exact[name] {
 		return true
 	}
@@ -118,18 +152,16 @@ func (l *domainList) match(destination M.Socksaddr) bool {
 	return false
 }
 
-// viaUpstream decides whether a destination should use the SOCKS5 upstream:
-// direct_domains always wins, then socks_domains (if set) limits the upstream
-// to its entries; otherwise everything goes through the upstream.
-func (o *outbound) viaUpstream(destination M.Socksaddr) bool {
-	if o.upstream == nil {
+// sameSource reports whether l was built from the same file and inline
+// entries, so a reload can keep it instead of re-reading the file.
+func (l *ruleList) sameSource(path string, inline []string) bool {
+	if l.path != path || len(l.inline) != len(inline) {
 		return false
 	}
-	if o.directDomains != nil && o.directDomains.match(destination) {
-		return false
-	}
-	if o.upstreamDomains != nil {
-		return o.upstreamDomains.match(destination)
+	for i := range inline {
+		if l.inline[i] != inline[i] {
+			return false
+		}
 	}
 	return true
 }

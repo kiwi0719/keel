@@ -12,20 +12,41 @@ import (
 // and re-read whenever the file changes; later the master pushes the same
 // structure over its control connection.
 type Config struct {
-	Outbound OutboundConfig  `json:"outbound"`
-	Inbounds []InboundConfig `json:"inbounds"`
-	Users    []UserConfig    `json:"users"`
+	Route     RouteConfig      `json:"route"`
+	Outbounds []OutboundConfig `json:"outbounds,omitempty"`
+	Inbounds  []InboundConfig  `json:"inbounds"`
+	Users     []UserConfig     `json:"users"`
 }
 
-type OutboundConfig struct {
+// RouteConfig picks an outbound for each connection: the first rule whose
+// list matches the destination wins, otherwise Final.
+type RouteConfig struct {
 	// IPv4Only dials and resolves IPv4 only (the old -4 flag).
-	IPv4Only bool `json:"ipv4_only,omitempty"`
-	// Socks sends outbound TCP/UDP through this SOCKS5 proxy (host:port).
-	Socks string `json:"socks,omitempty"`
-	// SocksDomains, when set, limits Socks to the domains in this file.
-	SocksDomains string `json:"socks_domains,omitempty"`
-	// DirectDomains always bypasses Socks for the domains in this file.
-	DirectDomains string `json:"direct_domains,omitempty"`
+	IPv4Only bool         `json:"ipv4_only,omitempty"`
+	Rules    []RuleConfig `json:"rules,omitempty"`
+	// Final is the outbound for everything no rule matched; default "direct".
+	Final string `json:"final,omitempty"`
+}
+
+type RuleConfig struct {
+	Name     string   `json:"name,omitempty"` // shown in logs, e.g. "ai"
+	File     string   `json:"file,omitempty"` // list file, reloaded when it changes
+	Domains  []string `json:"domains,omitempty"`
+	Outbound string   `json:"outbound"`
+}
+
+// OutboundConfig is a way out of the node besides the built-in "direct".
+type OutboundConfig struct {
+	Tag    string `json:"tag"`
+	Type   string `json:"type"`   // ss2022 | socks
+	Server string `json:"server"` // host:port
+
+	// ss2022: Password is "<server psk>:<user key>" as for any SS 2022 client.
+	Method   string `json:"method,omitempty"`
+	Password string `json:"password,omitempty"`
+	// UDPOverTCP carries UDP inside the TCP connection to the server instead
+	// of SS 2022 UDP packets.
+	UDPOverTCP bool `json:"udp_over_tcp,omitempty"`
 }
 
 // InboundConfig describes one listener. Which fields apply depends on Type.
@@ -106,6 +127,30 @@ func loadConfig(path string) (*Config, error) {
 }
 
 func (c *Config) validate() error {
+	tags := map[string]bool{"direct": true}
+	for _, o := range c.Outbounds {
+		if o.Tag == "" || tags[o.Tag] {
+			return fmt.Errorf("outbound tag %q is empty or used twice (\"direct\" is built in)", o.Tag)
+		}
+		if o.Type != "ss2022" && o.Type != "socks" {
+			return fmt.Errorf("outbound %s: unknown type %q", o.Tag, o.Type)
+		}
+		if o.Server == "" {
+			return fmt.Errorf("outbound %s: server is required", o.Tag)
+		}
+		tags[o.Tag] = true
+	}
+	for i, r := range c.Route.Rules {
+		if !tags[r.Outbound] {
+			return fmt.Errorf("route rule %d: unknown outbound %q", i+1, r.Outbound)
+		}
+		if r.File == "" && len(r.Domains) == 0 {
+			return fmt.Errorf("route rule %d: needs file or domains", i+1)
+		}
+	}
+	if c.Route.Final != "" && !tags[c.Route.Final] {
+		return fmt.Errorf("route final: unknown outbound %q", c.Route.Final)
+	}
 	keys := make(map[string]bool)
 	for _, inbound := range c.Inbounds {
 		if _, ok := protocols[inbound.Type]; !ok {
