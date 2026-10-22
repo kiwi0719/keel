@@ -446,7 +446,7 @@ function exitCard(e, x) {
   const st = exitStyle(e.id);
   const parts = [];
   if (x) {
-    parts.push(`${esc(nm(x))} :${e.port}`);
+    parts.push(esc(nm(x)));
     if (e.quota_bytes) parts.push(`${gib(e.used)} / ${gib(e.quota_bytes)} G`, `${e.reset_day} 号重置`);
     else parts.push(`本期 ${bytes(e.used)}`);
     if (e.udp_over_tcp) parts.push('UDP 走 TCP');
