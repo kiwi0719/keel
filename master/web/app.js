@@ -716,7 +716,6 @@ function settingsDrawer() {
   return {
     title: '设置', mark: shape({ color: C.ink, shape: 'circle' }, 16),
     body: `<section class="sec"><div class="fields two">
-        ${field('面板地址（订阅和节点安装用）', 'panel_url', st.panel_url, { full: true, placeholder: st.base_url })}
         <div class="field">时区（重置日按它算）<div class="stepper"><button type="button" data-act="tz-step" data-d="-1" aria-label="减一小时">−</button><output id="tz-label">${tzLabel(tz)}</output><button type="button" data-act="tz-step" data-d="1" aria-label="加一小时">+</button></div><input type="hidden" name="tz_offset" value="${tz * 60}"></div>
       </div></section>
       <section class="sec"><h3>三网测速目标</h3><div class="fields">${targets}</div>
@@ -960,7 +959,7 @@ const actions = {
   async 'save-settings'() {
     const f = form(), st = S.data.settings;
     const body = {
-      panel_url: f.panel_url, tz_offset: int(f.tz_offset),
+      tz_offset: int(f.tz_offset),
       probe_targets: st.probe_targets.map(t => ({ name: t.name, label: t.label, host: (f['probe_' + t.name] || '').trim() }))
     };
     body.username = f.username.trim(); body.current_password = f.current_password;
