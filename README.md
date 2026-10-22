@@ -51,6 +51,24 @@ KEEL_TOKEN=<节点令牌> keel-node -master https://panel.example:8443 \
 
 节点每 5 秒上报一次每个用户的流量、连接数和整机状态（CPU、内存、硬盘、网速、连接数、TCP 重传率、在线时长），配置了 `probes` 时还会定时对电信、联通、移动的目标做 TCPing（延迟、波动、丢包）。入口的可选参数（AnyTLS 的域名、证书（可以自动向 Let's Encrypt 申请和续期，支持 Cloudflare DNS 验证，NAT 机器也能用）、填充方案，Reality 的 SNI、dest、shortId 等）见 [docs/node-protocol.md](docs/node-protocol.md#入口入站的可选参数)。
 
+主控生成的安装命令会顺便装一个 `agent` 命令（Alpine 的 OpenRC 和 systemd 都支持，服务挂了会自动拉起）：
+
+```
+# agent
+keel-node  1a2b3c4 （2026-10-22 21:08 提交）
+服务 运行中 · 已运行 3 天 4 小时 · 内存 11.2 MB
+主控 已连接 https://panel.example:8443 · 配置版本 13 · 上次上报 2 秒前
+入站 编进程序的协议: anytls,ss2022,vless
+  vless   0.0.0.0:443            运行中  Reality SNI www.example.com
+  anytls  0.0.0.0:8443           运行中  域名 a.example.com · 证书 已签发，2027-01-20 到期（提前 30 天自动续）
+出口
+  x1       正常 182 ms
+用户 12 个 · 连接 34
+三网 电信 38 ms   联通 45 ms   移动 61 ms
+```
+
+`agent restart` / `start` / `stop` 管服务，`agent logs`（`-f` 持续看）看日志，`agent update` 从主控下载最新的节点程序、确认能跑后替换并重启，`agent version` 看版本。版本号就是构建时的 git 提交号，也会上报给主控。状态来自节点每 5 秒写一次的 `/etc/keel/status.json`（不含密码和令牌）。
+
 配置格式见 [examples/entry.json](examples/entry.json)（入口）和 [examples/exit.json](examples/exit.json)（出口）。
 
 - 配置文件改了会在 2 秒内自动重新加载，`kill -HUP` 可以立刻生效。设置没变的监听保持不动；改了或删掉的监听停止接新连接，已经建立的连接不受影响。

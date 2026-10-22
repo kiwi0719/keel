@@ -15,7 +15,6 @@ import (
 	"net/url"
 	"os"
 	"runtime"
-	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -34,31 +33,9 @@ const (
 	maxMessageSize   = 16 << 20
 )
 
-// version can be set with -ldflags "-X main.version=..."; otherwise it is
-// the git commit the binary was built from (see buildVersion).
-var version = buildVersion()
-
-func buildVersion() string {
-	info, ok := debug.ReadBuildInfo()
-	if !ok {
-		return "dev"
-	}
-	var rev, dirty string
-	for _, s := range info.Settings {
-		switch s.Key {
-		case "vcs.revision":
-			rev = s.Value
-		case "vcs.modified":
-			if s.Value == "true" {
-				dirty = "+dirty"
-			}
-		}
-	}
-	if len(rev) < 7 {
-		return "dev"
-	}
-	return rev[:7] + dirty
-}
+// version can be set with -ldflags "-X main.version=..."; otherwise main
+// sets it to the git commit the binary was built from (see buildVersion).
+var version string
 
 // masterClient keeps a WebSocket connection to the master: it receives
 // configs and sends reports. The node keeps running on its cached config
@@ -129,6 +106,7 @@ func (m *masterClient) run(ctx context.Context) {
 			return
 		}
 		log.Print("master: ", err)
+		m.node.masterState.Store(&MasterState{URL: m.url, Error: err.Error(), Since: time.Now().Unix()})
 		if time.Since(start) > maxReconnectWait {
 			wait = time.Second
 		}
@@ -160,6 +138,7 @@ func (m *masterClient) session(ctx context.Context) error {
 	defer conn.CloseNow()
 	conn.SetReadLimit(maxMessageSize)
 	log.Print("master: connected to ", m.url)
+	m.node.masterState.Store(&MasterState{URL: m.url, Connected: true, Since: time.Now().Unix()})
 
 	var writeMu sync.Mutex
 	send := func(v any) error {
@@ -238,6 +217,7 @@ func (m *masterClient) reportLoop(ctx context.Context, conn *websocket.Conn, sen
 			if err := send(m.report()); err != nil {
 				return err
 			}
+			m.node.lastReport.Store(time.Now().Unix())
 		case <-ping.C:
 			pingCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 			err := conn.Ping(pingCtx)

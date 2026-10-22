@@ -38,6 +38,8 @@ chmod 700 /etc/keel /var/lib/keel
 fetch "$MASTER/dl/keel-node-linux-$ARCH" /usr/local/bin/keel-node.new
 chmod 755 /usr/local/bin/keel-node.new
 mv /usr/local/bin/keel-node.new /usr/local/bin/keel-node
+# `agent` shows the node's status and restarts, updates or tails it.
+ln -sf /usr/local/bin/keel-node /usr/local/bin/agent
 
 umask 077
 printf 'KEEL_TOKEN=%s\n' "$TOKEN" >/etc/keel/token.env
@@ -124,6 +126,7 @@ else
 	exit 1
 fi
 echo "keel-node installed; it should show up as online in the panel within a few seconds."
+echo "run 'agent' on this server to see its status ('agent help' for more)."
 # Ports to open or map at the provider (NAT boxes: public -> listen).
 if [ -n "$PIN" ]; then
 	PORTS=$(curl -fsSk --pinnedpubkey "sha256//$PIN" -H "Authorization: Bearer $TOKEN" "$MASTER/api/node/ports" 2>/dev/null || true)

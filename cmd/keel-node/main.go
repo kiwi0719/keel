@@ -35,6 +35,16 @@ const (
 )
 
 func main() {
+	if version == "" {
+		version = buildVersion()
+	}
+	if filepath.Base(os.Args[0]) == "agent" || len(os.Args) > 1 && os.Args[1] == "agent" {
+		args := os.Args[1:]
+		if len(args) > 0 && args[0] == "agent" {
+			args = args[1:]
+		}
+		os.Exit(agentMain(args))
+	}
 	configPath := flag.String("c", "/etc/keel/node.json", "config file, reloaded when it changes; with -master it caches the master's config")
 	statePath := flag.String("state", "/var/lib/keel/usage.json", "where per-user traffic counters are kept across restarts")
 	master := flag.String("master", "", "master address, e.g. https://panel.example.com:8443; the node connects out to it")
@@ -45,7 +55,7 @@ func main() {
 	log.Print("keel-node ", version, " protocols: ", builtProtocols())
 
 	certDir = filepath.Dir(*configPath)
-	n := &node{users: newRegistry(*statePath), running: make(map[string]*runningInbound), prober: newProber()}
+	n := &node{users: newRegistry(*statePath), running: make(map[string]*runningInbound), prober: newProber(), started: time.Now()}
 	n.handler = &handler{users: n.users}
 	config, err := loadConfig(*configPath, *master == "")
 	n.strict = *master == ""
@@ -85,6 +95,10 @@ func main() {
 		client := &masterClient{url: wsURL, token: *token, pin: pin, node: n, configs: masterConfigs}
 		go client.run(ctx)
 	}
+
+	statusPath := filepath.Join(filepath.Dir(*configPath), "status.json")
+	go n.writeStatus(ctx, statusPath, *master, *fingerprint)
+	defer os.Remove(statusPath)
 
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGUSR1)
@@ -188,6 +202,11 @@ type node struct {
 	handler *handler
 	prober  *prober
 	config  atomic.Pointer[Config]
+	// masterState is the master connection, for the status file; nil
+	// without -master.
+	masterState atomic.Pointer[MasterState]
+	lastReport  atomic.Int64 // unix seconds of the last report sent
+	started     time.Time
 }
 
 // rev is the master revision of the running config (0 for a local file).
