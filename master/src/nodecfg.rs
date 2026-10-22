@@ -229,10 +229,13 @@ fn entry(w: &World, node: &Node, secret: &str, now: i64) -> Value {
                 "short_ids": node.reality_short_ids(),
             }
         });
-        // Empty dest: the node uses server_names[0]:443.
-        if !node.reality_dest.is_empty() {
-            v["reality"]["dest"] = json!(node.reality_dest);
-        }
+        // Empty dest follows the first server name.
+        let dest = if node.reality_dest.is_empty() {
+            node.reality_names().first().map(|s| format!("{s}:443")).unwrap_or_default()
+        } else {
+            node.reality_dest.clone()
+        };
+        v["reality"]["dest"] = json!(dest);
         inbounds.push(v);
     }
 

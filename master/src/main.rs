@@ -225,6 +225,8 @@ fn router(app: Arc<App>) -> Router {
         .route_layer(axum::middleware::from_fn_with_state(app.clone(), api::require_login));
     Router::new()
         .route("/", get(|| async { static_file(INDEX_HTML, "text/html; charset=utf-8") }))
+        .route("/admin", get(|| async { static_file(INDEX_HTML, "text/html; charset=utf-8") }))
+        .route("/api/public", get(api::public_state))
         .route("/robots.txt", get(|| async { static_file("User-agent: *\nDisallow: /\n", "text/plain; charset=utf-8") }))
         .route("/app.js", get(|| async { static_file(APP_JS, "text/javascript; charset=utf-8") }))
         .route("/app.css", get(|| async { static_file(APP_CSS, "text/css; charset=utf-8") }))
