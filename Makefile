@@ -8,7 +8,7 @@ TAGS := $(PROTOCOLS)$(if $(findstring vless,$(PROTOCOLS)),$(comma)with_utls)
 SUFFIX := $(subst $(comma),-,$(PROTOCOLS))
 GOFLAGS_BUILD := -trimpath -ldflags "-s -w -buildid=" -tags "$(TAGS)"
 
-.PHONY: node node-linux test compat limits
+.PHONY: node node-linux master test compat limits
 
 node:
 	CGO_ENABLED=0 go build $(GOFLAGS_BUILD) -o bin/keel-node-$(SUFFIX) ./cmd/keel-node
@@ -17,7 +17,11 @@ node-linux:
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build $(GOFLAGS_BUILD) -o bin/keel-node-$(SUFFIX)-linux-amd64 ./cmd/keel-node
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build $(GOFLAGS_BUILD) -o bin/keel-node-$(SUFFIX)-linux-arm64 ./cmd/keel-node
 
+master:
+	cd master && cargo build --release
+
 test:
+	cd master && cargo test
 	go test -race -tags anytls,vless,with_utls,ss ./...
 
 # Client compatibility and limit tests; BIN must point at xray-*/mihomo/sing-box.
