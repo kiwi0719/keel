@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -33,7 +34,31 @@ const (
 	maxMessageSize   = 16 << 20
 )
 
-var version = "dev"
+// version can be set with -ldflags "-X main.version=..."; otherwise it is
+// the git commit the binary was built from (see buildVersion).
+var version = buildVersion()
+
+func buildVersion() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "dev"
+	}
+	var rev, dirty string
+	for _, s := range info.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			rev = s.Value
+		case "vcs.modified":
+			if s.Value == "true" {
+				dirty = "+dirty"
+			}
+		}
+	}
+	if len(rev) < 7 {
+		return "dev"
+	}
+	return rev[:7] + dirty
+}
 
 // masterClient keeps a WebSocket connection to the master: it receives
 // configs and sends reports. The node keeps running on its cached config
