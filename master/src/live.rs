@@ -68,6 +68,18 @@ pub struct ProbeReport {
     pub at: i64,
 }
 
+/// Health of one outbound as the node's own check sees it.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct OutboundHealth {
+    pub tag: String,
+    pub alive: bool,
+    pub latency_ms: f64,
+    pub checked_at: i64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub error: String,
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct Report {
@@ -77,6 +89,7 @@ pub struct Report {
     pub system: Option<System>,
     /// Present only in the first report after a probe round finished.
     pub probes: Vec<ProbeReport>,
+    pub outbounds: Vec<OutboundHealth>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -105,6 +118,8 @@ pub struct NodeLive {
     pub last_probe_ts: i64,
     /// User counters online right now, by counter name.
     pub conns: HashMap<String, i64>,
+    /// Exit health from the last report, by outbound tag.
+    pub outbounds: HashMap<String, OutboundHealth>,
     pub applied_rev: i64,
     pub apply_error: String,
     pub sent_rev: i64,

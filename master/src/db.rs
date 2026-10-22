@@ -108,6 +108,21 @@ CREATE TABLE IF NOT EXISTS node_month(
 CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, expires INTEGER NOT NULL);
 "#;
 
+/// Columns added after the first release: (table, column, type).
+const MIGRATIONS: &[(&str, &str, &str)] = &[
+    // Fallback exits in order, comma-separated exit ids (0 = direct).
+    ("nodes", "default_fallback", "TEXT NOT NULL DEFAULT ''"),
+    ("entry_rules", "fallback", "TEXT NOT NULL DEFAULT ''"),
+];
+
+pub fn ids_from_text(s: &str) -> Vec<i64> {
+    s.split(',').filter_map(|x| x.trim().parse().ok()).collect()
+}
+
+pub fn ids_to_text(ids: &[i64]) -> String {
+    ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
+}
+
 /// Rule sets offered for split routing; lists live in rules/ at the repo root.
 /// Nodes match rules top to bottom, so narrower lists come first (Gemini is in
 /// both ai and google, YouTube in both youtube and streaming).
@@ -127,6 +142,14 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
     conn.execute_batch(SCHEMA)?;
+    for (table, col, ddl) in MIGRATIONS {
+        let has: bool = conn
+            .prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name=?1"))?
+            .exists([col])?;
+        if !has {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {col} {ddl}"))?;
+        }
+    }
     for (i, (id, label, desc, list)) in RULESETS.iter().enumerate() {
         // Built-in lists follow the binary; labels the user never edits.
         conn.execute(
@@ -179,6 +202,7 @@ pub struct Node {
     #[serde(skip)]
     pub ss_psk: String,
     pub default_exit: i64,
+    pub default_fallback: Vec<i64>,
     #[serde(skip)]
     pub config_rev: i64,
 }
@@ -197,7 +221,7 @@ impl Node {
     }
 }
 
-const NODE_COLS: &str = "id,code,name,role,host,last_ip,token,sort,ipv4_only,direct_list,anytls_on,anytls_port,anytls_sni,vless_on,vless_port,reality_dest,reality_sni,reality_private,reality_public,reality_short_id,ss_on,ss_port,ss_psk,default_exit,config_rev";
+const NODE_COLS: &str = "id,code,name,role,host,last_ip,token,sort,ipv4_only,direct_list,anytls_on,anytls_port,anytls_sni,vless_on,vless_port,reality_dest,reality_sni,reality_private,reality_public,reality_short_id,ss_on,ss_port,ss_psk,default_exit,config_rev,default_fallback";
 
 fn node_from_row(r: &rusqlite::Row) -> rusqlite::Result<Node> {
     Ok(Node {
@@ -226,6 +250,7 @@ fn node_from_row(r: &rusqlite::Row) -> rusqlite::Result<Node> {
         ss_psk: r.get(22)?,
         default_exit: r.get(23)?,
         config_rev: r.get(24)?,
+        default_fallback: ids_from_text(&r.get::<_, String>(25)?),
     })
 }
 
@@ -257,6 +282,7 @@ pub struct EntryRule {
     pub node_id: i64,
     pub ruleset: String,
     pub exit_id: i64,
+    pub fallback: Vec<i64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -361,9 +387,14 @@ pub fn load_world(conn: &Connection) -> rusqlite::Result<World> {
     w.rulesets = st
         .query_map([], |r| Ok(RuleSet { id: r.get(0)?, label: r.get(1)?, description: r.get(2)?, domains: r.get(3)? }))?
         .collect::<Result<_, _>>()?;
-    let mut st = conn.prepare("SELECT er.node_id,er.ruleset,er.exit_id FROM entry_rules er JOIN rulesets r ON r.id=er.ruleset ORDER BY r.sort")?;
+    let mut st = conn.prepare("SELECT er.node_id,er.ruleset,er.exit_id,er.fallback FROM entry_rules er JOIN rulesets r ON r.id=er.ruleset ORDER BY r.sort")?;
     w.rules = st
-        .query_map([], |r| Ok(EntryRule { node_id: r.get(0)?, ruleset: r.get(1)?, exit_id: r.get(2)? }))?
+        .query_map([], |r| Ok(EntryRule {
+                node_id: r.get(0)?,
+                ruleset: r.get(1)?,
+                exit_id: r.get(2)?,
+                fallback: ids_from_text(&r.get::<_, String>(3)?),
+            }))?
         .collect::<Result<_, _>>()?;
     let mut st = conn.prepare(&format!("SELECT {USER_COLS} FROM users ORDER BY id"))?;
     w.users = st.query_map([], user_from_row)?.collect::<Result<_, _>>()?;

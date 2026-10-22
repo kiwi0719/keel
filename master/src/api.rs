@@ -101,7 +101,8 @@ pub async fn login(State(app): State<Arc<App>>, Json(body): Json<Login>) -> ApiR
     app.db()
         .execute("INSERT INTO sessions(token,expires) VALUES(?1,?2)", params![token, now() + SESSION_DAYS * 86_400])
         .map_err(internal)?;
-    let secure = if app.tls.is_some() { "; Secure" } else { "" };
+    // Behind -no-tls the reverse proxy terminates HTTPS, so the cookie is still secure-only.
+    let secure = if app.tls.is_some() || app.trust_proxy { "; Secure" } else { "" };
     let cookie = format!(
         "{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{secure}",
         SESSION_DAYS * 86_400
@@ -208,7 +209,10 @@ pub async fn state(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult
             o.insert("address".into(), json!(n.address()));
             o.insert(
                 "rules".into(),
-                json!(w.rules_of(n.id).map(|r| json!({"ruleset": r.ruleset, "exit_id": r.exit_id})).collect::<Vec<_>>()),
+                json!(w
+                    .rules_of(n.id)
+                    .map(|r| json!({"ruleset": r.ruleset, "exit_id": r.exit_id, "fallback": r.fallback}))
+                    .collect::<Vec<_>>()),
             );
             let l = live.nodes.get(&n.id);
             let is_online = l.is_some_and(|l| l.online());
@@ -226,6 +230,7 @@ pub async fn state(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult
                 o.insert("applied_rev".into(), json!(l.applied_rev));
                 o.insert("sent_rev".into(), json!(l.sent_rev));
                 o.insert("apply_error".into(), json!(l.apply_error));
+                o.insert("health".into(), json!(l.outbounds));
                 let probes: Vec<Value> = targets
                     .iter()
                     .filter_map(|t| {
@@ -378,6 +383,7 @@ pub async fn update_node(State(app): State<Arc<App>>, Path(id): Path<i64>, Json(
                     }
                     ("default_exit", json!(e))
                 }
+                "default_fallback" => ("default_fallback", json!(db::ids_to_text(&exit_list(&conn, v)?))),
                 _ => return Err(bad(format!("不能改 {k}"))),
             };
             let val: rusqlite::types::Value = match val {
@@ -402,6 +408,23 @@ pub struct Rules {
 pub struct RuleRow {
     ruleset: String,
     exit_id: i64,
+    #[serde(default)]
+    fallback: Vec<i64>,
+}
+
+/// An ordered list of fallback exits (0 = direct), checked and deduplicated.
+fn exit_list(conn: &Connection, v: &Value) -> Result<Vec<i64>, Response> {
+    let mut out = Vec::new();
+    for id in v.as_array().ok_or_else(|| bad("备用出口应为列表"))?.iter() {
+        let id = id.as_i64().ok_or_else(|| bad("备用出口应为编号"))?;
+        if id != 0 && !exists(conn, "exits", id) {
+            return Err(bad("没有这个出口"));
+        }
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    Ok(out)
 }
 
 pub async fn set_rules(State(app): State<Arc<App>>, Path(id): Path<i64>, Json(b): Json<Rules>) -> ApiResult {
@@ -417,9 +440,11 @@ pub async fn set_rules(State(app): State<Arc<App>>, Path(id): Path<i64>, Json(b)
             if r.exit_id != 0 && !exists(&tx, "exits", r.exit_id) {
                 return Err(bad("没有这个出口"));
             }
+            let fallback = exit_list(&tx, &json!(r.fallback))?;
+            let fallback: Vec<i64> = fallback.into_iter().filter(|x| *x != r.exit_id).collect();
             tx.execute(
-                "INSERT OR REPLACE INTO entry_rules(node_id,ruleset,exit_id,sort) VALUES(?1,?2,?3,?4)",
-                params![id, r.ruleset, r.exit_id, i as i64],
+                "INSERT OR REPLACE INTO entry_rules(node_id,ruleset,exit_id,sort,fallback) VALUES(?1,?2,?3,?4,?5)",
+                params![id, r.ruleset, r.exit_id, i as i64, db::ids_to_text(&fallback)],
             )
             .map_err(|_| bad("没有这个规则集"))?;
         }
@@ -468,10 +493,34 @@ pub async fn delete_node(State(app): State<Arc<App>>, Path(id): Path<i64>) -> Ap
     ok(json!({"ok": true}))
 }
 
-/// Points everything that used an exit back to the default / direct.
+/// Takes an exit out of every default and rule: its first fallback moves
+/// up, and a rule left with nothing goes back to the default exit.
 fn forget_exit(conn: &Connection, exit: i64) -> rusqlite::Result<()> {
-    conn.execute("UPDATE nodes SET default_exit=0 WHERE default_exit=?1", [exit])?;
-    conn.execute("DELETE FROM entry_rules WHERE exit_id=?1", [exit])?;
+    let promote = |primary: i64, fallback: &str| -> (i64, String) {
+        let mut rest: Vec<i64> = db::ids_from_text(fallback).into_iter().filter(|x| *x != exit).collect();
+        let primary = if primary == exit { if rest.is_empty() { -1 } else { rest.remove(0) } } else { primary };
+        (primary, db::ids_to_text(&rest))
+    };
+    let nodes: Vec<(i64, i64, String)> = conn
+        .prepare("SELECT id, default_exit, default_fallback FROM nodes")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    for (id, primary, fallback) in nodes {
+        let (p, f) = promote(primary, &fallback);
+        conn.execute("UPDATE nodes SET default_exit=?1, default_fallback=?2 WHERE id=?3", params![p.max(0), f, id])?;
+    }
+    let rules: Vec<(i64, String, i64, String)> = conn
+        .prepare("SELECT node_id, ruleset, exit_id, fallback FROM entry_rules")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<Result<_, _>>()?;
+    for (node, set, primary, fallback) in rules {
+        let (p, f) = promote(primary, &fallback);
+        if p < 0 {
+            conn.execute("DELETE FROM entry_rules WHERE node_id=?1 AND ruleset=?2", params![node, set])?;
+        } else {
+            conn.execute("UPDATE entry_rules SET exit_id=?1, fallback=?2 WHERE node_id=?3 AND ruleset=?4", params![p, f, node, set])?;
+        }
+    }
     conn.execute("DELETE FROM exits WHERE id=?1", [exit])?;
     Ok(())
 }
