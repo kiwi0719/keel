@@ -170,6 +170,7 @@ async fn security_headers(req: axum::extract::Request, next: axum::middleware::N
     h.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
     h.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
     h.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    h.insert("x-robots-tag", HeaderValue::from_static("noindex, nofollow, noarchive"));
     h.insert(
         "content-security-policy",
         HeaderValue::from_static(
@@ -198,6 +199,7 @@ fn router(app: Arc<App>) -> Router {
         .route_layer(axum::middleware::from_fn_with_state(app.clone(), api::require_login));
     Router::new()
         .route("/", get(|| async { static_file(INDEX_HTML, "text/html; charset=utf-8") }))
+        .route("/robots.txt", get(|| async { static_file("User-agent: *\nDisallow: /\n", "text/plain; charset=utf-8") }))
         .route("/app.js", get(|| async { static_file(APP_JS, "text/javascript; charset=utf-8") }))
         .route("/app.css", get(|| async { static_file(APP_CSS, "text/css; charset=utf-8") }))
         .route("/install.sh", get(install_script))

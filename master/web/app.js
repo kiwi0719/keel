@@ -209,7 +209,8 @@ function probePage() {
   if (!nodes.length) {
     return hero + `<div class="empty">还没有节点。去「线路」页点「添加节点」，在服务器上运行给出的那一行命令。</div>`;
   }
-  return hero + `<div class="grid probe">${nodes.map(probeCard).join('')}</div>`;
+  const ext = d.exits.filter(isExternal);
+  return hero + `<div class="grid probe">${nodes.map(probeCard).join('')}${ext.map(extCard).join('')}</div>`;
 }
 
 function probeCard(n) {
@@ -294,6 +295,31 @@ function linesPage() {
   S.data.exits.filter(isExternal).forEach(e => cards.push(exitCard(e, null)));
   html += cards.length ? `<div class="grid exits">${cards.join('')}</div>` : `<div class="empty">还没有出口。加一个出口节点，或者粘贴 vless:// / ss:// 链接导入外部出口。</div>`;
   return html;
+}
+
+// How each entry's node last found this exit (entries check every exit
+// they route to; external exits have no probe of their own).
+function exitChecks(e) {
+  return entries().map(n => ({ n, h: (n.health || {})['x' + e.id] })).filter(c => c.h);
+}
+function checkLine(e) {
+  const cs = exitChecks(e);
+  if (!cs.length) return '<span class="muted">还没有入口检测过</span>';
+  return cs.map(c => c.h.alive
+    ? `${esc(nm(c.n))} <b style="font-weight:500">${c.h.latency_ms != null ? c.h.latency_ms + ' ms' : '通'}</b>`
+    : `${esc(nm(c.n))} <span style="color:${C.danger}">不通</span>`).join(' · ');
+}
+function extCard(e) {
+  const cs = exitChecks(e), dead = cs.length && cs.every(c => !c.h.alive), some = cs.some(c => !c.h.alive);
+  const kind = !cs.length ? 'off' : dead ? 'bad' : some ? 'warn' : 'ok';
+  return `<div class="card ${dead ? 'off' : ''}" style="padding:20px;display:flex;flex-direction:column;gap:14px">
+    <div class="row">
+      <span class="code" style="flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(e.name)}</span>
+      <span class="muted" style="font-size:14px;flex:1 1 auto">外部出口 · ${esc(extProto(e))}</span>
+      ${cs.length ? statusMark(kind) : ''}
+    </div>
+    <div style="font-size:14px">${checkLine(e)}</div>
+  </div>`;
 }
 
 // Exit health as this entry's node sees it: true, false, or undefined
@@ -393,7 +419,7 @@ function exitCard(e, x) {
     if (e.udp_over_tcp) parts.push('UDP 走 TCP');
     if (!x.address) parts.push('还不知道地址');
   } else {
-    parts.push('外部', extProto(e), esc(e.server));
+    parts.push('外部', esc(extProto(e)));
   }
   const defaults = entries().filter(n => n.default_exit === e.id).map(nm);
   const split = [];
@@ -412,6 +438,7 @@ function exitCard(e, x) {
     <span class="title">${shape(st)}${esc(e.name)}${off}</span>
     <span class="muted" style="font-size:13px">${parts.join(' · ')}</span>
     ${bar}
+    <span style="font-size:13px">${checkLine(e)}</span>
     <span style="font-size:14px">${esc(usedBy.length ? usedBy.join('；') : '没有入口在用')}</span>
   </button>`;
 }
@@ -493,10 +520,26 @@ function renderDrawer(focus) {
 
 function field(label, name, value, opts) {
   opts = opts || {};
-  return `<label class="field ${opts.full ? 'full' : ''}">${label}<input name="${name}" value="${esc(value)}" ${opts.type ? `type="${opts.type}"` : ''} ${opts.placeholder ? `placeholder="${esc(opts.placeholder)}"` : ''} ${opts.inputmode ? `inputmode="${opts.inputmode}"` : ''}></label>`;
+  return `<label class="field ${opts.full ? 'full' : ''}">${label}<input name="${name}" value="${esc(value)}" autocomplete="off" data-1p-ignore ${opts.type ? `type="${opts.type}"` : ''} ${opts.placeholder ? `placeholder="${esc(opts.placeholder)}"` : ''} ${opts.inputmode ? `inputmode="${opts.inputmode}"` : ''}></label>`;
 }
 function sw(name, on, label) {
   return `<button type="button" class="switch" data-act="switch" data-name="${name}" aria-pressed="${!!on}" aria-label="${esc(label)}"><i></i></button><input type="hidden" name="${name}" value="${on ? 1 : 0}">`;
+}
+
+// The node's address stays hidden until asked for, so it is not on screen
+// or in a screenshot by accident. A domain can replace the detected IP.
+const MASK = '••••••••••';
+function hostInput(n) {
+  return `<input name="node_domain" value="${esc(n.host)}" placeholder="域名，留空用自动识别的 IP" autocomplete="off" autocapitalize="off" spellcheck="false" data-1p-ignore data-lpignore="true">`;
+}
+function addressField(n) {
+  const addr = n.host || n.last_ip;
+  return `<div class="field full">地址
+      <div class="addr"><span class="mono" id="addr-v">${addr ? MASK : '<span class="muted">节点连上后自动识别</span>'}</span>
+        ${addr ? `<button type="button" class="text-btn" data-act="addr-toggle" data-id="${n.id}">显示</button>` : ''}
+        ${n.host ? '' : `<button type="button" class="text-btn" data-act="host-edit" data-id="${n.id}">改用域名</button>`}
+      </div>${n.host ? hostInput(n) : ''}
+    </div>`;
 }
 
 function nodeDrawer(d) {
@@ -506,7 +549,7 @@ function nodeDrawer(d) {
   const isEntry = n.role === 'entry';
   let body = `<section class="sec"><div class="fields two">
       ${field('名称', 'name', n.name, { full: true })}
-      ${field('地址（域名或 IP）', 'host', n.host, { full: true, placeholder: n.last_ip ? '留空用 ' + n.last_ip : '节点连上后自动填' })}
+      ${addressField(n)}
     </div></section>`;
   if (isEntry) {
     const proto = (key, name, extra, portName, port) => `<div class="proto">
@@ -636,7 +679,7 @@ function extDrawer(d) {
     body: `<section class="sec">
         <div class="fields two">
           ${field('名称', 'name', e.name)}
-          <label class="field">协议 · 地址<input value="${esc(extProto(e) + ' · ' + e.server)}" disabled></label>
+          <label class="field">协议<input value="${esc(extProto(e))}" disabled></label>
         </div>
         <label class="field">换一条链接（商家换了地址或密钥时粘贴新的，名称和线路设置不变）<textarea name="link" rows="3" placeholder="留空就不换"></textarea></label>
         ${EXT_HELP}
@@ -827,6 +870,16 @@ const actions = {
     try { const r = await api('POST', `/api/nodes/${el.dataset.id}/token`); await refresh(); openDrawer({ kind: 'install', id: +el.dataset.id, install: r.install, rotated: true }); }
     catch (e) { drawerError(e.message); }
   },
+  'addr-toggle'(el) {
+    const n = node(+el.dataset.id), v = document.getElementById('addr-v'), show = v.textContent === MASK;
+    v.textContent = show ? (n.host || n.last_ip) : MASK;
+    el.textContent = show ? '隐藏' : '显示';
+  },
+  'host-edit'(el) {
+    el.closest('.field').insertAdjacentHTML('beforeend', hostInput(node(+el.dataset.id)));
+    el.closest('.field').querySelector('input[name="node_domain"]').focus();
+    el.remove();
+  },
   fp(el) {
     el.parentElement.querySelectorAll('.chip').forEach(b => b.setAttribute('aria-pressed', b === el));
     el.closest('.field').querySelector('input[name="reality_fp"]').value = el.dataset.v;
@@ -844,7 +897,7 @@ const actions = {
   },
   async 'save-node'(el) {
     const n = node(+el.dataset.id), f = form();
-    const patch = { name: f.name.trim(), host: f.host, ipv4_only: f.ipv4_only === '1' };
+    const patch = { name: f.name.trim(), host: f.node_domain, ipv4_only: f.ipv4_only === '1' };
     if (n.role === 'entry') {
       Object.assign(patch, {
         anytls_on: f.anytls_on === '1', vless_on: f.vless_on === '1',

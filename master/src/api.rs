@@ -3,7 +3,7 @@
 
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
-use axum::extract::{Path, Request, State};
+use axum::extract::{ConnectInfo, Path, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -11,7 +11,9 @@ use axum::Json;
 use rusqlite::{params, Connection};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::app::App;
@@ -87,7 +89,28 @@ pub fn admin_user(conn: &Connection) -> String {
     db::get_setting(conn, "admin_user").ok().flatten().filter(|u| !u.is_empty()).unwrap_or_else(|| "admin".into())
 }
 
-pub async fn login(State(app): State<Arc<App>>, Json(body): Json<Login>) -> ApiResult {
+/// Failed logins per client IP: (count, window start). Ten misses in ten
+/// minutes lock that IP out until the window passes.
+static FAILS: Mutex<Option<HashMap<String, (u32, i64)>>> = Mutex::new(None);
+const FAIL_LIMIT: u32 = 10;
+const FAIL_WINDOW: i64 = 600;
+
+pub async fn login(
+    State(app): State<Arc<App>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<Login>,
+) -> ApiResult {
+    let ip = crate::ws::client_ip(&app, &headers, peer);
+    let t = now();
+    {
+        let mut f = FAILS.lock().unwrap();
+        let map = f.get_or_insert_with(HashMap::new);
+        map.retain(|_, (_, start)| t - *start < FAIL_WINDOW);
+        if map.get(&ip).is_some_and(|(n, _)| *n >= FAIL_LIMIT) {
+            return Err((StatusCode::TOO_MANY_REQUESTS, Json(json!({"error": "试错太多次，10 分钟后再试"}))).into_response());
+        }
+    }
     let good = {
         let conn = app.db();
         // Check the password even for a wrong name so both take as long.
@@ -95,6 +118,11 @@ pub async fn login(State(app): State<Arc<App>>, Json(body): Json<Login>) -> ApiR
         pw_ok && body.username.trim() == admin_user(&conn)
     };
     if !good {
+        {
+            let mut f = FAILS.lock().unwrap();
+            let e = f.get_or_insert_with(HashMap::new).entry(ip).or_insert((0, t));
+            e.0 += 1;
+        }
         tokio::time::sleep(Duration::from_secs(1)).await;
         return Err((StatusCode::UNAUTHORIZED, Json(json!({"error": "用户名或密码不对"}))).into_response());
     }
