@@ -690,11 +690,10 @@ function userDrawer(d) {
     <section class="sec"><h3>可用入口</h3><div class="chips">${chips || '<span class="muted">还没有入口节点</span>'}</div></section>`;
   if (u) {
     body += `<section class="sec">
-      <div style="display:flex;align-items:center;gap:12px">
-        <span class="mono" id="sub-url" style="flex:1 1 auto;min-width:0;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(u.sub_url)}</span>
+      <div style="display:flex;gap:8px">
         <button type="button" class="btn small" data-act="copy" data-text="${esc(u.sub_url)}">复制订阅</button>
+        <button type="button" class="btn small" data-act="sub-rotate" data-id="${u.id}">重置订阅</button>
       </div>
-      <p class="small muted" style="margin:0">Stash / Clash 自动拿到 Clash 配置，其他客户端拿到通用链接。链接泄露了就点 <button type="button" class="btn small" style="min-height:32px" data-act="sub-rotate" data-id="${u.id}">换订阅链接</button></p>
       <p class="small muted" style="margin:0">本期已用 ${bytes(u.used)}，${u.reset_day} 号清零${u.conns ? ' · 当前 ' + u.conns + ' 个连接' : ''}。</p>
     </section>`;
   }
@@ -952,8 +951,8 @@ const actions = {
     act(() => api('DELETE', `/api/users/${u.id}`), `已删除 ${u.name}。`);
   },
   async 'sub-rotate'(el) {
-    if (!confirm('换订阅链接后旧链接立即失效，要把新链接重新发给这个用户。继续？')) return;
-    try { await api('POST', `/api/users/${el.dataset.id}/sub`); await refresh(); keepUserDraft(); renderDrawer(); }
+    if (!confirm('重置后旧订阅链接立即失效，要把新链接重新发给这个用户。继续？')) return;
+    try { await api('POST', `/api/users/${el.dataset.id}/sub`); flash('订阅已重置，点复制订阅拿新链接。'); await refresh(); keepUserDraft(); renderDrawer(); }
     catch (e) { drawerError(e.message); }
   },
   async 'save-settings'() {
