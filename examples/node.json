@@ -1,0 +1,30 @@
+{
+  "outbound": {
+    "ipv4_only": true,
+    "socks": "127.0.0.1:1081",
+    "direct_domains": "/etc/keel/direct.list"
+  },
+  "inbounds": [
+    {"type": "anytls", "listen": ":719", "cert": "/etc/keel/cert.pem", "key": "/etc/keel/key.pem"},
+    {"type": "vless", "listen": ":443",
+     "reality": {
+       "dest": "www.example.com:443",
+       "server_names": ["www.example.com"],
+       "private_key": "<xray x25519 的 PrivateKey>",
+       "short_ids": ["0123456789abcdef"]
+     }},
+    {"type": "ss2022", "listen": ":8388", "method": "2022-blake3-aes-128-gcm", "password": "<openssl rand -base64 16>"}
+  ],
+  "users": [
+    {
+      "name": "alice",
+      "anytls_password": "<随机字符串>",
+      "uuid": "<xray uuid>",
+      "flow": "xtls-rprx-vision",
+      "ss_key": "<openssl rand -base64 16>",
+      "quota_bytes": 107374182400,
+      "expire_at": 1798732800,
+      "period": "2026-10"
+    }
+  ]
+}
