@@ -3,11 +3,12 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -250,22 +251,37 @@ func TestMasterWebSocketURL(t *testing.T) {
 	}
 }
 
-func TestSelfSignedCert(t *testing.T) {
-	dir := t.TempDir()
-	certPath, keyPath := filepath.Join(dir, "a.crt"), filepath.Join(dir, "a.key")
-	first, err := loadOrCreateCert(certPath, keyPath)
-	if err != nil {
+func TestAnyTLSCert(t *testing.T) {
+	defer func(old string) { certDir = old }(certDir)
+	certDir = t.TempDir()
+	name := func(cert tls.Certificate) string {
+		leaf, _ := x509.ParseCertificate(cert.Certificate[0])
+		return leaf.Subject.CommonName
+	}
+	first, err := anytlsCert(InboundConfig{ServerName: "a.example.com"})
+	if err != nil || name(first) != "a.example.com" {
+		t.Fatal(name(first), err)
+	}
+	second, _ := anytlsCert(InboundConfig{ServerName: "a.example.com"})
+	if string(second.Certificate[0]) != string(first.Certificate[0]) {
+		t.Fatal("the generated certificate must be kept")
+	}
+	third, _ := anytlsCert(InboundConfig{ServerName: "b.example.com"})
+	if name(third) != "b.example.com" {
+		t.Fatal("a new server name must replace the generated certificate")
+	}
+	// Given paths must exist: no silent self-signed replacement.
+	_, err = anytlsCert(InboundConfig{Cert: filepath.Join(certDir, "x.crt"), Key: filepath.Join(certDir, "x.key")})
+	if err == nil {
+		t.Fatal("missing cert files accepted")
+	}
+	certPEM, keyPEM, _ := selfSigned("c.example.com")
+	inline, err := anytlsCert(InboundConfig{CertPEM: string(certPEM), KeyPEM: string(keyPEM), ServerName: "ignored"})
+	if err != nil || name(inline) != "c.example.com" {
+		t.Fatal("inline certificate not used", err)
+	}
+	certDir = ""
+	if _, err = anytlsCert(InboundConfig{}); err != nil {
 		t.Fatal(err)
-	}
-	second, err := loadOrCreateCert(certPath, keyPath)
-	if err != nil || string(second.Certificate[0]) != string(first.Certificate[0]) {
-		t.Fatal("second load did not reuse the generated certificate")
-	}
-	if _, err = loadOrCreateCert("", ""); err != nil {
-		t.Fatal(err)
-	}
-	os.Remove(keyPath)
-	if _, err = loadOrCreateCert(certPath, keyPath); err == nil {
-		t.Error("a half-missing key pair must be an error, not silently replaced")
 	}
 }

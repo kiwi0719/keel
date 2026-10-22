@@ -49,7 +49,7 @@ KEEL_TOKEN=<节点令牌> keel-node -master https://panel.example:8443 \
     -fingerprint <主控证书 SHA-256> -c /etc/keel/node.json -state /var/lib/keel/usage.json
 ```
 
-节点每 5 秒上报一次每个用户的流量、连接数和整机状态（CPU、内存、硬盘、网速、连接数、TCP 重传率、在线时长），配置了 `probes` 时还会定时对电信、联通、移动的目标做 TCPing（延迟、波动、丢包）。AnyTLS 的证书文件不存在时自动生成自签证书。
+节点每 5 秒上报一次每个用户的流量、连接数和整机状态（CPU、内存、硬盘、网速、连接数、TCP 重传率、在线时长），配置了 `probes` 时还会定时对电信、联通、移动的目标做 TCPing（延迟、波动、丢包）。入口的可选参数（AnyTLS 的域名、证书、填充方案，Reality 的 SNI、dest、shortId 等）见 [docs/node-protocol.md](docs/node-protocol.md#入口入站的可选参数)。
 
 配置格式见 [examples/entry.json](examples/entry.json)（入口）和 [examples/exit.json](examples/exit.json)（出口）。
 

@@ -155,4 +155,36 @@ keel-node -master https://panel.example:8443 -token <节点令牌> \
 - 入口节点上的用户名：`u<用户id>`。
 - 出口节点上的用户名（每个入口一个）：`n<入口id>x<出口id>`。出口按这个名字统计每个入口走了多少流量。
 - 分流规则用 `domains` 直接写在配置里，不用 `file`（主控没法往节点上放文件）。顺序：直连名单放第一条（`outbound: "direct"`），然后是 AI、流媒体等规则集，最后 `final` 指向默认出口。规则和 `final` 选了多个出口时按面板上的顺序写成列表。
-- AnyTLS 入站的 `cert` / `key`：两个文件都不存在时，节点会在那两个路径生成一张自签 ECDSA 证书（AnyTLS 客户端本来就不校验证书）；两个都留空则只在内存里生成。所以主控可以统一写 `/var/lib/keel/anytls.crt` 和 `/var/lib/keel/anytls.key`。
+- 入口节点只下发 `anytls` 和 `vless`（Reality）入站；`ss2022` 入站只给出口用。
+
+## 入口入站的可选参数
+
+AnyTLS：
+
+```json
+{"type":"anytls","listen":"0.0.0.0:443","server_name":"a.example.com",
+ "cert":"/etc/letsencrypt/live/a.example.com/fullchain.pem","key":"/etc/letsencrypt/live/a.example.com/privkey.pem",
+ "padding_scheme":["stop=8","0=30-30","1=100-400","2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000","3=9-9,500-1000","4=500-1000","5=500-1000","6=500-1000","7=500-1000"]}
+```
+
+- `server_name`：客户端连接时用的域名（SNI）。节点不按它拒绝连接，只用来生成自签证书；主控也用它生成订阅里的 `sni`。
+- 证书三选一，按顺序：
+  1. `cert_pem` + `key_pem`：证书内容直接写在配置里（PEM 文本）。
+  2. `cert` + `key`：节点上的证书文件路径，比如 certbot 申请的证书。文件必须存在，不存在或读不了时这个入站起不来，`applied.error` 里写明原因，节点不会自己生成证书去顶替。
+  3. 都不给：节点用自签 ECDSA 证书，域名是 `server_name`（没写就是 `localhost`），保存在 `-c` 配置文件所在目录的 `anytls.crt` / `anytls.key`，重启后不变；`server_name` 改了会重新生成。AnyTLS 客户端通常不校验证书（订阅里写 `skip-cert-verify` / `insecure`）。
+- 换证书文件后要重新下发配置（或改动这个入站）才会加载新证书。
+- `padding_scheme`：可选，覆盖 AnyTLS 默认的填充方案，格式和 sing-box 的 `padding_scheme` 一样，每行一条。服务端会把它推给客户端，客户端不用配置。写错（缺 `stop=`）这个入站起不来。
+
+VLESS Reality：
+
+```json
+{"type":"vless","listen":"0.0.0.0:443",
+ "reality":{"dest":"www.example.com:443","server_names":["www.example.com","cdn.example.com"],
+            "private_key":"<x25519 私钥>","short_ids":["","0123abcd"],"max_time_diff":"1m"}}
+```
+
+- `server_names`：客户端可以用的 SNI，可以写多个，必须至少一个。第一个就是订阅里默认的 `sni`。
+- `dest`：借用握手的网站，`host:port`；不写端口就是 443，整个不写就用 `server_names` 的第一个加 443。
+- `short_ids`：可以写多个，每个 0 到 16 位十六进制（位数为偶数）；空字符串表示允许不带 shortId。整个不写等于只允许空 shortId。
+- `max_time_diff`：可选，客户端和服务器允许的最大时间差，不写不检查。
+- 用户的 `flow` 为 `xtls-rprx-vision` 或空。客户端指纹（`fp`）只在订阅里，节点不需要。

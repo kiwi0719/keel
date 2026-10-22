@@ -104,9 +104,17 @@ type InboundConfig struct {
 	Type   string `json:"type"` // anytls | vless | ss2022
 	Listen string `json:"listen"`
 
-	// anytls
-	Cert string `json:"cert,omitempty"`
-	Key  string `json:"key,omitempty"`
+	// anytls. The certificate comes from cert_pem/key_pem, else from the
+	// cert/key files (which must exist); with neither the node uses its own
+	// self-signed one for server_name (see anytlsCert).
+	ServerName string `json:"server_name,omitempty"` // the domain clients use
+	Cert       string `json:"cert,omitempty"`
+	Key        string `json:"key,omitempty"`
+	CertPEM    string `json:"cert_pem,omitempty"`
+	KeyPEM     string `json:"key_pem,omitempty"`
+	// PaddingScheme overrides AnyTLS's default padding, one rule per line
+	// as in sing-box ("stop=8", "0=30-30", ...).
+	PaddingScheme []string `json:"padding_scheme,omitempty"`
 
 	// vless
 	Reality *RealityConfig `json:"reality,omitempty"`
@@ -119,7 +127,11 @@ type InboundConfig struct {
 
 // RealityConfig uses the same names as Xray's realitySettings.
 type RealityConfig struct {
-	Dest        string   `json:"dest"`
+	// Dest is the site Reality borrows its handshake from, host:port; when
+	// empty it is the first server name on port 443.
+	Dest string `json:"dest,omitempty"`
+	// ServerNames are the SNIs clients may use; the first is the default
+	// the master puts in client links.
 	ServerNames []string `json:"server_names"`
 	PrivateKey  string   `json:"private_key"` // X25519, base64 raw URL encoding
 	ShortIDs    []string `json:"short_ids"`

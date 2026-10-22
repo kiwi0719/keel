@@ -54,8 +54,15 @@ func newRealityConfig(c *RealityConfig) (*utls.RealityConfig, error) {
 	if c == nil {
 		return nil, errors.New("vless inbound needs reality settings")
 	}
-	if c.Dest == "" || len(c.ServerNames) == 0 {
-		return nil, errors.New("reality: dest and server_names are required")
+	if len(c.ServerNames) == 0 || c.ServerNames[0] == "" {
+		return nil, errors.New("reality: server_names is required")
+	}
+	dest := c.Dest
+	if dest == "" {
+		dest = c.ServerNames[0]
+	}
+	if _, _, err := net.SplitHostPort(dest); err != nil {
+		dest = net.JoinHostPort(dest, "443")
 	}
 	privateKey, err := base64.RawURLEncoding.DecodeString(c.PrivateKey)
 	if err != nil || len(privateKey) != 32 {
@@ -63,7 +70,7 @@ func newRealityConfig(c *RealityConfig) (*utls.RealityConfig, error) {
 	}
 	config := &utls.RealityConfig{
 		Type:        "tcp",
-		Dest:        c.Dest,
+		Dest:        dest,
 		ServerNames: make(map[string]bool),
 		PrivateKey:  privateKey,
 		MaxTimeDiff: time.Duration(c.MaxTimeDiff),
