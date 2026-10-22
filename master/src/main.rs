@@ -144,6 +144,31 @@ fn write_private(path: &Path, content: &[u8]) -> Result<(), String> {
     f.write_all(content).map_err(|e| e.to_string())
 }
 
+/// The data directory holds every secret (node tokens, user keys, the
+/// Cloudflare token, sessions): owner only. SQLite gives its -wal and -shm
+/// files the database file's mode.
+fn lock_down(data: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let set = |p: &Path, mode: u32| {
+            if p.exists() {
+                if let Err(e) = std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)) {
+                    eprintln!("{}: {e}", p.display());
+                }
+            }
+        };
+        set(data, 0o700);
+        let db = data.join("keel.db");
+        if !db.exists() {
+            let _ = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&db);
+        }
+        for name in ["keel.db", "keel.db-wal", "keel.db-shm"] {
+            set(&data.join(name), 0o600);
+        }
+    }
+}
+
 fn static_file(body: &'static str, ctype: &'static str) -> Response {
     ([(header::CONTENT_TYPE, ctype), (header::CACHE_CONTROL, "no-cache")], body).into_response()
 }
@@ -278,6 +303,7 @@ async fn main() {
         eprintln!("{}: {e}", o.data.display());
         std::process::exit(1);
     }
+    lock_down(&o.data);
     let conn = db::open(&o.data.join("keel.db")).unwrap_or_else(|e| {
         eprintln!("database: {e}");
         std::process::exit(1)

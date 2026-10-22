@@ -59,6 +59,24 @@ ExecStart=/usr/local/bin/keel-node $ARGS
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
+# Root for low ports and certificate files, but sandboxed: it writes only
+# /etc/keel (config cache, certificates) and /var/lib/keel (counters).
+NoNewPrivileges=yes
+ProtectSystem=full
+ReadWritePaths=/etc/keel /var/lib/keel
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target
