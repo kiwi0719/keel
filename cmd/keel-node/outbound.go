@@ -35,25 +35,39 @@ type outbound interface {
 // reload; connections keep the router they started with.
 type router struct {
 	rules    []routeRule
-	final    string
+	final    []string
 	outbound map[string]outbound
+	// health tracks every outbound but direct; entries are carried over a
+	// reload when the outbound's settings did not change.
+	health      map[string]*outboundHealth
+	healthCheck healthCheck
 }
 
 type routeRule struct {
 	name     string
 	list     *ruleList
-	outbound string
+	outbound []string // fallback order
 }
 
 var currentRouter atomic.Pointer[router]
 
 func newRouter(c *Config, previous *router) (*router, error) {
 	direct := &directOutbound{ipv4Only: c.Route.IPv4Only}
-	r := &router{final: c.Route.Final, outbound: map[string]outbound{"direct": direct}}
-	if r.final == "" {
-		r.final = "direct"
+	r := &router{
+		final:       c.Route.Final,
+		outbound:    map[string]outbound{"direct": direct},
+		health:      make(map[string]*outboundHealth),
+		healthCheck: newHealthCheck(c.Route.HealthCheck),
+	}
+	if len(r.final) == 0 {
+		r.final = []string{"direct"}
 	}
 	for _, o := range c.Outbounds {
+		if previous != nil && previous.health[o.Tag] != nil && previous.health[o.Tag].config == o {
+			r.health[o.Tag] = previous.health[o.Tag]
+		} else {
+			r.health[o.Tag] = newOutboundHealth(o)
+		}
 		switch o.Type {
 		case "socks":
 			r.outbound[o.Tag] = &socksOutbound{socks.NewClient(direct, M.ParseSocksaddr(o.Server), socks.Version5, "", "")}
@@ -91,18 +105,39 @@ func newRouter(c *Config, previous *router) (*router, error) {
 	return r, nil
 }
 
-// pick returns the outbound for destination and a label for logs.
-func (r *router) pick(destination M.Socksaddr) (outbound, string) {
+// pick returns the outbound for destination, its tag and a label for logs.
+func (r *router) pick(destination M.Socksaddr) (outbound, string, string) {
 	for _, rule := range r.rules {
 		if rule.list.match(destination) {
-			return r.outbound[rule.outbound], rule.name + "->" + rule.outbound
+			tag := r.firstAlive(rule.outbound)
+			return r.outbound[tag], tag, rule.name + "->" + tag
 		}
 	}
-	return r.outbound[r.final], r.final
+	tag := r.firstAlive(r.final)
+	return r.outbound[tag], tag, tag
+}
+
+// firstAlive returns the first outbound of list that is not known to be
+// dead. When all are dead it returns the first, so traffic still tries.
+func (r *router) firstAlive(list []string) string {
+	for _, tag := range list {
+		if h := r.health[tag]; h == nil || h.isAlive() {
+			return tag
+		}
+	}
+	return list[0]
+}
+
+// dialFailed asks for an early health check after a dial to the outbound's
+// server failed.
+func (r *router) dialFailed(tag string) {
+	if h := r.health[tag]; h != nil {
+		h.suspect()
+	}
 }
 
 func (r *router) relayTCP(ctx context.Context, user string, conn net.Conn, destination M.Socksaddr) {
-	out, label := r.pick(destination)
+	out, tag, label := r.pick(destination)
 	if verbose {
 		log.Print("[", user, "] tcp ", destination, " via ", label)
 	}
@@ -110,6 +145,7 @@ func (r *router) relayTCP(ctx context.Context, user string, conn net.Conn, desti
 	remote, err := out.dialTCP(dialCtx, destination)
 	cancel()
 	if err != nil {
+		r.dialFailed(tag)
 		N.ReportHandshakeFailure(conn, err)
 		if verbose {
 			log.Print("[", user, "] tcp ", destination, ": ", err)
@@ -124,13 +160,16 @@ func (r *router) relayTCP(ctx context.Context, user string, conn net.Conn, desti
 // UDP-over-TCP (to report the handshake result), or nil. The session is
 // routed by its first destination.
 func (r *router) relayUDP(ctx context.Context, user string, packetConn N.PacketConn, stream net.Conn, destination M.Socksaddr) {
-	out, label := r.pick(destination)
+	out, tag, label := r.pick(destination)
 	if verbose {
 		log.Print("[", user, "] udp ", destination, " via ", label)
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
 	remote, err := out.listenUDP(dialCtx, destination)
 	cancel()
+	if err != nil {
+		r.dialFailed(tag)
+	}
 	if stream != nil {
 		if err != nil {
 			N.ReportHandshakeFailure(stream, err)

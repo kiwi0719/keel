@@ -64,6 +64,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go n.prober.run(ctx)
+	go runHealthChecks(ctx)
 	masterConfigs := make(chan masterConfig)
 	if *master != "" {
 		if *token == "" {

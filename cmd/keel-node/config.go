@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -32,14 +33,53 @@ type RouteConfig struct {
 	IPv4Only bool         `json:"ipv4_only,omitempty"`
 	Rules    []RuleConfig `json:"rules,omitempty"`
 	// Final is the outbound for everything no rule matched; default "direct".
-	Final string `json:"final,omitempty"`
+	Final OutboundList `json:"final,omitempty"`
+	// HealthCheck decides when an outbound counts as dead, so lists with
+	// several outbounds fall back to the next one.
+	HealthCheck HealthCheckConfig `json:"health_check,omitzero"`
+}
+
+// HealthCheckConfig: every Interval the node fetches URL (plain http) through
+// each outbound. Two failures in a row mark it dead, two successes alive.
+type HealthCheckConfig struct {
+	URL      string   `json:"url,omitempty"`      // default http://www.gstatic.com/generate_204
+	Interval Duration `json:"interval,omitempty"` // default 15s, minimum 5s
+}
+
+// OutboundList is one outbound tag or an ordered list of them; the first
+// alive one is used. In JSON it is a string or an array of strings.
+type OutboundList []string
+
+func (l *OutboundList) UnmarshalJSON(content []byte) error {
+	var one string
+	if err := json.Unmarshal(content, &one); err == nil {
+		*l = OutboundList{one}
+		if one == "" {
+			*l = nil
+		}
+		return nil
+	}
+	var many []string
+	if err := json.Unmarshal(content, &many); err != nil {
+		return fmt.Errorf("outbound must be a tag or a list of tags: %w", err)
+	}
+	*l = many
+	return nil
+}
+
+func (l OutboundList) MarshalJSON() ([]byte, error) {
+	if len(l) == 1 {
+		return json.Marshal(l[0])
+	}
+	return json.Marshal([]string(l))
 }
 
 type RuleConfig struct {
-	Name     string   `json:"name,omitempty"` // shown in logs, e.g. "ai"
-	File     string   `json:"file,omitempty"` // list file, reloaded when it changes
-	Domains  []string `json:"domains,omitempty"`
-	Outbound string   `json:"outbound"`
+	Name    string   `json:"name,omitempty"` // shown in logs, e.g. "ai"
+	File    string   `json:"file,omitempty"` // list file, reloaded when it changes
+	Domains []string `json:"domains,omitempty"`
+	// Outbound is a tag or an ordered fallback list of tags.
+	Outbound OutboundList `json:"outbound"`
 }
 
 // OutboundConfig is a way out of the node besides the built-in "direct".
@@ -163,16 +203,30 @@ func (c *Config) validate() error {
 		}
 		tags[o.Tag] = true
 	}
+	checkList := func(where string, list OutboundList) error {
+		for _, tag := range list {
+			if !tags[tag] {
+				return fmt.Errorf("%s: unknown outbound %q", where, tag)
+			}
+		}
+		return nil
+	}
 	for i, r := range c.Route.Rules {
-		if !tags[r.Outbound] {
-			return fmt.Errorf("route rule %d: unknown outbound %q", i+1, r.Outbound)
+		if len(r.Outbound) == 0 {
+			return fmt.Errorf("route rule %d: needs an outbound", i+1)
+		}
+		if err := checkList(fmt.Sprint("route rule ", i+1), r.Outbound); err != nil {
+			return err
 		}
 		if r.File == "" && len(r.Domains) == 0 {
 			return fmt.Errorf("route rule %d: needs file or domains", i+1)
 		}
 	}
-	if c.Route.Final != "" && !tags[c.Route.Final] {
-		return fmt.Errorf("route final: unknown outbound %q", c.Route.Final)
+	if err := checkList("route final", c.Route.Final); err != nil {
+		return err
+	}
+	if u := c.Route.HealthCheck.URL; u != "" && !strings.HasPrefix(u, "http://") {
+		return fmt.Errorf("route health_check url must be plain http://, got %q", u)
 	}
 	keys := make(map[string]bool)
 	for _, inbound := range c.Inbounds {
