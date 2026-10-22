@@ -2,7 +2,7 @@ module github.com/kiwi0719/keel
 
 go 1.24.0
 
-toolchain go1.24.7
+toolchain go1.26.10
 
 replace github.com/anytls/sing-anytls => ./third_party/sing-anytls
 

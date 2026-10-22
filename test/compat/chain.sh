@@ -50,7 +50,8 @@ for i in 1 2; do
   psk=PSK$i key=KEY$i port=EXIT${i}_PORT
   mkdir -p "$WORK/exit$i"
   cat > "$WORK/exit$i/node.json" <<JSON
-{"inbounds": [{"type": "ss2022", "listen": "127.0.0.1:${!port}", "password": "${!psk}"}],
+{"route": {"allow_private": true},
+ "inbounds": [{"type": "ss2022", "listen": "127.0.0.1:${!port}", "password": "${!psk}"}],
  "users": [{"name": "entry", "ss_key": "${!key}"}]}
 JSON
   start_exit $i
@@ -59,6 +60,7 @@ mkdir -p "$WORK/entry"
 cat > "$WORK/entry/node.json" <<JSON
 {
   "route": {
+    "allow_private": true,
     "rules": [
       {"name": "ai", "domains": ["=localhost", "127.0.0.2/32"], "outbound": "exit2"},
       {"name": "direct", "domains": ["127.0.0.3"], "outbound": "direct"},

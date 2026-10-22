@@ -54,6 +54,7 @@ SS_KEY=$(openssl rand -base64 16)
 
 cat > "$WORK/node.json" <<JSON
 {
+  "route": {"allow_private": true},
   "inbounds": [
     {"type": "vless", "listen": "127.0.0.1:$VLESS_PORT",
      "reality": {"dest": "$DEST", "server_names": ["$SNI"], "private_key": "$PRIV", "short_ids": ["$SID"]}},

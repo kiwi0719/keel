@@ -27,7 +27,7 @@ func newVLESSOutbound(o OutboundConfig, direct *directOutbound) (*vlessOutbound,
 }
 
 func (v *vlessOutbound) dialTCP(ctx context.Context, destination M.Socksaddr) (net.Conn, error) {
-	conn, err := v.direct.dialTCP(ctx, v.server)
+	conn, err := v.direct.dialServer(ctx, v.server)
 	if err != nil {
 		return nil, err
 	}
@@ -41,7 +41,7 @@ func (v *vlessOutbound) dialTCP(ctx context.Context, destination M.Socksaddr) (n
 }
 
 func (v *vlessOutbound) listenUDP(ctx context.Context, destination M.Socksaddr) (N.PacketConn, error) {
-	conn, err := v.direct.dialTCP(ctx, v.server)
+	conn, err := v.direct.dialServer(ctx, v.server)
 	if err != nil {
 		return nil, err
 	}
