@@ -343,7 +343,7 @@ pub async fn create_node(State(app): State<Arc<App>>, headers: HeaderMap, Json(b
         if b.role == "exit" {
             conn.execute(
                 "INSERT INTO exits(node_id,name,port,psk,reset_day,sort) VALUES(?1,?2,?3,?4,1,0)",
-                params![id, code, 20730, random_b64(16)],
+                params![id, code, crate::util::random_port(&[]), random_b64(16)],
             )
             .map_err(internal)?;
         }
@@ -353,6 +353,9 @@ pub async fn create_node(State(app): State<Arc<App>>, headers: HeaderMap, Json(b
     let base = base_url(&app, &headers);
     ok(json!({"id": id, "install": install_command(&app, &base, &token)}))
 }
+
+/// uTLS fingerprints clients may present for Reality.
+const FINGERPRINTS: &[&str] = &["chrome", "firefox", "safari", "ios", "android", "edge", "random"];
 
 pub async fn update_node(State(app): State<Arc<App>>, Path(id): Path<i64>, Json(b): Json<Map<String, Value>>) -> ApiResult {
     {
@@ -373,8 +376,48 @@ pub async fn update_node(State(app): State<Arc<App>>, Path(id): Path<i64>, Json(
                 "host" => ("host", json!(str_field(v, 255)?)),
                 "direct_list" => ("direct_list", json!(str_field(v, 200_000)?)),
                 "anytls_sni" => ("anytls_sni", json!(str_field(v, 255)?)),
-                "reality_dest" => ("reality_dest", json!(str_field(v, 255)?)),
-                "reality_sni" => ("reality_sni", json!(str_field(v, 255)?)),
+                "anytls_cert" | "anytls_key" => {
+                    let s = str_field(v, 255)?;
+                    if !s.is_empty() && !s.starts_with('/') {
+                        return Err(bad("证书路径要写服务器上的绝对路径，比如 /etc/letsencrypt/live/域名/fullchain.pem"));
+                    }
+                    (k.as_str(), json!(s))
+                }
+                "reality_dest" => {
+                    let s = str_field(v, 255)?;
+                    if !s.is_empty() && !s.rsplit_once(':').is_some_and(|(h, p)| !h.is_empty() && p.parse::<u16>().is_ok()) {
+                        return Err(bad("Reality 目标要写成 域名:端口，比如 www.apple.com:443"));
+                    }
+                    ("reality_dest", json!(s))
+                }
+                "reality_sni" => {
+                    let names = db::split_list(&str_field(v, 1000)?);
+                    if names.is_empty() {
+                        return Err(bad("Reality SNI 至少填一个"));
+                    }
+                    ("reality_sni", json!(names.join(",")))
+                }
+                "reality_short_id" => {
+                    let ids = db::split_list(&str_field(v, 500)?);
+                    if ids.is_empty() || ids.iter().any(|i| i.len() > 16 || i.len() % 2 != 0 || !i.chars().all(|c| c.is_ascii_hexdigit())) {
+                        return Err(bad("Short ID 是 0–16 位偶数长度的十六进制，多个用逗号隔开"));
+                    }
+                    ("reality_short_id", json!(ids.join(",").to_lowercase()))
+                }
+                "reality_fp" => {
+                    let s = str_field(v, 20)?;
+                    if !FINGERPRINTS.contains(&s.as_str()) {
+                        return Err(bad("不支持这个指纹"));
+                    }
+                    ("reality_fp", json!(s))
+                }
+                "reality_regen" => {
+                    if v.as_bool() == Some(true) {
+                        let (private, public) = crate::util::reality_keypair();
+                        conn.execute("UPDATE nodes SET reality_private=?1, reality_public=?2 WHERE id=?3", params![private, public, id]).map_err(internal)?;
+                    }
+                    continue;
+                }
                 "ipv4_only" | "anytls_on" | "vless_on" | "ss_on" => (k.as_str(), json!(bool_field(v)?)),
                 "anytls_port" | "vless_port" | "ss_port" => (k.as_str(), json!(port_field(v)?)),
                 "default_exit" => {
@@ -608,12 +651,14 @@ pub async fn create_exit(State(app): State<Arc<App>>, Json(b): Json<Map<String, 
         if role != "exit" {
             return Err(bad("只有出口节点能加 SS 端口"));
         }
-        let (count, max_port): (i64, i64) = tx
-            .query_row("SELECT COUNT(*), COALESCE(MAX(port),20729) FROM exits WHERE node_id=?1", [node], |r| Ok((r.get(0)?, r.get(1)?)))
+        let taken: Vec<i64> = tx
+            .prepare("SELECT port FROM exits WHERE node_id=?1")
+            .and_then(|mut st| st.query_map([node], |r| r.get(0))?.collect())
             .map_err(internal)?;
+        let count = taken.len() as i64;
         tx.execute(
             "INSERT INTO exits(node_id,name,port,psk,reset_day,sort) VALUES(?1,?2,?3,?4,1,?5)",
-            params![node, format!("出口 {}", count + 1), (max_port + 1).min(65535), random_b64(16), count],
+            params![node, format!("出口 {}", count + 1), crate::util::random_port(&taken), random_b64(16), count],
         )
         .map_err(internal)?;
         let id = tx.last_insert_rowid();

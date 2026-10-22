@@ -120,6 +120,11 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     // Fallback exits in order, comma-separated exit ids (0 = direct).
     ("nodes", "default_fallback", "TEXT NOT NULL DEFAULT ''"),
     ("entry_rules", "fallback", "TEXT NOT NULL DEFAULT ''"),
+    // AnyTLS certificate files on the node; empty = the node's own self-signed cert.
+    ("nodes", "anytls_cert", "TEXT NOT NULL DEFAULT ''"),
+    ("nodes", "anytls_key", "TEXT NOT NULL DEFAULT ''"),
+    // uTLS fingerprint clients present for Reality (subscription only).
+    ("nodes", "reality_fp", "TEXT NOT NULL DEFAULT 'chrome'"),
 ];
 
 /// Databases from before external exits have exits.node_id NOT NULL and no
@@ -145,6 +150,11 @@ fn migrate_exits(conn: &mut Connection) -> rusqlite::Result<()> {
     ))?;
     tx.commit()?;
     conn.pragma_update(None, "foreign_keys", "ON")
+}
+
+/// Comma- or space-separated text as a list, empty items dropped.
+pub fn split_list(s: &str) -> Vec<String> {
+    s.split(|c: char| c == ',' || c.is_whitespace()).filter(|x| !x.is_empty()).map(str::to_string).collect()
 }
 
 pub fn ids_from_text(s: &str) -> Vec<i64> {
@@ -222,6 +232,8 @@ pub struct Node {
     pub anytls_on: bool,
     pub anytls_port: i64,
     pub anytls_sni: String,
+    pub anytls_cert: String,
+    pub anytls_key: String,
     pub vless_on: bool,
     pub vless_port: i64,
     pub reality_dest: String,
@@ -230,9 +242,13 @@ pub struct Node {
     pub reality_private: String,
     pub reality_public: String,
     pub reality_short_id: String,
+    pub reality_fp: String,
+    // SS entry inbounds are retired (entries speak AnyTLS / Reality only);
+    // the columns stay so old databases load.
     pub ss_on: bool,
     pub ss_port: i64,
     #[serde(skip)]
+    #[allow(dead_code)]
     pub ss_psk: String,
     pub default_exit: i64,
     pub default_fallback: Vec<i64>,
@@ -244,6 +260,14 @@ impl Node {
     pub fn is_entry(&self) -> bool {
         self.role == "entry"
     }
+    /// Reality server names; the first is the one clients send.
+    pub fn reality_names(&self) -> Vec<String> {
+        split_list(&self.reality_sni)
+    }
+    /// Reality short ids; the first goes into subscriptions.
+    pub fn reality_short_ids(&self) -> Vec<String> {
+        split_list(&self.reality_short_id)
+    }
     /// Address clients and entries use to reach this node.
     pub fn address(&self) -> &str {
         if self.host.is_empty() {
@@ -254,7 +278,7 @@ impl Node {
     }
 }
 
-const NODE_COLS: &str = "id,code,name,role,host,last_ip,token,sort,ipv4_only,direct_list,anytls_on,anytls_port,anytls_sni,vless_on,vless_port,reality_dest,reality_sni,reality_private,reality_public,reality_short_id,ss_on,ss_port,ss_psk,default_exit,config_rev,default_fallback";
+const NODE_COLS: &str = "id,code,name,role,host,last_ip,token,sort,ipv4_only,direct_list,anytls_on,anytls_port,anytls_sni,vless_on,vless_port,reality_dest,reality_sni,reality_private,reality_public,reality_short_id,ss_on,ss_port,ss_psk,default_exit,config_rev,default_fallback,anytls_cert,anytls_key,reality_fp";
 
 fn node_from_row(r: &rusqlite::Row) -> rusqlite::Result<Node> {
     Ok(Node {
@@ -284,6 +308,9 @@ fn node_from_row(r: &rusqlite::Row) -> rusqlite::Result<Node> {
         default_exit: r.get(23)?,
         config_rev: r.get(24)?,
         default_fallback: ids_from_text(&r.get::<_, String>(25)?),
+        anytls_cert: r.get(26)?,
+        anytls_key: r.get(27)?,
+        reality_fp: r.get(28)?,
     })
 }
 
@@ -478,10 +505,12 @@ pub fn insert_node(conn: &Connection, role: &str, code: &str, name: &str, now: i
     let sort: i64 = conn.query_row("SELECT COALESCE(MAX(sort),0)+1 FROM nodes", [], |r| r.get(0))?;
     if role == "entry" {
         let (private, public) = crate::util::reality_keypair();
+        let anytls_port = crate::util::random_port(&[]);
+        let vless_port = crate::util::random_port(&[anytls_port]);
         conn.execute(
             "INSERT INTO nodes(code,name,role,token,sort,anytls_on,anytls_port,vless_on,vless_port,reality_dest,reality_sni,reality_private,reality_public,reality_short_id,ss_port,ss_psk,created_at)
-             VALUES(?1,?2,'entry',?3,?4,1,443,0,8443,'www.apple.com:443','www.apple.com',?5,?6,?7,8388,?8,?9)",
-            params![code, name, token, sort, private, public, random_hex(8), random_b64(16), now],
+             VALUES(?1,?2,'entry',?3,?4,1,?10,0,?11,'www.apple.com:443','www.apple.com',?5,?6,?7,0,?8,?9)",
+            params![code, name, token, sort, private, public, random_hex(8), random_b64(16), now, anytls_port, vless_port],
         )?;
     } else {
         conn.execute(

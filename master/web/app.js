@@ -274,14 +274,14 @@ function linesPage() {
   const toast = S.toast ? `${shape({ color: C.blue, shape: 'circle' }, 8)}<span>${esc(S.toast)}</span>` : '';
   let html = `
     <div class="section-head">
-      <h2>入口 <span class="muted">用户连这里，选它走哪个出口</span></h2>
+      <h2>入口</h2>
       <button class="btn" data-act="new-node">添加节点</button>
     </div>
     <div class="toast" role="status">${toast}</div>`;
   html += es.length ? `<div class="grid entries">${es.map(entryCard).join('')}</div>`
     : `<div class="empty" style="margin-bottom:48px">还没有入口节点。</div>`;
   html += `<div class="section-head">
-      <h2>出口 <span class="muted">自建 SS-2022 · 外部导入</span></h2>
+      <h2>出口</h2>
       <button class="btn" data-act="ext-import">导入外部出口</button>
     </div>`;
   const cards = [];
@@ -349,7 +349,7 @@ function fallbackLine(n, rule, primary, fallback) {
 function entryCard(n) {
   const st = nodeStatus(n);
   const editing = S.editing === n.id;
-  const protos = [n.anytls_on && 'AnyTLS', n.vless_on && 'VLESS', n.ss_on && 'SS'].filter(Boolean).join(' · ') || '没开协议';
+  const protos = [n.anytls_on && 'AnyTLS', n.vless_on && 'Reality'].filter(Boolean).join(' · ') || '没开协议';
   const head = editing
     ? `<span class="code" style="font-size:28px">${esc(n.code)}</span>
        <input class="rename-input" id="rename-input" value="${esc(n.name)}" aria-label="给 ${esc(n.code)} 改名" data-key="rename" data-id="${n.id}">
@@ -454,7 +454,7 @@ function usersPage() {
     </div>
     ${S.toast ? `<div class="toast" role="status">${shape({ color: C.blue, shape: 'circle' }, 8)}<span>${esc(S.toast)}</span></div>` : ''}
     <div class="users">${list || '<div class="empty">还没有用户。</div>'}</div>
-    <p class="muted" style="font-size:13px;margin:20px 0 0">额度在节点本地执行，主控断线也照样生效。到期或用完自动停用，到重置日自动清零。</p>`;
+    `;
 }
 
 // ---------- drawers ----------
@@ -521,15 +521,31 @@ function nodeDrawer(d) {
         <input class="port" name="${portName}" value="${port}" inputmode="numeric" aria-label="${name} 端口">
       </div>`;
     const built = n.protocols && n.protocols.length ? n.protocols : null;
-    const missing = ['anytls', 'vless', 'ss2022'].filter(p => built && !built.includes(p) && n[{ anytls: 'anytls_on', vless: 'vless_on', ss2022: 'ss_on' }[p]]);
+    const missing = ['anytls', 'vless'].filter(p => built && !built.includes(p) && n[p + '_on']);
+    const ownCert = !!(n.anytls_cert && n.anytls_key);
+    const sni0 = (n.reality_sni || '').split(',')[0];
+    const fp = n.reality_fp || 'chrome';
     body += `<section class="sec" style="gap:0">
         <h3 style="margin-bottom:4px">协议</h3>
-        ${proto('anytls_on', 'AnyTLS', '自签证书，客户端跳过校验', 'anytls_port', n.anytls_port)}
-        ${proto('vless_on', 'VLESS Reality', 'Vision · 伪装 ' + esc(n.reality_sni), 'vless_port', n.vless_port)}
-        <div class="fields two" style="padding:10px 0;border-bottom:1px solid #D6D1C6">
-          ${field('Reality 伪装站点', 'reality_sni', n.reality_sni, { full: true })}
+        ${proto('anytls_on', 'AnyTLS', ownCert ? '自有证书，客户端校验' : '自签证书，客户端跳过校验', 'anytls_port', n.anytls_port)}
+        <div class="fields two proto-opts">
+          ${field('域名 · SNI', 'anytls_sni', n.anytls_sni, { full: true, placeholder: '比如 jp.example.com，留空不带 SNI' })}
+          ${field('证书文件（服务器上的路径）', 'anytls_cert', n.anytls_cert, { placeholder: '留空用自签' })}
+          ${field('私钥文件', 'anytls_key', n.anytls_key, { placeholder: '留空用自签' })}
         </div>
-        ${proto('ss_on', 'SS-2022', '每人独立密钥', 'ss_port', n.ss_port)}
+        ${proto('vless_on', 'VLESS Reality', 'Vision · 伪装 ' + esc(sni0), 'vless_port', n.vless_port)}
+        <div class="fields two proto-opts">
+          ${field('SNI（多个用逗号隔开，第一个给订阅）', 'reality_sni', n.reality_sni, { full: true })}
+          ${field('目标 dest', 'reality_dest', n.reality_dest, { placeholder: '留空为 ' + (sni0 || 'SNI') + ':443' })}
+          ${field('Short ID', 'reality_short_id', n.reality_short_id, { placeholder: '十六进制，多个用逗号' })}
+          <div class="field full">客户端指纹
+            <div class="chips" role="group" aria-label="客户端指纹" style="margin-top:6px">${['chrome', 'firefox', 'safari', 'ios', 'android', 'edge', 'random'].map(v => `<button type="button" class="chip small-chip" data-act="fp" data-v="${v}" aria-pressed="${v === fp}">${v}</button>`).join('')}</div>
+            <input type="hidden" name="reality_fp" value="${esc(fp)}">
+          </div>
+          <div class="field full">公钥 <span class="mono small" style="word-break:break-all;color:var(--ink)">${esc(n.reality_public)}</span>
+            <button type="button" class="text-btn" style="align-self:flex-start;padding:0" data-act="reality-regen" data-id="${n.id}">换一对密钥</button>
+          </div>
+        </div>
         ${missing.length ? `<p class="err" style="margin:10px 0 0">这台的 keel-node 没编进 ${missing.join('、')}，这些不会下发。</p>` : ''}
       </section>
       <section class="sec">
@@ -594,7 +610,7 @@ function newNodeDrawer(d) {
           <button type="button" data-act="role" data-role="entry" aria-pressed="${role === 'entry'}">入口</button>
           <button type="button" data-act="role" data-role="exit" aria-pressed="${role === 'exit'}">出口</button>
         </div>
-        <p class="small muted" style="margin:0">${role === 'entry' ? '入口：用户连它（AnyTLS / VLESS Reality / SS-2022），再按规则把流量交给出口。' : '出口：只开 SS-2022，接各个入口转来的流量，比如家宽落地。'}</p>
+        <p class="small muted" style="margin:0">${role === 'entry' ? '入口：用户连它（AnyTLS / VLESS Reality），再按规则把流量交给出口。' : '出口：只开 SS-2022，接各个入口转来的流量，比如家宽落地。'}</p>
         <div class="fields two">
           ${field('代号', 'code', d.code || '', { placeholder: role === 'entry' ? 'JP' : 'UK' })}
           ${field('名称', 'name', d.name || '', { placeholder: role === 'entry' ? '日本' : '英国' })}
@@ -788,7 +804,7 @@ const actions = {
   },
   probe(el) { const id = +el.dataset.id; S.openProbe = S.openProbe === id ? null : id; render(); },
   rename(el) {
-    S.editing = +el.dataset.id; render();
+    S.editing = +el.dataset.id; S.picker = null; render();
     const i = document.getElementById('rename-input'); if (i) { i.focus(); i.select(); }
   },
   'rename-done'(el) { commitRename(+el.dataset.id); },
@@ -827,6 +843,15 @@ const actions = {
     try { const r = await api('POST', `/api/nodes/${el.dataset.id}/token`); await refresh(); openDrawer({ kind: 'install', id: +el.dataset.id, install: r.install, rotated: true }); }
     catch (e) { drawerError(e.message); }
   },
+  fp(el) {
+    el.parentElement.querySelectorAll('.chip').forEach(b => b.setAttribute('aria-pressed', b === el));
+    el.closest('.field').querySelector('input[name="reality_fp"]').value = el.dataset.v;
+  },
+  async 'reality-regen'(el) {
+    if (!confirm('换密钥后，用户要重新更新订阅才能连 Reality。继续？')) return;
+    try { await api('PATCH', `/api/nodes/${el.dataset.id}`, { reality_regen: true }); flash('Reality 密钥已更换，已热更新。'); await refresh(); renderDrawer(); }
+    catch (e) { drawerError(e.message); }
+  },
   switch(el) {
     const on = el.getAttribute('aria-pressed') !== 'true';
     el.setAttribute('aria-pressed', on);
@@ -838,12 +863,18 @@ const actions = {
     const patch = { code: f.code, name: f.name, host: f.host, ipv4_only: f.ipv4_only === '1' };
     if (n.role === 'entry') {
       Object.assign(patch, {
-        anytls_on: f.anytls_on === '1', vless_on: f.vless_on === '1', ss_on: f.ss_on === '1',
-        anytls_port: int(f.anytls_port), vless_port: int(f.vless_port), ss_port: int(f.ss_port),
-        direct_list: f.direct_list, reality_sni: f.reality_sni.trim()
+        anytls_on: f.anytls_on === '1', vless_on: f.vless_on === '1',
+        anytls_port: int(f.anytls_port), vless_port: int(f.vless_port),
+        anytls_sni: f.anytls_sni.trim(), anytls_cert: f.anytls_cert.trim(), anytls_key: f.anytls_key.trim(),
+        reality_sni: f.reality_sni.trim(), reality_dest: f.reality_dest.trim(), reality_short_id: f.reality_short_id.trim(), reality_fp: f.reality_fp,
+        direct_list: f.direct_list
       });
-      if (patch.reality_sni && patch.reality_sni !== n.reality_sni) patch.reality_dest = patch.reality_sni + ':443';
-      for (const k of ['anytls_port', 'vless_port', 'ss_port']) if (patch[k] === null) return drawerError('端口要填数字');
+      // A dest that just followed the old SNI follows the new one.
+      const oldSni = (n.reality_sni || '').split(',')[0];
+      if (patch.reality_sni !== n.reality_sni && patch.reality_dest === oldSni + ':443') patch.reality_dest = '';
+      if (!patch.anytls_cert !== !patch.anytls_key) return drawerError('证书和私钥要一起填，或者都留空用自签');
+      if (patch.anytls_port !== null && patch.anytls_port === patch.vless_port) return drawerError('两个协议不能用同一个端口');
+      for (const k of ['anytls_port', 'vless_port']) if (patch[k] === null) return drawerError('端口要填数字');
     }
     try {
       await api('PATCH', `/api/nodes/${n.id}`, patch);
@@ -1007,6 +1038,9 @@ document.addEventListener('click', e => {
   const fn = actions[el.dataset.act];
   if (!fn) return;
   e.preventDefault();
+  // Tapping anything else while renaming finishes the rename first, so
+  // one tap both closes what was open and does what was tapped.
+  if (S.editing !== null && !['rename-done', 'rename', 'switch', 'fp'].includes(el.dataset.act) && !el.closest('.drawer')) commitRename(S.editing);
   fn(el);
 });
 

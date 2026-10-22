@@ -9,9 +9,6 @@ use crate::period::period_label;
 use crate::util::exit_key;
 
 pub const SS_METHOD: &str = "2022-blake3-aes-128-gcm";
-/// keel-node creates a self-signed pair here when neither file exists.
-pub const CERT_PATH: &str = "/var/lib/keel/anytls.crt";
-pub const KEY_PATH: &str = "/var/lib/keel/anytls.key";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProbeTarget {
@@ -191,22 +188,32 @@ fn entry(w: &World, node: &Node, secret: &str, now: i64) -> Value {
 
     let mut inbounds = Vec::new();
     if node.anytls_on && node.anytls_port > 0 {
-        inbounds.push(json!({"type": "anytls", "listen": listen(node.anytls_port), "cert": CERT_PATH, "key": KEY_PATH}));
+        // Without cert files the node keeps its own self-signed cert.
+        let mut a = json!({"type": "anytls", "listen": listen(node.anytls_port)});
+        if !node.anytls_cert.is_empty() && !node.anytls_key.is_empty() {
+            a["cert"] = json!(node.anytls_cert);
+            a["key"] = json!(node.anytls_key);
+        }
+        if !node.anytls_sni.is_empty() {
+            a["server_name"] = json!(node.anytls_sni);
+        }
+        inbounds.push(a);
     }
     if node.vless_on && node.vless_port > 0 {
-        inbounds.push(json!({
+        let mut v = json!({
             "type": "vless",
             "listen": listen(node.vless_port),
             "reality": {
-                "dest": node.reality_dest,
-                "server_names": [node.reality_sni],
+                "server_names": node.reality_names(),
                 "private_key": node.reality_private,
-                "short_ids": [node.reality_short_id],
+                "short_ids": node.reality_short_ids(),
             }
-        }));
-    }
-    if node.ss_on && node.ss_port > 0 {
-        inbounds.push(json!({"type": "ss2022", "listen": listen(node.ss_port), "method": SS_METHOD, "password": node.ss_psk}));
+        });
+        // Empty dest: the node uses server_names[0]:443.
+        if !node.reality_dest.is_empty() {
+            v["reality"]["dest"] = json!(node.reality_dest);
+        }
+        inbounds.push(v);
     }
 
     let users: Vec<Value> = w
