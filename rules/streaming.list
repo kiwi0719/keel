@@ -1,0 +1,69 @@
+# Streaming services. Format: see README (suffix / =exact / ~keyword / CIDR).
+# Netflix
+netflix.com
+netflix.net
+nflxext.com
+nflximg.com
+nflximg.net
+nflxso.net
+nflxvideo.net
+fast.com
+# Disney+
+disneyplus.com
+disney-plus.net
+dssott.com
+bamgrid.com
+disneystreaming.com
+# YouTube
+youtube.com
+youtu.be
+googlevideo.com
+ytimg.com
+youtube-nocookie.com
+# Prime Video
+primevideo.com
+aiv-cdn.net
+aiv-delivery.net
+amazonvideo.com
+media-amazon.com
+pv-cdn.net
+# HBO Max
+max.com
+hbomax.com
+hbo.com
+hbomaxcdn.com
+# Hulu
+hulu.com
+hulustream.com
+huluim.com
+# Spotify
+spotify.com
+scdn.co
+spotifycdn.com
+# TikTok
+tiktok.com
+tiktokv.com
+tiktokcdn.com
+byteoversea.com
+ibytedtos.com
+muscdn.com
+# Twitch
+twitch.tv
+ttvnw.net
+jtvnw.net
+# Apple TV+ / Music
+tv.apple.com
+=hls.itunes.apple.com
+# Japan
+abema.tv
+ameba.jp
+abema.io
+hayabusa.io
+dmm.com
+dmm.co.jp
+nicovideo.jp
+nimg.jp
+tver.jp
+unext.jp
+# Bilibili overseas
+bilibili.tv

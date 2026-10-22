@@ -41,7 +41,9 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	n.reload(config)
+	if err = n.reload(config); err != nil {
+		log.Fatal(err)
+	}
 	configStat, _ := os.Stat(*configPath)
 
 	signals := make(chan os.Signal, 1)
@@ -106,17 +108,24 @@ func (n *node) reloadFile(path string) {
 		log.Print("reload: ", err, " (keeping current config)")
 		return
 	}
-	log.Print("reload: ", path)
-	n.reload(config)
+	if err = n.reload(config); err != nil {
+		log.Print("reload: ", err, " (keeping current config)")
+		return
+	}
+	log.Print("reloaded ", path)
 }
 
 // reload applies a new config. Listeners whose settings did not change keep
 // running; changed or removed ones stop accepting, but connections already
 // established on them continue.
-func (n *node) reload(config *Config) {
+func (n *node) reload(config *Config) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	currentOutbound.Store(newOutbound(config.Outbound, currentOutbound.Load()))
+	r, err := newRouter(config, currentRouter.Load())
+	if err != nil {
+		return err
+	}
+	currentRouter.Store(r)
 	n.users.apply(config.Users)
 	active := n.users.active()
 
@@ -150,6 +159,7 @@ func (n *node) reload(config *Config) {
 		n.running[key] = &runningInbound{config: c, inbound: in}
 		log.Print("started ", key)
 	}
+	return nil
 }
 
 // pushUsers re-sends the active user list after quota or expiry changed it.

@@ -1,0 +1,10 @@
+{
+  "route": {"ipv4_only": true},
+  "inbounds": [
+    {"type": "ss2022", "listen": ":20731", "method": "2022-blake3-aes-128-gcm", "password": "<openssl rand -base64 16>"}
+  ],
+  "users": [
+    {"name": "entry-de", "ss_key": "<openssl rand -base64 16>"},
+    {"name": "entry-us", "ss_key": "<openssl rand -base64 16>"}
+  ]
+}

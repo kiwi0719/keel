@@ -2,16 +2,18 @@ package main
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"log"
 	"net"
 	"net/netip"
 	"sync/atomic"
 	"time"
 
-	"github.com/sagernet/sing/common/auth"
+	"github.com/sagernet/sing-shadowsocks"
+	"github.com/sagernet/sing-shadowsocks/shadowaead_2022"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
+	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/uot"
@@ -23,133 +25,95 @@ const (
 	udpTimeout  = 3 * time.Minute
 )
 
-// outbound is how traffic leaves the node. It is replaced as a whole on
-// reload; connections keep the outbound they started with.
-type outbound struct {
-	ipv4Only bool
-	// upstream, when set, carries outbound TCP/UDP through a SOCKS5 proxy
-	// (e.g. a local sslocal pointing at a residential landing).
-	upstream *socks.Client
-	// upstreamDomains limits the upstream to listed domains; directDomains
-	// always bypasses it (see route.go).
-	upstreamDomains *domainList
-	directDomains   *domainList
+// outbound is one way for traffic to leave the node.
+type outbound interface {
+	dialTCP(ctx context.Context, destination M.Socksaddr) (net.Conn, error)
+	listenUDP(ctx context.Context, destination M.Socksaddr) (N.PacketConn, error)
 }
 
-var currentOutbound atomic.Pointer[outbound]
-
-func newOutbound(c OutboundConfig, previous *outbound) *outbound {
-	o := &outbound{ipv4Only: c.IPv4Only}
-	if c.Socks == "" {
-		return o
-	}
-	o.upstream = socks.NewClient(N.SystemDialer, M.ParseSocksaddr(c.Socks), socks.Version5, "", "")
-	o.upstreamDomains = reuseDomainList(c.SocksDomains, previous, func(p *outbound) *domainList { return p.upstreamDomains })
-	o.directDomains = reuseDomainList(c.DirectDomains, previous, func(p *outbound) *domainList { return p.directDomains })
-	return o
+// router picks an outbound per connection. It is replaced as a whole on
+// reload; connections keep the router they started with.
+type router struct {
+	rules    []routeRule
+	final    string
+	outbound map[string]outbound
 }
 
-// reuseDomainList keeps an already loaded list when its path is unchanged;
-// the list reloads itself when the file changes.
-func reuseDomainList(path string, previous *outbound, get func(*outbound) *domainList) *domainList {
-	if path == "" {
-		return nil
+type routeRule struct {
+	name     string
+	list     *ruleList
+	outbound string
+}
+
+var currentRouter atomic.Pointer[router]
+
+func newRouter(c *Config, previous *router) (*router, error) {
+	direct := &directOutbound{ipv4Only: c.Route.IPv4Only}
+	r := &router{final: c.Route.Final, outbound: map[string]outbound{"direct": direct}}
+	if r.final == "" {
+		r.final = "direct"
 	}
-	if previous != nil {
-		if l := get(previous); l != nil && l.path == path {
-			return l
+	for _, o := range c.Outbounds {
+		switch o.Type {
+		case "socks":
+			r.outbound[o.Tag] = &socksOutbound{socks.NewClient(direct, M.ParseSocksaddr(o.Server), socks.Version5, "", "")}
+		case "ss2022":
+			method := o.Method
+			if method == "" {
+				method = "2022-blake3-aes-128-gcm"
+			}
+			ss, err := shadowaead_2022.NewWithPassword(method, o.Password, time.Now)
+			if err != nil {
+				return nil, fmt.Errorf("outbound %s: %w", o.Tag, err)
+			}
+			r.outbound[o.Tag] = &ssOutbound{method: ss, server: M.ParseSocksaddr(o.Server), direct: direct, udpOverTCP: o.UDPOverTCP}
 		}
 	}
-	return newDomainList(path)
-}
-
-// network picks the IPv4-only variant of a Go network name when needed.
-func (o *outbound) network(name string) string {
-	if o.ipv4Only {
-		return name + "4"
-	}
-	return name
-}
-
-var errUserInactive = errors.New("user removed, expired or over quota")
-
-// user returns the authenticated user if it may still use the node. Checked
-// per connection, so a multiplexed session (AnyTLS, XUDP) cannot open new
-// streams after its user is blocked.
-func (h *handler) user(ctx context.Context) *userState {
-	name, ok := auth.UserFromContext[string](ctx)
-	if !ok {
-		return nil
-	}
-	return h.users.lookup(name)
-}
-
-// handler receives every proxied connection from every inbound. The inbound
-// has already authenticated the user and put the name in the context.
-type handler struct {
-	users *registry
-}
-
-func (h *handler) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
-	user := h.user(ctx)
-	if user == nil {
-		N.CloseOnHandshakeFailure(conn, onClose, errUserInactive)
-		return
-	}
-	untrack := user.track(conn)
-	defer untrack()
-	defer N.CloseOnHandshakeFailure(conn, onClose, nil)
-	defer conn.Close()
-	conn = bufio.NewInt64CounterConn(conn, []*atomic.Int64{&user.up}, []*atomic.Int64{&user.down})
-
-	o := currentOutbound.Load()
-	destination = destination.Unwrap()
-	switch destination.Fqdn {
-	case uot.MagicAddress:
-		request, err := uot.ReadRequest(conn)
-		if err != nil {
-			N.ReportHandshakeFailure(conn, err)
-			return
+	for i, rc := range c.Route.Rules {
+		name := rc.Name
+		if name == "" {
+			name = fmt.Sprint("rule", i+1)
 		}
-		o.relayUDP(ctx, user.name, uot.NewConn(conn, *request), conn, request.Destination)
-	case uot.LegacyMagicAddress:
-		o.relayUDP(ctx, user.name, uot.NewConn(conn, uot.Request{}), conn, M.Socksaddr{})
-	default:
-		o.relayTCP(ctx, user.name, conn, destination)
+		var list *ruleList
+		if previous != nil {
+			for _, old := range previous.rules {
+				if old.list.sameSource(rc.File, rc.Domains) {
+					list = old.list
+					break
+				}
+			}
+		}
+		if list == nil {
+			list = newRuleList(rc.File, rc.Domains)
+		}
+		r.rules = append(r.rules, routeRule{name: name, list: list, outbound: rc.Outbound})
 	}
+	return r, nil
 }
 
-func (h *handler) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
-	user := h.user(ctx)
-	if user == nil {
-		N.CloseOnHandshakeFailure(conn, onClose, errUserInactive)
-		return
+// pick returns the outbound for destination and a label for logs.
+func (r *router) pick(destination M.Socksaddr) (outbound, string) {
+	for _, rule := range r.rules {
+		if rule.list.match(destination) {
+			return r.outbound[rule.outbound], rule.name + "->" + rule.outbound
+		}
 	}
-	untrack := user.track(conn)
-	defer untrack()
-	defer N.CloseOnHandshakeFailure(conn, onClose, nil)
-	defer conn.Close()
-	conn = bufio.NewInt64CounterPacketConn(conn, []*atomic.Int64{&user.up}, nil, []*atomic.Int64{&user.down}, nil)
-	currentOutbound.Load().relayUDP(ctx, user.name, conn, nil, destination.Unwrap())
+	return r.outbound[r.final], r.final
 }
 
-func (o *outbound) relayTCP(ctx context.Context, user string, conn net.Conn, destination M.Socksaddr) {
-	viaUpstream := o.viaUpstream(destination)
+func (r *router) relayTCP(ctx context.Context, user string, conn net.Conn, destination M.Socksaddr) {
+	out, label := r.pick(destination)
 	if verbose {
-		log.Print("[", user, "] tcp ", destination, " via-upstream=", viaUpstream)
+		log.Print("[", user, "] tcp ", destination, " via ", label)
 	}
-	var remote net.Conn
-	var err error
-	if viaUpstream {
-		dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
-		remote, err = o.upstream.DialContext(dialCtx, N.NetworkTCP, destination)
-		cancel()
-	} else {
-		dialer := net.Dialer{Timeout: dialTimeout}
-		remote, err = dialer.DialContext(ctx, o.network("tcp"), destination.String())
-	}
+	dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
+	remote, err := out.dialTCP(dialCtx, destination)
+	cancel()
 	if err != nil {
 		N.ReportHandshakeFailure(conn, err)
+		if verbose {
+			log.Print("[", user, "] tcp ", destination, ": ", err)
+		}
 		return
 	}
 	N.ReportHandshakeSuccess(conn)
@@ -157,39 +121,147 @@ func (o *outbound) relayTCP(ctx context.Context, user string, conn net.Conn, des
 }
 
 // relayUDP forwards a UDP session. stream is the carrying TCP connection for
-// UDP-over-TCP (to report the handshake result), or nil.
-func (o *outbound) relayUDP(ctx context.Context, user string, packetConn N.PacketConn, stream net.Conn, destination M.Socksaddr) {
-	viaUpstream := o.viaUpstream(destination)
+// UDP-over-TCP (to report the handshake result), or nil. The session is
+// routed by its first destination.
+func (r *router) relayUDP(ctx context.Context, user string, packetConn N.PacketConn, stream net.Conn, destination M.Socksaddr) {
+	out, label := r.pick(destination)
 	if verbose {
-		log.Print("[", user, "] udp ", destination, " via-upstream=", viaUpstream)
+		log.Print("[", user, "] udp ", destination, " via ", label)
 	}
-	report := func(err error) {
-		if stream == nil {
-			return
-		}
+	dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
+	remote, err := out.listenUDP(dialCtx, destination)
+	cancel()
+	if stream != nil {
 		if err != nil {
 			N.ReportHandshakeFailure(stream, err)
 		} else {
 			N.ReportHandshakeSuccess(stream)
 		}
 	}
-	if viaUpstream {
-		dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
-		associated, err := o.upstream.ListenPacket(dialCtx, destination)
-		cancel()
-		report(err)
-		if err != nil {
-			return
-		}
-		bufio.CopyPacketConn(ctx, packetConn, associated.(N.PacketConn))
-		return
-	}
-	udpConn, err := net.ListenUDP(o.network("udp"), nil)
-	report(err)
 	if err != nil {
+		if verbose {
+			log.Print("[", user, "] udp ", destination, ": ", err)
+		}
 		return
 	}
-	bufio.CopyPacketConn(ctx, packetConn, &udpOutbound{UDPConn: udpConn, ipv4Only: o.ipv4Only, resolved: make(map[string]netip.Addr)})
+	bufio.CopyPacketConn(ctx, packetConn, remote)
+}
+
+// directOutbound dials from this machine. It also implements N.Dialer so the
+// other outbounds reach their servers through it (and honor ipv4_only).
+type directOutbound struct {
+	ipv4Only bool
+}
+
+func (d *directOutbound) network(name string) string {
+	if d.ipv4Only {
+		return name + "4"
+	}
+	return name
+}
+
+func (d *directOutbound) dialTCP(ctx context.Context, destination M.Socksaddr) (net.Conn, error) {
+	var dialer net.Dialer
+	return dialer.DialContext(ctx, d.network("tcp"), destination.String())
+}
+
+func (d *directOutbound) listenUDP(context.Context, M.Socksaddr) (N.PacketConn, error) {
+	udpConn, err := net.ListenUDP(d.network("udp"), nil)
+	if err != nil {
+		return nil, err
+	}
+	return &udpOutbound{UDPConn: udpConn, ipv4Only: d.ipv4Only, resolved: make(map[string]netip.Addr)}, nil
+}
+
+func (d *directOutbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	var dialer net.Dialer
+	return dialer.DialContext(ctx, d.network(N.NetworkName(network)), destination.String())
+}
+
+func (d *directOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	return net.ListenUDP(d.network("udp"), nil)
+}
+
+// socksOutbound sends traffic through a SOCKS5 proxy, e.g. a local sslocal
+// pointing at a residential landing.
+type socksOutbound struct {
+	client *socks.Client
+}
+
+func (s *socksOutbound) dialTCP(ctx context.Context, destination M.Socksaddr) (net.Conn, error) {
+	return s.client.DialContext(ctx, N.NetworkTCP, destination)
+}
+
+func (s *socksOutbound) listenUDP(ctx context.Context, destination M.Socksaddr) (N.PacketConn, error) {
+	conn, err := s.client.ListenPacket(ctx, destination)
+	if err != nil {
+		return nil, err
+	}
+	return conn.(N.PacketConn), nil
+}
+
+// ssOutbound is a Shadowsocks 2022 client, used by entry nodes to reach exits.
+type ssOutbound struct {
+	method     shadowsocks.Method
+	server     M.Socksaddr
+	direct     *directOutbound
+	udpOverTCP bool
+}
+
+func (s *ssOutbound) dialTCP(ctx context.Context, destination M.Socksaddr) (net.Conn, error) {
+	conn, err := s.direct.dialTCP(ctx, s.server)
+	if err != nil {
+		return nil, err
+	}
+	ssConn, err := s.method.DialConn(conn, destination)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return ssConn, nil
+}
+
+func (s *ssOutbound) listenUDP(ctx context.Context, destination M.Socksaddr) (N.PacketConn, error) {
+	if s.udpOverTCP {
+		client := uot.Client{Dialer: ssDialer{s}, Version: uot.Version}
+		conn, err := client.ListenPacket(ctx, destination)
+		if err != nil {
+			return nil, err
+		}
+		return conn.(N.PacketConn), nil
+	}
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(ctx, s.direct.network("udp"), s.server.String())
+	if err != nil {
+		return nil, err
+	}
+	return s.method.DialPacketConn(&idleConn{conn}), nil
+}
+
+// ssDialer lets the UDP-over-TCP client open its stream through the SS server.
+type ssDialer struct{ s *ssOutbound }
+
+func (d ssDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	if N.NetworkName(network) != N.NetworkTCP {
+		return nil, E.New("ss2022 outbound: unsupported network ", network)
+	}
+	return d.s.dialTCP(ctx, destination)
+}
+
+func (d ssDialer) ListenPacket(context.Context, M.Socksaddr) (net.PacketConn, error) {
+	return nil, E.New("ss2022 outbound: ListenPacket unsupported")
+}
+
+// idleConn ends a UDP session to the SS server after udpTimeout without
+// replies. It wraps the socket under the SS packet conn, so the SS conn's
+// header room is still visible to sing's copy.
+type idleConn struct {
+	net.Conn
+}
+
+func (c *idleConn) Read(p []byte) (int, error) {
+	c.SetReadDeadline(time.Now().Add(udpTimeout))
+	return c.Conn.Read(p)
 }
 
 // udpOutbound adapts a UDP socket to N.PacketConn, resolving domain
