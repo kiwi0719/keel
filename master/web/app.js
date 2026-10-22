@@ -189,8 +189,10 @@ function probePage() {
   const sp = d.summary.speed;
   const last = sp.length ? sp[sp.length - 1] : [0, 0];
   const totals = sp.map(p => p[0] + p[1]);
-  const max = Math.max(1, ...totals) * 1.1, min = Math.min(...totals, max) * 0.8;
-  const spark = totals.length > 1 ? totals.map((v, i) => `${(i * 300 / (totals.length - 1)).toFixed(1)},${(52 - (v - min) / ((max - min) || 1) * 48).toFixed(1)}`).join(' ') : '';
+  // Scale from zero with a 1 MB/s floor, so a few KB/s of background
+  // traffic draws as the flat line it is instead of filling the chart.
+  const peak = Math.max(0, ...totals), top = Math.max(peak * 1.15, 1e6);
+  const spark = totals.length > 1 ? totals.map((v, i) => `${(i * 300 / (totals.length - 1)).toFixed(1)},${(53 - v / top * 50).toFixed(1)}`).join(' ') : '';
   const hero = `
     <section class="hero">
       <div class="sun" aria-hidden="true"></div>
@@ -198,7 +200,8 @@ function probePage() {
         <div class="label">实时总速率</div>
         <div style="display:flex;align-items:baseline;gap:10px"><span class="big">${mbps(last[0] + last[1])}</span><span style="font-size:20px">MB/s</span></div>
         <div class="muted" style="font-size:14px">入 ${mbps(last[0])} MB/s · 出 ${mbps(last[1])} MB/s</div>
-        <svg class="spark" height="56" viewBox="0 0 300 56" preserveAspectRatio="none" role="img" aria-label="近 3 分钟总速率走势"><polyline points="${spark}" fill="none" stroke="${C.ink}" stroke-width="1.5" vector-effect="non-scaling-stroke"></polyline></svg>
+        <svg class="spark" height="56" viewBox="0 0 300 56" preserveAspectRatio="none" role="img" aria-label="近 3 分钟总速率走势"><line x1="0" y1="53" x2="300" y2="53" stroke="#D6D1C6" stroke-width="1" vector-effect="non-scaling-stroke"></line><polyline points="${spark}" fill="none" stroke="${C.ink}" stroke-width="1.5" vector-effect="non-scaling-stroke"></polyline></svg>
+        <div class="small muted">近 3 分钟 · 峰值 ${mbps(peak)} MB/s · 全部节点网卡合计</div>
       </div>
       <div class="tiles">
         <div><div class="small muted">在线</div><div class="v">${d.summary.online}/${nodes.length}</div></div>
