@@ -114,6 +114,9 @@ type InboundConfig struct {
 	Key        string `json:"key,omitempty"`
 	CertPEM    string `json:"cert_pem,omitempty"`
 	KeyPEM     string `json:"key_pem,omitempty"`
+	// ACME obtains and renews a certificate for ServerName automatically;
+	// until it is issued the node serves a self-signed one.
+	ACME *ACMEConfig `json:"acme,omitempty"`
 	// PaddingScheme overrides AnyTLS's default padding, one rule per line
 	// as in sing-box ("stop=8", "0=30-30", ...).
 	PaddingScheme []string `json:"padding_scheme,omitempty"`
@@ -252,6 +255,12 @@ func (c *Config) validate() error {
 	for _, inbound := range c.Inbounds {
 		if _, ok := protocols[inbound.Type]; !ok {
 			return fmt.Errorf("inbound %s: protocol %q is not built into this binary (built with: %s)", inbound.Listen, inbound.Type, builtProtocols())
+		}
+		if inbound.ACME != nil && (inbound.Cert != "" || inbound.Key != "" || inbound.CertPEM != "" || inbound.KeyPEM != "") {
+			return fmt.Errorf("inbound %s: acme and cert/key/cert_pem are mutually exclusive", inbound.Listen)
+		}
+		if inbound.ACME != nil && inbound.ServerName == "" {
+			return fmt.Errorf("inbound %s: acme needs server_name", inbound.Listen)
 		}
 		if keys[inbound.ID()] {
 			return fmt.Errorf("duplicate inbound %s", inbound.ID())
