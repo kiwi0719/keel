@@ -103,7 +103,7 @@ make master                    # 生成 master/target/release/keel-master
 keel-master -data /var/lib/keel-master -listen 0.0.0.0:8443
 ```
 
-- 第一次启动会在日志里打印面板密码，进去后在「设置」里改；忘了可以 `keel-master -data ... -password 新密码`。
+- 面板用用户名 + 密码登录。第一次启动会在日志里打印 `admin` 和一个随机密码，进去后在「设置」里改；也可以在服务器上 `keel-master -data ... -user 用户名 -password -`（密码从标准输入读，不留在命令历史里）。改完所有已登录的会话都会失效。
 - 不给证书时会在 `数据目录/tls/` 生成自签证书，节点按指纹认它（安装命令里自动带上），浏览器会提示不安全。有域名证书就用 `-cert fullchain.pem -key key.pem`；放在 Caddy / nginx 后面就用 `-no-tls -listen 127.0.0.1:8080`（反代要转发 WebSocket）。
 - 数据库是 `数据目录/keel.db`（WAL 模式，备份时连 `-wal`、`-shm` 一起拷，或者先停服务）。
 - 节点安装脚本从主控下载 keel-node：把 `make node-linux` 编出来的文件改名放进 `数据目录/dist/`，叫 `keel-node-linux-amd64`、`keel-node-linux-arm64`。

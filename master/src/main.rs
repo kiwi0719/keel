@@ -38,16 +38,18 @@ struct Options {
     key: Option<PathBuf>,
     no_tls: bool,
     password: Option<String>,
+    user: Option<String>,
 }
 
 fn usage() -> ! {
     eprintln!(
-        "usage: keel-master [-data DIR] [-listen ADDR] [-cert FILE -key FILE | -no-tls] [-password NEW]\n\
+        "usage: keel-master [-data DIR] [-listen ADDR] [-cert FILE -key FILE | -no-tls] [-user NAME] [-password NEW]\n\
          \n  -data DIR      database, generated certificate and node binaries (default /var/lib/keel-master)\
          \n  -listen ADDR   panel, subscriptions and node connections (default 0.0.0.0:8443)\
          \n  -cert, -key    TLS certificate; without them a self-signed one is made in DIR/tls\
          \n  -no-tls        plain HTTP behind a TLS reverse proxy (trusts X-Forwarded-For)\
-         \n  -password NEW  set the panel password and exit"
+         \n  -user NAME     set the panel login name and exit (with -password: both)\
+         \n  -password NEW  set the panel password and exit (\"-\" reads it from stdin)"
     );
     std::process::exit(2)
 }
@@ -60,6 +62,7 @@ fn parse_args() -> Options {
         key: None,
         no_tls: false,
         password: None,
+        user: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -72,6 +75,7 @@ fn parse_args() -> Options {
             "key" => o.key = Some(value().into()),
             "no-tls" => o.no_tls = true,
             "password" => o.password = Some(value()),
+            "user" => o.user = Some(value()),
             _ => usage(),
         }
     }
@@ -247,20 +251,40 @@ async fn main() {
         std::process::exit(1)
     });
 
-    if let Some(pw) = &o.password {
-        if pw.chars().count() < 8 {
-            eprintln!("password must be at least 8 characters");
-            std::process::exit(2);
+    if o.user.is_some() || o.password.is_some() {
+        if let Some(user) = &o.user {
+            let user = user.trim();
+            if user.is_empty() || user.chars().count() > 40 {
+                eprintln!("user name must be 1-40 characters");
+                std::process::exit(2);
+            }
+            db::set_setting(&conn, "admin_user", user).expect("save user");
+            eprintln!("panel user name set to {user}");
         }
-        db::set_setting(&conn, "admin_hash", &api::hash_password(pw)).expect("save password");
+        if let Some(pw) = &o.password {
+            // "-" reads it from stdin so it stays out of shell history.
+            let pw = if pw == "-" {
+                eprint!("new panel password: ");
+                let mut line = String::new();
+                let _ = std::io::stdin().read_line(&mut line);
+                line.trim_end_matches(['\r', '\n']).to_string()
+            } else {
+                pw.clone()
+            };
+            if pw.chars().count() < 8 {
+                eprintln!("password must be at least 8 characters");
+                std::process::exit(2);
+            }
+            db::set_setting(&conn, "admin_hash", &api::hash_password(&pw)).expect("save password");
+            eprintln!("panel password updated");
+        }
         let _ = conn.execute("DELETE FROM sessions", []);
-        eprintln!("panel password updated");
         return;
     }
     if db::get_setting(&conn, "admin_hash").ok().flatten().is_none() {
         let pw = util::random_hex(8);
         db::set_setting(&conn, "admin_hash", &api::hash_password(&pw)).expect("save password");
-        eprintln!("first start: panel password is {pw} (change it in the panel, or with -password)");
+        eprintln!("first start: panel login is {} / {pw} (change it in the panel, or with -user and -password)", api::admin_user(&conn));
     }
     let secret = match db::get_setting(&conn, "secret").ok().flatten() {
         Some(s) => s,
