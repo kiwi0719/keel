@@ -751,8 +751,9 @@ function userDrawer(d) {
     <section class="sec"><h3>可用入口</h3><div class="chips">${chips || '<span class="muted">还没有入口节点</span>'}</div></section>`;
   if (u) {
     body += `<section class="sec">
+      <h3>订阅</h3>
+      <div class="sub-list">${subClients(u)}</div>
       <div style="display:flex;gap:8px">
-        <button type="button" class="btn small" data-act="copy" data-text="${esc(u.sub_url)}">复制订阅</button>
         <button type="button" class="btn small" data-act="sub-rotate" data-id="${u.id}">重置订阅</button>
       </div>
       <p class="small muted" style="margin:0">本期已用 ${bytes(u.used)}，${u.reset_day} 号清零${u.conns ? ' · 当前 ' + u.conns + ' 个连接' : ''}。</p>
@@ -767,6 +768,25 @@ function userDrawer(d) {
          <button class="btn danger" data-act="user-del" data-id="${u.id}">删除</button>`
       : `<button class="btn solid" data-act="save-user">创建</button>`
   };
+}
+
+// One subscription link serves every client: it answers by User-Agent, and
+// format= pins it for clients that do not say who they are.
+function subClients(u) {
+  const url = u.sub_url, enc = encodeURIComponent, name = enc('keel-' + u.name);
+  const fmt = f => url + '?format=' + f;
+  const rows = [
+    ['Clash / mihomo', 'Clash Verge、FlClash、Clash Meta', fmt('clash'), `clash://install-config?url=${enc(fmt('clash'))}&name=${name}`],
+    ['Stash', '', fmt('stash'), `stash://install-config?url=${enc(fmt('stash'))}&name=${name}`],
+    ['sing-box', 'iOS / Android / macOS 官方客户端', fmt('singbox'), `sing-box://import-remote-profile?url=${enc(fmt('singbox'))}#${name}`],
+    ['Surge', 'Surge 不支持 VLESS，只含 AnyTLS 入口', fmt('surge'), `surge:///install-config?url=${enc(fmt('surge'))}`],
+    ['Shadowrocket', '节点列表，分流用小火箭自己的配置', fmt('links'), `shadowrocket://add/sub://${btoa(fmt('links'))}?remark=${name}`],
+    ['v2rayN / NekoBox', '节点列表', fmt('links'), '']
+  ];
+  return `<div class="sub-row"><div><div class="sub-name">通用链接</div><div class="small muted">自动识别客户端，发给别人用这个</div></div>
+      <div class="sub-acts"><button type="button" class="btn small solid" data-act="copy" data-text="${esc(url)}">复制</button></div></div>` +
+    rows.map(([t, note, link, deep]) => `<div class="sub-row"><div><div class="sub-name">${t}</div>${note ? `<div class="small muted">${note}</div>` : ''}</div>
+      <div class="sub-acts">${deep ? `<a class="btn small" href="${esc(deep)}">导入</a>` : ''}<button type="button" class="btn small" data-act="copy" data-text="${esc(link)}">复制</button></div></div>`).join('');
 }
 
 function settingsDrawer() {
@@ -786,6 +806,10 @@ function settingsDrawer() {
         ${field('Cloudflare API Token', 'cf_token', '', { type: 'password', placeholder: st.cf_token_tail ? '已设置 …' + st.cf_token_tail + '，留空不改' : '不填就用 HTTP / TLS 验证' })}
       </div>
       <p class="small muted" style="margin:0">填了 Token（权限：Zone → DNS → Edit）就用 DNS 验证，不用开端口，NAT 机也能签。所有节点共用，只存在主控里，不会再显示出来。${st.cf_token_tail ? '<button type="button" class="text-btn" data-act="cf-clear">清除 Token</button>' : ''}</p>
+      </section>
+      <section class="sec"><h3>订阅分流</h3>
+        <label class="field">额外走「流媒体」的域名<textarea name="sub_media" rows="3" placeholder="emby.example.com（一行一个，含子域名）">${esc(st.sub_media || '')}</textarea></label>
+        <p class="small muted" style="margin:0">订阅里流媒体、AI 各有一个可选的组，国内和局域网直连，其他走 PROXY。自建 Emby 之类的域名填在这里。</p>
       </section>
       <section class="sec"><h3>登录</h3><div class="fields two">
         ${field('用户名', 'username', st.username, { full: true })}
@@ -1048,6 +1072,7 @@ const actions = {
       probe_targets: st.probe_targets.map(t => ({ name: t.name, label: t.label, host: (f['probe_' + t.name] || '').trim() }))
     };
     body.acme_email = (f.acme_email || '').trim();
+    body.sub_media = f.sub_media || '';
     if (f.cf_token) body.cf_token = f.cf_token.trim();
     body.username = f.username.trim(); body.current_password = f.current_password;
     if (f.password) body.password = f.password;

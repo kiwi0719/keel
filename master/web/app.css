@@ -186,3 +186,8 @@ aside.drawer { position: fixed; top: 0; right: 0; bottom: 0; width: 100%; max-wi
   main { padding-top: 20px; }
   .fields.three { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
+.sub-list { border-top: 1px solid var(--ink); }
+.sub-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+.sub-name { font-size: 15px; font-weight: 500; }
+.sub-acts { display: flex; gap: 6px; flex: none; }
+a.btn { display: inline-flex; align-items: center; text-decoration: none; color: inherit; }
