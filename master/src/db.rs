@@ -204,6 +204,18 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
+/// A new id for `table` ("nodes" or "exits") that was never used before,
+/// even by a deleted row: ids name config tags and usage counters, so a
+/// reused id would inherit a deleted node's history.
+pub fn fresh_id(conn: &Connection, table: &str) -> rusqlite::Result<i64> {
+    let key = format!("last_{table}_id");
+    let floor: i64 = get_setting(conn, &key)?.and_then(|v| v.parse().ok()).unwrap_or(0);
+    let max: i64 = conn.query_row(&format!("SELECT COALESCE(MAX(id),0) FROM {table}"), [], |r| r.get(0))?;
+    let id = floor.max(max) + 1;
+    set_setting(conn, &key, &id.to_string())?;
+    Ok(id)
+}
+
 pub fn get_setting(conn: &Connection, key: &str) -> rusqlite::Result<Option<String>> {
     conn.query_row("SELECT value FROM settings WHERE key=?1", [key], |r| r.get(0)).optional()
 }
@@ -503,22 +515,23 @@ pub fn user_by_sub(conn: &Connection, token: &str) -> rusqlite::Result<Option<Us
 pub fn insert_node(conn: &Connection, role: &str, code: &str, name: &str, now: i64) -> rusqlite::Result<i64> {
     let token = random_hex(24);
     let sort: i64 = conn.query_row("SELECT COALESCE(MAX(sort),0)+1 FROM nodes", [], |r| r.get(0))?;
+    let id = fresh_id(conn, "nodes")?;
     if role == "entry" {
         let (private, public) = crate::util::reality_keypair();
         let anytls_port = crate::util::random_port(&[]);
         let vless_port = crate::util::random_port(&[anytls_port]);
         conn.execute(
-            "INSERT INTO nodes(code,name,role,token,sort,anytls_on,anytls_port,vless_on,vless_port,reality_dest,reality_sni,reality_private,reality_public,reality_short_id,ss_port,ss_psk,created_at)
-             VALUES(?1,?2,'entry',?3,?4,1,?10,0,?11,'www.apple.com:443','www.apple.com',?5,?6,?7,0,?8,?9)",
-            params![code, name, token, sort, private, public, random_hex(8), random_b64(16), now, anytls_port, vless_port],
+            "INSERT INTO nodes(code,name,role,token,sort,anytls_on,anytls_port,vless_on,vless_port,reality_dest,reality_sni,reality_private,reality_public,reality_short_id,ss_port,ss_psk,created_at,id)
+             VALUES(?1,?2,'entry',?3,?4,1,?10,0,?11,'www.apple.com:443','www.apple.com',?5,?6,?7,0,?8,?9,?12)",
+            params![code, name, token, sort, private, public, random_hex(8), random_b64(16), now, anytls_port, vless_port, id],
         )?;
     } else {
         conn.execute(
-            "INSERT INTO nodes(code,name,role,token,sort,created_at) VALUES(?1,?2,'exit',?3,?4,?5)",
-            params![code, name, token, sort, now],
+            "INSERT INTO nodes(code,name,role,token,sort,created_at,id) VALUES(?1,?2,'exit',?3,?4,?5,?6)",
+            params![code, name, token, sort, now, id],
         )?;
     }
-    Ok(conn.last_insert_rowid())
+    Ok(id)
 }
 
 pub fn insert_user(conn: &Connection, name: &str, now: i64) -> rusqlite::Result<i64> {

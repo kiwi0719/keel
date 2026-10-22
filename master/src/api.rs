@@ -375,8 +375,8 @@ pub async fn create_node(State(app): State<Arc<App>>, headers: HeaderMap, Json(b
         let id = db::insert_node(&conn, &b.role, &code, if name.is_empty() { &code } else { &name }, now()).map_err(internal)?;
         if b.role == "exit" {
             conn.execute(
-                "INSERT INTO exits(node_id,name,port,psk,reset_day,sort) VALUES(?1,?2,?3,?4,1,0)",
-                params![id, code, crate::util::random_port(&[]), random_b64(16)],
+                "INSERT INTO exits(id,node_id,name,port,psk,reset_day,sort) VALUES(?5,?1,?2,?3,?4,1,0)",
+                params![id, code, crate::util::random_port(&[]), random_b64(16), db::fresh_id(&conn, "exits").map_err(internal)?],
             )
             .map_err(internal)?;
         }
@@ -639,8 +639,8 @@ fn import_exits(conn: &mut Connection, text: &str, name: Option<&str>) -> Result
             _ => it.name.clone(),
         };
         tx.execute(
-            "INSERT INTO exits(node_id,name,kind,server,uuid,method,psk,sort) VALUES(NULL,?1,?2,?3,?4,?5,?6,?7)",
-            params![name.chars().take(40).collect::<String>(), it.kind, it.server, it.uuid, it.method, it.password, sort],
+            "INSERT INTO exits(id,node_id,name,kind,server,uuid,method,psk,sort) VALUES(?8,NULL,?1,?2,?3,?4,?5,?6,?7)",
+            params![name.chars().take(40).collect::<String>(), it.kind, it.server, it.uuid, it.method, it.password, sort, db::fresh_id(&tx, "exits").map_err(internal)?],
         )
         .map_err(internal)?;
         ids.push(tx.last_insert_rowid());
@@ -690,8 +690,8 @@ pub async fn create_exit(State(app): State<Arc<App>>, Json(b): Json<Map<String, 
             .map_err(internal)?;
         let count = taken.len() as i64;
         tx.execute(
-            "INSERT INTO exits(node_id,name,port,psk,reset_day,sort) VALUES(?1,?2,?3,?4,1,?5)",
-            params![node, format!("出口 {}", count + 1), crate::util::random_port(&taken), random_b64(16), count],
+            "INSERT INTO exits(id,node_id,name,port,psk,reset_day,sort) VALUES(?6,?1,?2,?3,?4,1,?5)",
+            params![node, format!("出口 {}", count + 1), crate::util::random_port(&taken), random_b64(16), count, db::fresh_id(&tx, "exits").map_err(internal)?],
         )
         .map_err(internal)?;
         let id = tx.last_insert_rowid();
