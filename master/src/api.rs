@@ -49,9 +49,18 @@ pub fn hash_password(pw: &str) -> String {
 }
 
 fn verify_password(conn: &Connection, pw: &str) -> bool {
-    let Some(stored) = db::get_setting(conn, "admin_hash").ok().flatten() else { return false };
-    let Ok(parsed) = PasswordHash::new(&stored) else { return false };
+    db::get_setting(conn, "admin_hash").ok().flatten().is_some_and(|stored| password_matches(&stored, pw))
+}
+
+fn password_matches(stored: &str, pw: &str) -> bool {
+    let Ok(parsed) = PasswordHash::new(stored) else { return false };
     Argon2::default().verify_password(pw.as_bytes(), &parsed).is_ok()
+}
+
+/// The last `n` characters, for showing which secret is set.
+fn tail(s: &str, n: usize) -> String {
+    let skip = s.chars().count().saturating_sub(n);
+    s.chars().skip(skip).collect()
 }
 
 fn session_token(headers: &HeaderMap) -> Option<String> {
@@ -90,10 +99,36 @@ pub fn admin_user(conn: &Connection) -> String {
 }
 
 /// Failed logins per client IP: (count, window start). Ten misses in ten
-/// minutes lock that IP out until the window passes.
+/// minutes lock that IP out until the window passes. GLOBAL counts misses
+/// from everywhere: client IPs come from X-Forwarded-For behind a proxy, and
+/// anything that reaches the master's port directly (another proxy on the
+/// same box) can make that header up.
 static FAILS: Mutex<Option<HashMap<String, (u32, i64)>>> = Mutex::new(None);
 const FAIL_LIMIT: u32 = 10;
+const GLOBAL: &str = "*";
+const GLOBAL_FAIL_LIMIT: u32 = 100;
 const FAIL_WINDOW: i64 = 600;
+
+/// Argon2 takes ~19 MB and tens of milliseconds per check; a flood of
+/// logins waits here instead of exhausting the box.
+static VERIFYING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+fn locked_out(ip: &str) -> bool {
+    let t = now();
+    let mut f = FAILS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = f.get_or_insert_with(HashMap::new);
+    map.retain(|_, (_, start)| t - *start < FAIL_WINDOW);
+    map.get(ip).is_some_and(|(n, _)| *n >= FAIL_LIMIT) || map.get(GLOBAL).is_some_and(|(n, _)| *n >= GLOBAL_FAIL_LIMIT)
+}
+
+fn record_failure(ip: &str) {
+    let t = now();
+    let mut f = FAILS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = f.get_or_insert_with(HashMap::new);
+    for key in [ip, GLOBAL] {
+        map.entry(key.to_string()).or_insert((0, t)).0 += 1;
+    }
+}
 
 pub async fn login(
     State(app): State<Arc<App>>,
@@ -102,27 +137,29 @@ pub async fn login(
     Json(body): Json<Login>,
 ) -> ApiResult {
     let ip = crate::ws::client_ip(&app, &headers, peer);
-    let t = now();
-    {
-        let mut f = FAILS.lock().unwrap();
-        let map = f.get_or_insert_with(HashMap::new);
-        map.retain(|_, (_, start)| t - *start < FAIL_WINDOW);
-        if map.get(&ip).is_some_and(|(n, _)| *n >= FAIL_LIMIT) {
-            return Err((StatusCode::TOO_MANY_REQUESTS, Json(json!({"error": "试错太多次，10 分钟后再试"}))).into_response());
-        }
+    let too_many = || (StatusCode::TOO_MANY_REQUESTS, Json(json!({"error": "试错太多次，10 分钟后再试"}))).into_response();
+    if locked_out(&ip) {
+        return Err(too_many());
     }
-    let good = {
+    let (stored, user) = {
         let conn = app.db();
+        (db::get_setting(&conn, "admin_hash").ok().flatten(), admin_user(&conn))
+    };
+    let good = {
+        let _permit = VERIFYING.acquire().await.map_err(internal)?;
+        // Requests that queued up behind the permit count against the limit too.
+        if locked_out(&ip) {
+            return Err(too_many());
+        }
+        let password = body.password;
         // Check the password even for a wrong name so both take as long.
-        let pw_ok = verify_password(&conn, &body.password);
-        pw_ok && body.username.trim() == admin_user(&conn)
+        let pw_ok = tokio::task::spawn_blocking(move || stored.is_some_and(|h| password_matches(&h, &password)))
+            .await
+            .unwrap_or(false);
+        pw_ok && body.username.trim() == user
     };
     if !good {
-        {
-            let mut f = FAILS.lock().unwrap();
-            let e = f.get_or_insert_with(HashMap::new).entry(ip).or_insert((0, t));
-            e.0 += 1;
-        }
+        record_failure(&ip);
         tokio::time::sleep(Duration::from_secs(1)).await;
         return Err((StatusCode::UNAUTHORIZED, Json(json!({"error": "用户名或密码不对"}))).into_response());
     }
@@ -271,7 +308,7 @@ fn state_value(app: &Arc<App>, headers: &HeaderMap) -> Result<Value, Response> {
             month_total += mrx + mtx;
             o.insert("month_rx".into(), json!(mrx));
             o.insert("month_tx".into(), json!(mtx));
-            o.insert("token_tail".into(), json!(&n.token[n.token.len().saturating_sub(4)..]));
+            o.insert("token_tail".into(), json!(tail(&n.token, 4)));
             o.insert("address".into(), json!(n.address()));
             o.insert(
                 "rules".into(),
@@ -383,7 +420,7 @@ fn state_value(app: &Arc<App>, headers: &HeaderMap) -> Result<Value, Response> {
             "fingerprint": app.tls.as_ref().map(|t| t.cert_sha256.clone()),
             "acme_email": w.acme_email,
             // Never sent back: only whether it is set and its last 4 chars.
-            "cf_token_tail": if w.cf_token.is_empty() { String::new() } else { w.cf_token[w.cf_token.len().saturating_sub(4)..].to_string() },
+            "cf_token_tail": tail(&w.cf_token, 4),
         },
     }))
 }
@@ -885,9 +922,14 @@ pub async fn delete_user(State(app): State<Arc<App>>, Path(id): Path<i64>) -> Ap
 
 // ---------- settings ----------
 
-pub async fn update_settings(State(app): State<Arc<App>>, Json(b): Json<Map<String, Value>>) -> ApiResult {
+pub async fn update_settings(State(app): State<Arc<App>>, headers: HeaderMap, Json(b): Json<Map<String, Value>>) -> ApiResult {
     {
         let conn = app.db();
+        // A new name or password signs out every other session.
+        let sign_out_others = || {
+            let current = session_token(&headers).unwrap_or_default();
+            conn.execute("DELETE FROM sessions WHERE token<>?1", [current]).map_err(internal)
+        };
         let current = b.get("current_password").and_then(Value::as_str).unwrap_or("");
         if let Some(v) = b.get("username") {
             let name = str_field(v, 40)?;
@@ -899,6 +941,7 @@ pub async fn update_settings(State(app): State<Arc<App>>, Json(b): Json<Map<Stri
                     return Err(bad("改用户名要填当前密码"));
                 }
                 db::set_setting(&conn, "admin_user", &name).map_err(internal)?;
+                sign_out_others()?;
             }
         }
         if let Some(pw) = b.get("password") {
@@ -910,6 +953,7 @@ pub async fn update_settings(State(app): State<Arc<App>>, Json(b): Json<Map<Stri
                 return Err(bad("新密码至少 8 位"));
             }
             db::set_setting(&conn, "admin_hash", &hash_password(pw)).map_err(internal)?;
+            sign_out_others()?;
         }
         if let Some(v) = b.get("panel_url") {
             let u = str_field(v, 255)?;
