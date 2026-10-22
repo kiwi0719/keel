@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"net/netip"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/sagernet/sing-shadowsocks"
@@ -54,7 +56,7 @@ type routeRule struct {
 var currentRouter atomic.Pointer[router]
 
 func newRouter(c *Config, previous *router) (*router, error) {
-	direct := &directOutbound{ipv4Only: c.Route.IPv4Only}
+	direct := &directOutbound{ipv4Only: c.Route.IPv4Only, allowPrivate: c.Route.AllowPrivate}
 	r := &router{
 		final:       c.Route.Final,
 		outbound:    map[string]outbound{"direct": direct},
@@ -203,8 +205,47 @@ func (r *router) relayUDP(ctx context.Context, user string, packetConn N.PacketC
 
 // directOutbound dials from this machine. It also implements N.Dialer so the
 // other outbounds reach their servers through it (and honor ipv4_only).
+//
+// Proxied traffic (dialTCP, listenUDP) may only reach public addresses unless
+// allowPrivate is set: a user must not get at this machine's own services
+// (a panel on 127.0.0.1, cloud metadata) or the LAN behind it. Outbound
+// servers (dialServer, DialContext) may be anywhere, e.g. a local sslocal.
 type directOutbound struct {
-	ipv4Only bool
+	ipv4Only     bool
+	allowPrivate bool
+}
+
+var errPrivateDestination = errors.New("destination is a private or local address")
+
+// cgnat is 100.64.0.0/10, shared address space (carrier NAT, Tailscale).
+var cgnat = netip.MustParsePrefix("100.64.0.0/10")
+
+// isPublic reports whether proxied traffic may go to a.
+func isPublic(a netip.Addr) bool {
+	a = a.Unmap()
+	if !a.IsGlobalUnicast() || a.IsPrivate() || cgnat.Contains(a) {
+		return false
+	}
+	// 0.0.0.0/8 means "this network".
+	return !a.Is4() || a.As4()[0] != 0
+}
+
+func (d *directOutbound) userDialer() *net.Dialer {
+	if d.allowPrivate {
+		return &net.Dialer{}
+	}
+	// Checked on the address actually dialed, after DNS, so a domain that
+	// resolves to 127.0.0.1 is refused too.
+	return &net.Dialer{Control: func(_, address string, _ syscall.RawConn) error {
+		ap, err := netip.ParseAddrPort(address)
+		if err != nil {
+			return err
+		}
+		if !isPublic(ap.Addr()) {
+			return errPrivateDestination
+		}
+		return nil
+	}}
 }
 
 func (d *directOutbound) network(name string) string {
@@ -215,8 +256,13 @@ func (d *directOutbound) network(name string) string {
 }
 
 func (d *directOutbound) dialTCP(ctx context.Context, destination M.Socksaddr) (net.Conn, error) {
+	return d.userDialer().DialContext(ctx, d.network("tcp"), destination.String())
+}
+
+// dialServer reaches an outbound's own server, which may be private.
+func (d *directOutbound) dialServer(ctx context.Context, server M.Socksaddr) (net.Conn, error) {
 	var dialer net.Dialer
-	return dialer.DialContext(ctx, d.network("tcp"), destination.String())
+	return dialer.DialContext(ctx, d.network("tcp"), server.String())
 }
 
 func (d *directOutbound) listenUDP(context.Context, M.Socksaddr) (N.PacketConn, error) {
@@ -224,7 +270,7 @@ func (d *directOutbound) listenUDP(context.Context, M.Socksaddr) (N.PacketConn, 
 	if err != nil {
 		return nil, err
 	}
-	return &udpOutbound{UDPConn: udpConn, ipv4Only: d.ipv4Only, resolved: make(map[string]netip.Addr)}, nil
+	return &udpOutbound{UDPConn: udpConn, ipv4Only: d.ipv4Only, allowPrivate: d.allowPrivate, resolved: make(map[string]netip.Addr)}, nil
 }
 
 func (d *directOutbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
@@ -264,7 +310,7 @@ type ssOutbound struct {
 }
 
 func (s *ssOutbound) dialTCP(ctx context.Context, destination M.Socksaddr) (net.Conn, error) {
-	conn, err := s.direct.dialTCP(ctx, s.server)
+	conn, err := s.direct.dialServer(ctx, s.server)
 	if err != nil {
 		return nil, err
 	}
@@ -323,8 +369,9 @@ func (c *idleConn) Read(p []byte) (int, error) {
 // destinations and expiring after udpTimeout of inactivity.
 type udpOutbound struct {
 	*net.UDPConn
-	ipv4Only bool
-	resolved map[string]netip.Addr
+	ipv4Only     bool
+	allowPrivate bool
+	resolved     map[string]netip.Addr
 }
 
 func (c *udpOutbound) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
@@ -364,6 +411,9 @@ func (c *udpOutbound) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) e
 	}
 	if c.ipv4Only && !addr.Unmap().Is4() {
 		return nil // drop IPv6 destinations, keep session alive
+	}
+	if !c.allowPrivate && !isPublic(addr) {
+		return nil // drop, as dialTCP refuses these
 	}
 	_, err := c.WriteToUDPAddrPort(buffer.Bytes(), netip.AddrPortFrom(addr, destination.Port))
 	return err

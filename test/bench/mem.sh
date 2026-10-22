@@ -15,7 +15,8 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -days 1 -node
 mkdir -p "$WORK/www" && head -c 100M /dev/urandom > "$WORK/www/f"
 (cd "$WORK/www" && exec python3 -m http.server -b 127.0.0.1 38080 >/dev/null 2>&1) & PIDS+=($!)
 cat > "$WORK/node.json" <<JSON
-{"inbounds": [{"type": "anytls", "listen": "127.0.0.1:38443", "cert": "$WORK/cert.pem", "key": "$WORK/key.pem"}],
+{"route": {"allow_private": true},
+ "inbounds": [{"type": "anytls", "listen": "127.0.0.1:38443", "cert": "$WORK/cert.pem", "key": "$WORK/key.pem"}],
  "users": [{"name": "u", "anytls_password": "pw"}]}
 JSON
 cat > "$WORK/sb.json" <<JSON

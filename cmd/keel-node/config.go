@@ -30,8 +30,11 @@ type Config struct {
 // list matches the destination wins, otherwise Final.
 type RouteConfig struct {
 	// IPv4Only dials and resolves IPv4 only (the old -4 flag).
-	IPv4Only bool         `json:"ipv4_only,omitempty"`
-	Rules    []RuleConfig `json:"rules,omitempty"`
+	IPv4Only bool `json:"ipv4_only,omitempty"`
+	// AllowPrivate lets users reach loopback, LAN and other non-public
+	// addresses through the direct outbound. Off by default.
+	AllowPrivate bool         `json:"allow_private,omitempty"`
+	Rules        []RuleConfig `json:"rules,omitempty"`
 	// Final is the outbound for everything no rule matched; default "direct".
 	Final OutboundList `json:"final,omitempty"`
 	// HealthCheck decides when an outbound counts as dead, so lists with
