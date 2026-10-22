@@ -53,11 +53,10 @@ main { max-width: 1180px; margin: 0 auto; padding: 32px 20px 80px; }
 .spark { display: block; width: 100%; margin-top: 16px; }
 
 .grid { display: grid; gap: 16px; }
-.grid.probe { grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr)); }
+.grid.probe { grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr)); align-items: start; }
 .grid.entries { grid-template-columns: repeat(auto-fill, minmax(min(100%, 420px), 1fr)); margin-bottom: 48px; }
 .grid.exits { grid-template-columns: repeat(auto-fill, minmax(min(100%, 260px), 1fr)); }
 .card { background: var(--paper); }
-.card.wide { grid-column: 1 / -1; }
 .card.off { color: var(--faint); }
 .card.off .code { color: var(--muted); }
 .probe-btn { width: 100%; display: flex; flex-direction: column; gap: 14px; padding: 20px; border: 0; background: transparent; text-align: left; font-size: 15px; }
@@ -66,12 +65,39 @@ main { max-width: 1180px; margin: 0 auto; padding: 32px 20px 80px; }
 .three { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
 .meter { height: 3px; background: var(--line); margin-top: 4px; }
 .meter > i { display: block; height: 100%; background: var(--ink); }
-.isp { padding: 0 20px 20px; }
-.isp-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 16px; padding-top: 12px; border-top: 1px solid var(--ink); font-size: 12px; color: var(--muted); }
-.isp-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); gap: 0 32px; }
-.isp-item { padding: 14px 0; border-bottom: 1px solid var(--line); }
-.isp-num { font-size: 24px; font-weight: 300; line-height: 1.2; }
-.isp-num small { font-size: 13px; }
+/* three-network strip at the bottom of a probe card */
+.isp-strip { display: flex; align-items: baseline; gap: 6px 16px; flex-wrap: wrap; padding-top: 12px; border-top: 1px solid var(--line); font-size: 13px; }
+.isp-cell { display: inline-flex; align-items: baseline; gap: 5px; white-space: nowrap; }
+.isp-cell svg { align-self: center; }
+.isp-cell b { font-size: 17px; font-weight: 500; }
+.isp-more { margin-left: auto; align-self: center; color: var(--muted); display: inline-flex; transition: transform .15s; }
+.probe-btn:hover .isp-more { transform: translateX(3px); color: var(--ink); }
+/* probe card flip: both faces share one grid cell, so the card is as tall
+   as the taller face and never changes size when it turns */
+.flip { perspective: 1200px; background: transparent; }
+.flip-inner { display: grid; transition: transform .55s cubic-bezier(.2, .7, .2, 1); transform-style: preserve-3d; }
+.flip.flipped .flip-inner { transform: rotateY(180deg); }
+.face { grid-area: 1 / 1; backface-visibility: hidden; -webkit-backface-visibility: hidden; background: var(--paper); }
+.face.back { transform: rotateY(180deg); }
+.flip-icon { color: var(--muted); display: inline-flex; }
+.isp-rows { display: flex; flex-direction: column; }
+.isp-row { display: grid; grid-template-columns: 4.5em auto 1fr; grid-template-rows: auto auto; align-items: center; column-gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--line); }
+.isp-row:first-child { border-top: 1px solid var(--line); }
+.isp-name { display: inline-flex; align-items: center; gap: 7px; font-size: 14px; grid-row: 1 / 3; }
+.isp-lat { grid-row: 1 / 3; display: inline-flex; align-items: baseline; gap: 2px; min-width: 3.2em; }
+.isp-lat b { font-size: 26px; font-weight: 300; line-height: 1; }
+.isp-lat small { font-size: 12px; color: var(--muted); }
+.isp-sub { display: flex; justify-content: flex-end; gap: 10px; font-size: 12px; color: var(--muted); }
+.isp-spark { width: 100%; height: 22px; display: block; }
+@media (prefers-reduced-motion: reduce) {
+  .flip-inner { transition: none; transform: none !important; }
+  .face, .face.back { transform: none; backface-visibility: visible; transition: opacity .2s; }
+  .flip .back, .flip.flipped .front { opacity: 0; pointer-events: none; }
+  .flip.flipped .back { opacity: 1; pointer-events: auto; }
+}
+.checks { display: flex; flex-direction: column; }
+.checks > div { display: flex; justify-content: space-between; gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--line); font-size: 14px; }
+.checks b { font-weight: 500; }
 .empty { padding: 40px 28px; background: var(--paper); color: var(--muted); }
 
 /* lines */

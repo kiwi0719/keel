@@ -211,6 +211,43 @@ fn exists(conn: &Connection, table: &str, id: i64) -> bool {
 // ---------- state ----------
 
 pub async fn state(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult {
+    ok(state_value(&app, &headers)?)
+}
+
+/// The public status page at /: per-node health and probes only. No
+/// addresses, ports, tokens, users, routes or exits, so it is safe to show
+/// without logging in.
+pub async fn public_state(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult {
+    let full = state_value(&app, &headers)?;
+    const KEEP: &[&str] = &["id", "name", "role", "online", "last_seen", "month_rx", "month_tx", "probes"];
+    const SYSTEM: &[&str] = &["cpu_pct", "mem_total", "mem_used", "disk_total", "disk_used", "rx_rate", "tx_rate", "uptime_s", "tcp_retrans_pct"];
+    let pick = |v: &Value, keys: &[&str]| -> Value {
+        let mut o = Map::new();
+        for k in keys {
+            if let Some(x) = v.get(*k) {
+                o.insert((*k).to_string(), x.clone());
+            }
+        }
+        Value::Object(o)
+    };
+    let nodes: Vec<Value> = full["nodes"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|n| {
+                    let mut o = pick(n, KEEP);
+                    if n["system"].is_object() {
+                        o["system"] = pick(&n["system"], SYSTEM);
+                    }
+                    o
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    ok(json!({"now": full["now"], "nodes": nodes, "summary": full["summary"]}))
+}
+
+fn state_value(app: &Arc<App>, headers: &HeaderMap) -> Result<Value, Response> {
     let ts = now();
     let base = base_url(&app, &headers);
     let conn = app.db();
@@ -326,7 +363,7 @@ pub async fn state(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult
         })
         .collect();
 
-    ok(json!({
+    Ok(json!({
         "now": ts,
         "nodes": nodes,
         "exits": exits,

@@ -13,12 +13,15 @@ const EXIT_STYLE = [
 const ISP_COLOR = { ct: [C.blue, C.blue], cu: [C.red, C.red], cm: [C.yellow, '#B08900'] };
 const GB = 1024 ** 3;
 
+// "/" is a public status page (probes only); the panel lives at /admin.
+const ADMIN = location.pathname.replace(/\/+$/, '') === '/admin';
+
 const S = {
   tab: load('tab') || 'probe',
   data: null,
   loggedIn: null,
-  openProbe: null,
   toast: '',
+  flipped: new Set(), // probe cards showing their three-network side
   picker: null,       // { id, kind: 'rule'|'primary'|'fb', rule } inline chooser open on the lines page
   drawer: null,       // { kind, id, ... }
   draft: null         // drawer form state
@@ -117,9 +120,14 @@ async function api(method, path, body) {
 
 async function refresh() {
   try {
-    S.data = await api('GET', '/api/state');
-    S.loggedIn = true;
-    if (!busy()) render();
+    const data = await api('GET', ADMIN ? '/api/state' : '/api/public');
+    // Unchanged data (most polls when idle) needs no re-render.
+    const sig = JSON.stringify(data);
+    const same = sig === S.sig;
+    S.sig = sig;
+    S.data = data;
+    if (ADMIN) S.loggedIn = true;
+    if (!same && !busy()) render();
   } catch (e) { /* shown via login or kept stale */ }
 }
 
@@ -156,6 +164,10 @@ async function act(fn, okMsg) {
 
 function render() {
   const root = document.getElementById('app');
+  if (!ADMIN) {
+    root.innerHTML = S.data ? `<main class="public">${probePage()}</main>` : '';
+    return;
+  }
   if (S.loggedIn === false) { root.innerHTML = loginPage(); S.drawer = null; renderDrawer(); return; }
   if (!S.data) { root.innerHTML = ''; return; }
   const t = S.tab;
@@ -206,27 +218,30 @@ function probePage() {
       <div class="tiles">
         <div><div class="small muted">在线</div><div class="v">${d.summary.online}/${nodes.length}</div></div>
         <div><div class="small muted">本月</div><div class="v">${bytes(d.summary.month)}</div></div>
-        <div><div class="small muted">用户</div><div class="v">${d.users.length}</div></div>
+        ${d.users ? `<div><div class="small muted">用户</div><div class="v">${d.users.length}</div></div>` : ''}
       </div>
     </section>`;
   if (!nodes.length) {
     return hero + `<div class="empty">还没有节点。去「线路」页点「添加节点」，在服务器上运行给出的那一行命令。</div>`;
   }
-  const ext = d.exits.filter(isExternal);
+  const ext = d.exits ? d.exits.filter(isExternal) : [];
   return hero + `<div class="grid probe">${nodes.map(probeCard).join('')}${ext.map(extCard).join('')}</div>`;
 }
 
 function probeCard(n) {
   const st = nodeStatus(n), off = st.kind === 'off', s = n.system || {};
-  const open = S.openProbe === n.id && !off;
   const meter = (label, p, text) => `<div><div class="small muted">${label}</div><div style="font-size:14px">${off ? '—' : text}</div><div class="meter"><i style="width:${off ? 0 : p.toFixed(0)}%;background:${p >= 80 ? C.red : C.ink}"></i></div></div>`;
   const mem = s.mem_total ? `${Math.round(s.mem_used / 1048576)}/${Math.round(s.mem_total / 1048576)}` : '—';
   const disk = s.disk_total ? `${(s.disk_used / GB).toFixed(1)}/${(s.disk_total / GB).toFixed(0)}` : '—';
-  const probes = n.probes || [];
-  const hint = off ? '失联中，没有三网数据' : probes.length ? (open ? '点一下收起' : '点一下看三网延迟') : '没有三网数据（在设置里填测速目标）';
-  return `<div class="card ${open ? 'wide' : ''} ${off ? 'off' : ''}">
-    <button class="probe-btn" data-act="probe" data-id="${n.id}" aria-expanded="${open}">
-      <div class="row">
+  const probes = off ? [] : (n.probes || []);
+  // Three-network latency at a glance; the detail opens in the side panel.
+  const strip = probes.length
+    ? probes.map(p => {
+      const col = (ISP_COLOR[p.name] || [C.ink])[0];
+      return `<span class="isp-cell">${shape({ color: col, shape: 'circle' }, 7)}<span class="muted">${esc(p.label || p.name)}</span><b>${p.latency > 0 ? Math.round(p.latency) : '—'}</b><span class="muted">ms</span></span>`;
+    }).join('') + `<span class="isp-more" aria-hidden="true">${FLIP_ICON}</span>`
+    : `<span class="small muted">${off ? '失联中' : '没有三网数据'}</span>`;
+  const head = `<div class="row">
         <span class="code" style="flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(nm(n))}</span>
         <span class="muted" style="font-size:14px;flex:1 1 auto">${n.role === 'entry' ? '入口' : '出口'}</span>
         ${statusMark(st.kind)}
@@ -242,36 +257,39 @@ function probeCard(n) {
         <div><div class="small muted">本月</div>${bytes(n.month_rx + n.month_tx)}</div>
         <div><div class="small muted">开机</div>${off ? '—' : duration(s.uptime_s)}</div>
       </div>
-      <span class="small muted">${hint}</span>
-    </button>
-    ${open && probes.length ? ispBlock(n, probes) : ''}
+      <div class="isp-strip">${strip}</div>`;
+  if (!probes.length) return `<div class="card ${off ? 'off' : ''}"><div class="probe-btn">${head}</div></div>`;
+  const flipped = S.flipped.has(n.id);
+  return `<div class="card flip ${flipped ? 'flipped' : ''}">
+    <div class="flip-inner">
+      <button class="face front probe-btn" data-act="probe" data-id="${n.id}" aria-label="${esc(nm(n))}：翻到三网延迟" ${flipped ? 'tabindex="-1" aria-hidden="true"' : ''}>${head}</button>
+      <button class="face back probe-btn" data-act="probe" data-id="${n.id}" aria-label="${esc(nm(n))}：翻回概况" ${flipped ? '' : 'tabindex="-1" aria-hidden="true"'}>${ispBack(n, probes)}</button>
+    </div>
   </div>`;
 }
 
-function ispBlock(n, probes) {
+// The back of a probe card: one row per network, sized to the front.
+function ispBack(n, probes) {
   const s = n.system || {};
-  const items = probes.map(p => {
+  const rows = probes.map(p => {
     const col = ISP_COLOR[p.name] || [C.ink, C.ink];
-    const pts = polyline(p.points, 300, 44, 4);
-    const lossColor = p.loss >= 2 ? C.danger : C.ink;
-    const range = p.max > 0 ? `${Math.round(p.min)}–${Math.round(p.max)} ms` : '';
+    const pts = polyline(p.points, 120, 28, 3);
     const lat = p.latency > 0 ? Math.round(p.latency) : '—';
-    return `<div class="isp-item">
-      <div style="display:flex;align-items:center;gap:8px;font-size:15px;font-weight:500">${shape({ color: col[0], shape: 'circle' }, 8)}${esc(p.label || p.name)}</div>
-      <div class="three" style="gap:8px;margin-top:6px">
-        <div><div class="small muted">延迟</div><div class="isp-num">${lat}<small> ms</small></div></div>
-        <div><div class="small muted">波动</div><div class="isp-num">±${Math.round(p.jitter)}<small> ms</small></div></div>
-        <div><div class="small muted" title="超时或 SYN 重传（≥1 秒）的连接占比">重传</div><div class="isp-num" style="color:${lossColor}">${p.loss.toFixed(p.loss >= 10 ? 0 : 1)}<small> %</small></div></div>
-      </div>
-      <svg width="100%" height="44" viewBox="0 0 300 44" preserveAspectRatio="none" style="display:block;margin-top:8px" role="img" aria-label="${esc(p.label)} 近 1 小时延迟走势"><polyline points="${pts}" fill="none" stroke="${col[1]}" stroke-width="1.5" vector-effect="non-scaling-stroke"></polyline></svg>
-      <div style="display:flex;justify-content:space-between;font-size:11px" class="muted"><span>${p.since ? ago(p.since) : ''}</span><span>${range}</span><span>现在</span></div>
+    return `<div class="isp-row">
+      <span class="isp-name">${shape({ color: col[0], shape: 'circle' }, 8)}${esc(p.label || p.name)}</span>
+      <span class="isp-lat"><b>${lat}</b><small>ms</small></span>
+      <span class="isp-sub"><span>±${Math.round(p.jitter)} ms</span><span style="color:${p.loss >= 2 ? C.danger : 'inherit'}">重传 ${p.loss.toFixed(p.loss >= 10 ? 0 : 1)}%</span></span>
+      <svg class="isp-spark" viewBox="0 0 120 28" preserveAspectRatio="none" aria-hidden="true"><polyline points="${pts}" fill="none" stroke="${col[1]}" stroke-width="1.5" vector-effect="non-scaling-stroke"></polyline></svg>
     </div>`;
   }).join('');
-  const retrans = s.tcp_retrans_pct != null ? ` · 整机 TCP 重传 ${(+s.tcp_retrans_pct).toFixed(1)}%` : '';
-  return `<div class="isp">
-    <div class="isp-head"><span>到国内三网 · 近 1 小时</span><span>TCPing，每轮 10 次${retrans}</span></div>
-    <div class="isp-grid">${items}</div>
-  </div>`;
+  const retrans = s.tcp_retrans_pct != null ? `整机重传 ${(+s.tcp_retrans_pct).toFixed(1)}%` : '';
+  return `<div class="row">
+      <span class="code" style="flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(nm(n))}</span>
+      <span class="muted" style="font-size:14px;flex:1 1 auto">三网 · 近 1 小时</span>
+      <span class="flip-icon" aria-hidden="true">${FLIP_ICON}</span>
+    </div>
+    <div class="isp-rows">${rows}</div>
+    <div class="small muted" style="display:flex;justify-content:space-between;gap:8px"><span>TCPing 每轮 10 次</span><span>${retrans}</span></div>`;
 }
 
 function linesPage() {
@@ -305,23 +323,25 @@ function linesPage() {
 function exitChecks(e) {
   return entries().map(n => ({ n, h: (n.health || {})['x' + e.id] })).filter(c => c.h);
 }
+function checkText(h) {
+  return h.alive ? (h.latency_ms > 0 ? Math.round(h.latency_ms) + ' ms' : '通') : '不通';
+}
 function checkLine(e) {
   const cs = exitChecks(e);
   if (!cs.length) return '<span class="muted">还没有入口检测过</span>';
-  return cs.map(c => c.h.alive
-    ? `${esc(nm(c.n))} <b style="font-weight:500">${c.h.latency_ms != null ? c.h.latency_ms + ' ms' : '通'}</b>`
-    : `${esc(nm(c.n))} <span style="color:${C.danger}">不通</span>`).join(' · ');
+  return cs.map(c => `${esc(nm(c.n))} <b style="font-weight:500;${c.h.alive ? '' : 'color:' + C.danger}">${checkText(c.h)}</b>`).join(' · ');
 }
 function extCard(e) {
   const cs = exitChecks(e), dead = cs.length && cs.every(c => !c.h.alive), some = cs.some(c => !c.h.alive);
   const kind = !cs.length ? 'off' : dead ? 'bad' : some ? 'warn' : 'ok';
-  return `<div class="card ${dead ? 'off' : ''}" style="padding:20px;display:flex;flex-direction:column;gap:14px">
+  return `<div class="card ${dead ? 'off' : ''}" style="padding:20px;display:flex;flex-direction:column;gap:12px">
     <div class="row">
       <span class="code" style="flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(e.name)}</span>
       <span class="muted" style="font-size:14px;flex:1 1 auto">外部出口 · ${esc(extProto(e))}</span>
       ${cs.length ? statusMark(kind) : ''}
     </div>
-    <div style="font-size:14px">${checkLine(e)}</div>
+    <div class="checks">${cs.length ? cs.map(c => `<div><span class="muted">${esc(nm(c.n))}</span><b style="${c.h.alive ? '' : 'color:' + C.danger}">${checkText(c.h)}</b></div>`).join('') : '<span class="small muted">还没有入口检测过</span>'}</div>
+    <div class="small muted">由各入口每 15 秒检测一次</div>
   </div>`;
 }
 
@@ -356,6 +376,7 @@ function exitPicker(n, kind, rule, ids, current) {
   }).join('');
   return `<div class="picker chips" role="group">${chips}</div>`;
 }
+const FLIP_ICON = '<svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M2 5.5A5 5 0 0 1 11.5 4M12 8.5A5 5 0 0 1 2.5 10" fill="none" stroke="currentColor" stroke-width="1.3"></path><path d="M11.8 1.2V4.3H8.7M2.2 12.8V9.7H5.3" fill="none" stroke="currentColor" stroke-width="1.3"></path></svg>';
 const CHEVRON = '<svg class="chev" width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="M1.5 3.5L5 7L8.5 3.5" fill="none" stroke="currentColor" stroke-width="1.4"></path></svg>';
 
 // Fallback chips plus a "+ 备用" picker. rule '' means the default exit.
@@ -888,7 +909,19 @@ const actions = {
       setRules(n, n.rules.concat([{ ruleset: v, exit_id: target }]), `${nm(n)} 的 ${set.label} 走 ${exitLabel(target)}，点出口可以换。`);
     }
   },
-  probe(el) { const id = +el.dataset.id; S.openProbe = S.openProbe === id ? null : id; render(); },
+  // Flip in place: toggle the class on the live element so the transition
+  // plays, and remember it so later re-renders keep the side.
+  probe(el) {
+    const id = +el.dataset.id, card = el.closest('.flip');
+    if (S.flipped.has(id)) S.flipped.delete(id); else S.flipped.add(id);
+    const on = S.flipped.has(id);
+    card.classList.toggle('flipped', on);
+    card.querySelector('.front').toggleAttribute('aria-hidden', on);
+    card.querySelector('.back').toggleAttribute('aria-hidden', !on);
+    card.querySelector('.front').tabIndex = on ? -1 : 0;
+    card.querySelector('.back').tabIndex = on ? 0 : -1;
+    card.querySelector(on ? '.back' : '.front').focus({ preventScroll: true });
+  },
   'default-exit'(el) {
     const n = node(+el.dataset.id), x = +el.dataset.exit;
     const label = x ? exit(x).name : '直连';
@@ -1144,11 +1177,15 @@ document.addEventListener('submit', async e => {
 });
 
 (async function start() {
-  try {
-    const s = await api('GET', '/api/session');
-    S.loggedIn = s.logged_in;
-  } catch (e) { S.loggedIn = false; }
-  if (S.loggedIn) await refresh();
+  if (ADMIN) {
+    try {
+      const s = await api('GET', '/api/session');
+      S.loggedIn = s.logged_in;
+    } catch (e) { S.loggedIn = false; }
+  }
+  if (S.loggedIn || !ADMIN) await refresh();
   render();
-  setInterval(() => { if (S.loggedIn) refresh(); }, 2000);
+  // No polling while the tab is in the background.
+  setInterval(() => { if ((S.loggedIn || !ADMIN) && !document.hidden) refresh(); }, ADMIN ? 2000 : 3000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden && (S.loggedIn || !ADMIN)) refresh(); });
 })();
