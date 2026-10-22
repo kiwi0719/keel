@@ -76,14 +76,26 @@ pub async fn require_login(State(app): State<Arc<App>>, req: Request, next: Next
 
 #[derive(Deserialize)]
 pub struct Login {
+    #[serde(default)]
+    username: String,
     password: String,
 }
 
+/// The panel login name; "admin" until set with -user or in the settings.
+pub fn admin_user(conn: &Connection) -> String {
+    db::get_setting(conn, "admin_user").ok().flatten().filter(|u| !u.is_empty()).unwrap_or_else(|| "admin".into())
+}
+
 pub async fn login(State(app): State<Arc<App>>, Json(body): Json<Login>) -> ApiResult {
-    let good = verify_password(&app.db(), &body.password);
+    let good = {
+        let conn = app.db();
+        // Check the password even for a wrong name so both take as long.
+        let pw_ok = verify_password(&conn, &body.password);
+        pw_ok && body.username.trim() == admin_user(&conn)
+    };
     if !good {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        return Err((StatusCode::UNAUTHORIZED, Json(json!({"error": "密码不对"}))).into_response());
+        return Err((StatusCode::UNAUTHORIZED, Json(json!({"error": "用户名或密码不对"}))).into_response());
     }
     let token = random_hex(24);
     app.db()
@@ -176,6 +188,7 @@ pub async fn state(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult
     let months = db::node_months(&conn, &month_label(ts, w.tz)).map_err(internal)?;
     let targets = App::probe_targets(&conn);
     let panel_url = db::get_setting(&conn, "panel_url").ok().flatten().unwrap_or_default();
+    let username = admin_user(&conn);
     drop(conn);
     let live = app.live();
 
@@ -290,6 +303,7 @@ pub async fn state(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult
             "month": month_total,
         },
         "settings": {
+            "username": username,
             "panel_url": panel_url,
             "base_url": base,
             "tz_offset": w.tz,
@@ -651,9 +665,21 @@ pub async fn delete_user(State(app): State<Arc<App>>, Path(id): Path<i64>) -> Ap
 pub async fn update_settings(State(app): State<Arc<App>>, Json(b): Json<Map<String, Value>>) -> ApiResult {
     {
         let conn = app.db();
+        let current = b.get("current_password").and_then(Value::as_str).unwrap_or("");
+        if let Some(v) = b.get("username") {
+            let name = str_field(v, 40)?;
+            if name.is_empty() {
+                return Err(bad("用户名不能为空"));
+            }
+            if name != admin_user(&conn) {
+                if !verify_password(&conn, current) {
+                    return Err(bad("改用户名要填当前密码"));
+                }
+                db::set_setting(&conn, "admin_user", &name).map_err(internal)?;
+            }
+        }
         if let Some(pw) = b.get("password") {
             let pw = pw.as_str().unwrap_or("");
-            let current = b.get("current_password").and_then(Value::as_str).unwrap_or("");
             if !verify_password(&conn, current) {
                 return Err(bad("当前密码不对"));
             }

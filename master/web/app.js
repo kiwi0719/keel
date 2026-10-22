@@ -173,7 +173,8 @@ function loginPage() {
   return `<div class="login"><form data-form="login">
     <div class="sun" aria-hidden="true"></div>
     <h1>keel</h1>
-    <label class="field">面板密码<input type="password" name="password" autocomplete="current-password" required autofocus></label>
+    <label class="field">用户名<input name="username" autocomplete="username" autocapitalize="off" spellcheck="false" required autofocus></label>
+    <label class="field">密码<input type="password" name="password" autocomplete="current-password" required></label>
     <div class="err" id="login-err"></div>
     <button class="btn solid" type="submit">进入</button>
   </form></div>`;
@@ -613,10 +614,11 @@ function settingsDrawer() {
       <section class="sec"><h3>三网测速目标</h3><div class="fields">${targets}</div>
         <p class="small muted" style="margin:0">默认是上海三网（Zstatic 公开的 TCPing 节点，地址由对方自动更新）。换省份就把 sh 改成对应代号。节点每 30 秒对每个目标 TCP 连 10 次，算延迟、波动和重传。留空就不测。</p></section>
       ${st.fingerprint ? `<section class="sec"><h3>主控证书指纹</h3><div class="mono small" style="word-break:break-all">${esc(st.fingerprint)}</div></section>` : ''}
-      <section class="sec"><h3>改密码</h3><div class="fields two">
+      <section class="sec"><h3>登录</h3><div class="fields two">
+        ${field('用户名', 'username', st.username, { full: true })}
         ${field('当前密码', 'current_password', '', { type: 'password' })}
-        ${field('新密码', 'password', '', { type: 'password' })}
-      </div></section>`,
+        ${field('新密码（不改就留空）', 'password', '', { type: 'password' })}
+      </div><p class="small muted" style="margin:0">改用户名或密码都要填当前密码。</p></section>`,
     foot: `<button class="btn solid" data-act="save-settings">保存</button>
       <button class="btn" data-act="logout">退出登录</button>`
   };
@@ -792,7 +794,8 @@ const actions = {
       panel_url: f.panel_url, tz_offset: int(f.tz_offset),
       probe_targets: st.probe_targets.map(t => ({ name: t.name, label: t.label, host: (f['probe_' + t.name] || '').trim() }))
     };
-    if (f.password) { body.password = f.password; body.current_password = f.current_password; }
+    body.username = f.username.trim(); body.current_password = f.current_password;
+    if (f.password) body.password = f.password;
     try { await api('PATCH', '/api/settings', body); flash('设置已保存。'); closeDrawer(); await refresh(); render(); }
     catch (e) { drawerError(e.message); }
   },
@@ -869,9 +872,9 @@ document.addEventListener('keydown', e => {
 document.addEventListener('submit', async e => {
   e.preventDefault();
   if (e.target.dataset.form === 'login') {
-    const pw = e.target.password.value;
+    const pw = e.target.password.value, user = e.target.username.value;
     try {
-      await api('POST', '/api/login', { password: pw });
+      await api('POST', '/api/login', { username: user, password: pw });
       S.loggedIn = true; await refresh(); render();
     } catch (err) {
       const box = document.getElementById('login-err');
