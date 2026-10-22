@@ -238,7 +238,12 @@ func (n *node) reload(config *Config) error {
 	if err != nil {
 		return err
 	}
+	allow, err := parseAllowList(config.AllowFrom)
+	if err != nil {
+		return err
+	}
 	currentRouter.Store(r)
+	currentAllow.Store(allow)
 	n.config.Store(config)
 	n.prober.setTargets(config.Probes, config.Route.IPv4Only, time.Duration(config.ProbeInterval))
 	n.failed = make(map[string]string)

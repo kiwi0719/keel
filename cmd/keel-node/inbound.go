@@ -50,6 +50,10 @@ func acceptLoop(listener net.Listener, serve func(net.Conn)) {
 			}
 			return
 		}
+		if addr, ok := conn.RemoteAddr().(*net.TCPAddr); ok && !allowed(addr.AddrPort().Addr()) {
+			conn.Close()
+			continue
+		}
 		go serve(conn)
 	}
 }

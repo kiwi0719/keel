@@ -280,7 +280,27 @@ fn exit(w: &World, node: &Node, secret: &str, now: i64) -> Value {
             users.push(v);
         }
     }
-    json!({"route": {"ipv4_only": node.ipv4_only}, "inbounds": inbounds, "users": users})
+    json!({"route": {"ipv4_only": node.ipv4_only}, "inbounds": inbounds, "users": users, "allow_from": entry_ips(w)})
+}
+
+/// Who may connect to an exit node: the IPs entries were last seen from, plus
+/// any entry host written as an IP. With no entry known yet the exit stays
+/// closed (loopback only) rather than open to everyone.
+fn entry_ips(w: &World) -> Vec<String> {
+    let mut ips: Vec<String> = w
+        .nodes
+        .iter()
+        .filter(|n| n.is_entry())
+        .flat_map(|n| [n.last_ip.as_str(), n.host.as_str()])
+        .filter_map(|s| s.trim().parse::<std::net::IpAddr>().ok())
+        .map(|ip| ip.to_string())
+        .collect();
+    ips.sort();
+    ips.dedup();
+    if ips.is_empty() {
+        ips.push("127.0.0.1".into());
+    }
+    ips
 }
 
 /// Leaves out inbounds of protocols the node's binary was built without, so

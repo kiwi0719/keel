@@ -81,6 +81,10 @@ func (in *ssInbound) loopUDP() {
 			}
 			return
 		}
+		if !allowed(addr.Addr()) {
+			buffer.Release()
+			continue
+		}
 		buffer.Truncate(n)
 		source := M.SocksaddrFromNetIP(addr).Unwrap()
 		if err = in.service.NewPacket(context.Background(), writer, buffer, M.Metadata{Source: source}); err != nil && verbose {

@@ -19,6 +19,10 @@ type Config struct {
 	Outbounds []OutboundConfig `json:"outbounds,omitempty"`
 	Inbounds  []InboundConfig  `json:"inbounds"`
 	Users     []UserConfig     `json:"users"`
+	// AllowFrom limits who may connect to the inbounds (IPs or CIDRs); other
+	// sources are dropped before any handshake. Empty allows everyone. The
+	// master fills it on exit nodes with its entries' addresses.
+	AllowFrom []string `json:"allow_from,omitempty"`
 	// Probes are TCPing targets (China Telecom / Unicom / Mobile) reported
 	// with latency, jitter and loss.
 	Probes []ProbeTarget `json:"probes,omitempty"`
@@ -257,6 +261,9 @@ func (c *Config) validate() error {
 			return fmt.Errorf("duplicate inbound %s", inbound.ID())
 		}
 		keys[inbound.ID()] = true
+	}
+	if _, err := parseAllowList(c.AllowFrom); err != nil {
+		return err
 	}
 	names := make(map[string]bool)
 	for _, user := range c.Users {
