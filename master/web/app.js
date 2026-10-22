@@ -82,6 +82,8 @@ function exitStyle(id) {
   const i = S.data.exits.findIndex(e => e.id === id);
   return i < 0 ? { color: C.faint, shape: 'circle' } : EXIT_STYLE[i % EXIT_STYLE.length];
 }
+function isExternal(e) { return e.kind && e.kind !== 'ss'; }
+function extProto(e) { return e.kind === 'vless' ? 'VLESS' : 'SS ' + e.method; }
 function entries() { return S.data.nodes.filter(n => n.role === 'entry'); }
 function exitNodes() { return S.data.nodes.filter(n => n.role === 'exit'); }
 function nodeStatus(n) {
@@ -278,14 +280,18 @@ function linesPage() {
     <div class="toast" role="status">${toast}</div>`;
   html += es.length ? `<div class="grid entries">${es.map(entryCard).join('')}</div>`
     : `<div class="empty" style="margin-bottom:48px">还没有入口节点。</div>`;
-  html += `<h2 style="margin:0 0 16px">出口 <span class="muted">统一 SS-2022</span></h2>`;
+  html += `<div class="section-head">
+      <h2>出口 <span class="muted">自建 SS-2022 · 外部导入</span></h2>
+      <button class="btn" data-act="ext-import">导入外部出口</button>
+    </div>`;
   const cards = [];
   for (const x of xs) {
     const ports = S.data.exits.filter(e => e.node_id === x.id);
     if (!ports.length) cards.push(exitNodeCard(x));
     ports.forEach(e => cards.push(exitCard(e, x)));
   }
-  html += cards.length ? `<div class="grid exits">${cards.join('')}</div>` : `<div class="empty">还没有出口节点。</div>`;
+  S.data.exits.filter(isExternal).forEach(e => cards.push(exitCard(e, null)));
+  html += cards.length ? `<div class="grid exits">${cards.join('')}</div>` : `<div class="empty">还没有出口。加一个出口节点，或者粘贴 vless:// / ss:// 链接导入外部出口。</div>`;
   return html;
 }
 
@@ -384,11 +390,16 @@ function entryCard(n) {
 
 function exitCard(e, x) {
   const st = exitStyle(e.id);
-  const parts = [`${esc(x.code)} :${e.port}`];
-  if (e.quota_bytes) parts.push(`${gib(e.used)} / ${gib(e.quota_bytes)} G`, `${e.reset_day} 号重置`);
-  else parts.push(`本期 ${bytes(e.used)}`);
-  if (e.udp_over_tcp) parts.push('UDP 走 TCP');
-  if (!x.address) parts.push('还不知道地址');
+  const parts = [];
+  if (x) {
+    parts.push(`${esc(x.code)} :${e.port}`);
+    if (e.quota_bytes) parts.push(`${gib(e.used)} / ${gib(e.quota_bytes)} G`, `${e.reset_day} 号重置`);
+    else parts.push(`本期 ${bytes(e.used)}`);
+    if (e.udp_over_tcp) parts.push('UDP 走 TCP');
+    if (!x.address) parts.push('还不知道地址');
+  } else {
+    parts.push('外部', extProto(e), esc(e.server));
+  }
   const defaults = entries().filter(n => n.default_exit === e.id).map(n => n.code);
   const split = [];
   for (const n of entries()) {
@@ -401,8 +412,8 @@ function exitCard(e, x) {
   if (split.length) usedBy.push('分流：' + split.join('，'));
   if (backup.length) usedBy.push('备用：' + backup.join(' · '));
   const bar = e.quota_bytes ? `<span style="display:block;height:3px;background:#D6D1C6"><span style="display:block;height:100%;width:${pct(e.used, e.quota_bytes).toFixed(0)}%;background:${e.used >= e.quota_bytes ? C.red : C.ink}"></span></span>` : '';
-  const off = !x.online ? ` <span style="font-size:13px;font-weight:400;color:${C.danger}">失联</span>` : '';
-  return `<button class="exit-card" data-act="node" data-id="${x.id}">
+  const off = x && !x.online ? ` <span style="font-size:13px;font-weight:400;color:${C.danger}">失联</span>` : '';
+  return `<button class="exit-card" ${x ? `data-act="node" data-id="${x.id}"` : `data-act="ext" data-exit="${e.id}"`}>
     <span class="title">${shape(st)}${esc(e.name)}${off}</span>
     <span class="muted" style="font-size:13px">${parts.join(' · ')}</span>
     ${bar}
@@ -466,6 +477,8 @@ function renderDrawer(focus) {
   else if (d.kind === 'install') view = installDrawer(d);
   else if (d.kind === 'user') view = userDrawer(d);
   else if (d.kind === 'settings') view = settingsDrawer(d);
+  else if (d.kind === 'ext-import') view = extImportDrawer(d);
+  else if (d.kind === 'ext') view = extDrawer(d);
   if (!view) { closeDrawer(); return; }
   root.innerHTML = `
     <button class="scrim" data-act="close" aria-label="关闭抽屉" tabindex="-1"></button>
@@ -588,6 +601,40 @@ function newNodeDrawer(d) {
         </div>
       </section>`,
     foot: `<button class="btn solid" data-act="create-node">创建并生成安装命令</button>`
+  };
+}
+
+const EXT_HELP = `<p class="small muted" style="margin:0">一行一条：<b>vless://</b>（明文 TCP，不带 TLS / Reality）、<b>ss://</b>（SS-2022 或 aes-gcm / chacha20，不带插件）。也可以粘贴 3x-ui / Xray 的出站 JSON，或整份 Xray 配置，会取出里面的 vless 和 shadowsocks 出站。名称取链接 # 后面的备注。</p>`;
+
+function extImportDrawer(d) {
+  return {
+    title: '导入外部出口', mark: shape({ color: C.blue, shape: 'circle' }, 16),
+    body: `<section class="sec">
+        <p style="margin:0;font-size:14px">外部出口是别人的服务器（比如买的家宽落地）：不装 keel，入口直接连它。导入后和自建出口一样，可以设成默认、分流或备用。</p>
+        <label class="field">分享链接或出站 JSON<textarea name="link" rows="6" placeholder="vless://…  或  ss://…">${esc(d.link || '')}</textarea></label>
+        <div class="fields">${field('名称（只导入一条时可选，留空用链接备注）', 'name', d.name || '', { placeholder: 'GLBB 动态' })}</div>
+        ${EXT_HELP}
+      </section>`,
+    foot: `<button class="btn solid" data-act="ext-create">导入</button>`
+  };
+}
+
+function extDrawer(d) {
+  const e = exit(d.id);
+  if (!e) return null;
+  return {
+    title: e.name, mark: shape(exitStyle(e.id), 16),
+    body: `<section class="sec">
+        <div class="fields two">
+          ${field('名称', 'name', e.name)}
+          <label class="field">协议 · 地址<input value="${esc(extProto(e) + ' · ' + e.server)}" disabled></label>
+        </div>
+        <label class="field">换一条链接（商家换了地址或密钥时粘贴新的，名称和线路设置不变）<textarea name="link" rows="3" placeholder="留空就不换"></textarea></label>
+        ${EXT_HELP}
+        <p class="small muted" style="margin:0">流量额度由商家那边控制，这里不统计。</p>
+      </section>`,
+    foot: `<button class="btn solid" data-act="ext-save" data-exit="${e.id}">保存并热更新</button>
+      <button class="btn danger" data-act="exit-del" data-exit="${e.id}">删除</button>`
   };
 }
 
@@ -825,8 +872,30 @@ const actions = {
   async 'exit-del'(el) {
     const e = exit(+el.dataset.exit);
     if (!confirm(`删除出口「${e.name}」？走它的入口和分流会改回默认或直连。`)) return;
+    if (isExternal(e)) closeDrawer();
     try { await api('DELETE', `/api/exits/${e.id}`); await refresh(); renderDrawer(); render(); }
     catch (err) { drawerError(err.message); }
+  },
+  'ext-import'() { openDrawer({ kind: 'ext-import' }); },
+  ext(el) { openDrawer({ kind: 'ext', id: +el.dataset.exit }); },
+  async 'ext-create'() {
+    const f = form();
+    if (!f.link.trim()) return drawerError('先粘贴链接');
+    try {
+      const r = await api('POST', '/api/exits', { link: f.link, name: f.name });
+      closeDrawer(); await refresh();
+      const n = r.ids.length;
+      flash(n > 1 ? `导入了 ${n} 个外部出口，可以在入口的默认、分流或备用里选它们。` : `导入了「${exit(r.id) ? exit(r.id).name : '外部出口'}」，可以在入口的默认、分流或备用里选它。`);
+      render();
+    } catch (e) { Object.assign(S.drawer, { link: f.link, name: f.name }); drawerError(e.message); }
+  },
+  async 'ext-save'(el) {
+    const e = exit(+el.dataset.exit), f = form();
+    try {
+      await api('PATCH', `/api/exits/${e.id}`, { name: f.name, link: f.link });
+      flash(`「${f.name || e.name}」已保存并热更新。`);
+      closeDrawer(); await refresh(); render();
+    } catch (err) { drawerError(err.message); }
   },
   user(el) { openDrawer({ kind: 'user', id: +el.dataset.id }); },
   'new-user'() { openDrawer({ kind: 'user', id: 0 }); },

@@ -93,8 +93,8 @@ fn listen(port: i64) -> String {
 /// (its node has no known address).
 fn exit_tag(w: &World, exit_id: i64) -> Option<String> {
     let e = w.exit(exit_id)?;
-    let n = w.node(e.node_id)?;
-    (!n.address().is_empty()).then(|| format!("x{exit_id}"))
+    let reachable = if e.is_external() { !e.server.is_empty() } else { !w.node(e.node_id)?.address().is_empty() };
+    reachable.then(|| format!("x{exit_id}"))
 }
 
 pub fn build(w: &World, node: &Node, secret: &str, probes: &[ProbeTarget], now: i64) -> Value {
@@ -167,6 +167,13 @@ fn entry(w: &World, node: &Node, secret: &str, now: i64) -> Value {
         .iter()
         .filter_map(|id| {
             let e = w.exit(*id)?;
+            match e.kind.as_str() {
+                "vless" => return Some(json!({"tag": format!("x{id}"), "type": "vless", "server": e.server, "uuid": e.uuid})),
+                "shadowsocks" => {
+                    return Some(json!({"tag": format!("x{id}"), "type": "ss2022", "server": e.server, "method": e.method, "password": e.psk}))
+                }
+                _ => {}
+            }
             let n = w.node(e.node_id)?;
             let mut o = json!({
                 "tag": format!("x{id}"),
@@ -238,7 +245,7 @@ fn entry(w: &World, node: &Node, secret: &str, now: i64) -> Value {
 }
 
 fn exit(w: &World, node: &Node, secret: &str, now: i64) -> Value {
-    let exits: Vec<&Exit> = w.exits.iter().filter(|e| e.node_id == node.id).collect();
+    let exits: Vec<&Exit> = w.exits.iter().filter(|e| e.node_id == node.id && !e.is_external()).collect();
     let inbounds: Vec<Value> = exits
         .iter()
         .map(|e| json!({"type": "ss2022", "listen": listen(e.port), "method": SS_METHOD, "password": e.psk}))

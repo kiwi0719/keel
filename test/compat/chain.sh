@@ -7,8 +7,9 @@
 # go to exit2, whose SS outbound carries UDP over TCP; 127.0.0.3 goes direct;
 # everything else goes to exit1 (final) with native SS 2022 UDP. Each check
 # reads the exits' per-user counters to prove which way the traffic went.
-# 127.0.0.4 goes to a third-party style upstream: an Xray VLESS server over
-# plain TCP (UDP as XUDP), checked through Xray's access log.
+# 127.0.0.4 and 127.0.0.5 go to third-party style upstreams on an Xray: VLESS
+# over plain TCP (UDP as XUDP) and classic Shadowsocks aes-128-gcm, checked
+# through Xray's access log.
 # Finally exit1 is stopped and started again: final is [exit1, exit2], so
 # traffic must fall back to exit2 and come back to exit1.
 #
@@ -24,7 +25,7 @@ go build -o "$WORK/helper" ./test/compat/helper || exit 1
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY
 
 SNI=www.example.com DEST=127.0.0.1:48443 PORT=48080 ECHO_PORT=49000
-ENTRY_PORT=48501 EXIT1_PORT=48601 EXIT2_PORT=48602 UPSTREAM_PORT=48701 SOCKS=127.0.0.1:1280
+ENTRY_PORT=48501 EXIT1_PORT=48601 EXIT2_PORT=48602 UPSTREAM_PORT=48701 SSUP_PORT=48702 SOCKS=127.0.0.1:1280
 MB=1048576
 
 "$WORK/helper" dest "$DEST" "$SNI" 2>/dev/null &
@@ -61,7 +62,8 @@ cat > "$WORK/entry/node.json" <<JSON
     "rules": [
       {"name": "ai", "domains": ["=localhost", "127.0.0.2/32"], "outbound": "exit2"},
       {"name": "direct", "domains": ["127.0.0.3"], "outbound": "direct"},
-      {"name": "upstream", "domains": ["127.0.0.4"], "outbound": "upstream"}
+      {"name": "upstream", "domains": ["127.0.0.4"], "outbound": "upstream"},
+      {"name": "ssup", "domains": ["127.0.0.5"], "outbound": "ssup"}
     ],
     "final": ["exit1", "exit2"],
     "health_check": {"url": "http://127.0.0.1:$PORT/ok", "interval": "5s"}
@@ -69,7 +71,8 @@ cat > "$WORK/entry/node.json" <<JSON
   "outbounds": [
     {"tag": "exit1", "type": "ss2022", "server": "127.0.0.1:$EXIT1_PORT", "password": "$PSK1:$KEY1"},
     {"tag": "exit2", "type": "ss2022", "server": "127.0.0.1:$EXIT2_PORT", "password": "$PSK2:$KEY2", "udp_over_tcp": true},
-    {"tag": "upstream", "type": "vless", "server": "127.0.0.1:$UPSTREAM_PORT", "uuid": "$UPSTREAM_UUID"}
+    {"tag": "upstream", "type": "vless", "server": "127.0.0.1:$UPSTREAM_PORT", "uuid": "$UPSTREAM_UUID"},
+    {"tag": "ssup", "type": "ss2022", "server": "127.0.0.1:$SSUP_PORT", "method": "aes-128-gcm", "password": "$UPSTREAM_UUID"}
   ],
   "inbounds": [
     {"type": "vless", "listen": "127.0.0.1:$ENTRY_PORT",
@@ -93,7 +96,9 @@ cat > "$WORK/upstream.json" <<JSON
 {"log": {"loglevel": "warning", "access": "$WORK/upstream-access.log"},
  "inbounds": [{"listen": "127.0.0.1", "port": $UPSTREAM_PORT, "protocol": "vless",
    "settings": {"clients": [{"id": "$UPSTREAM_UUID"}], "decryption": "none"},
-   "streamSettings": {"network": "tcp", "security": "none"}}],
+   "streamSettings": {"network": "tcp", "security": "none"}},
+  {"listen": "127.0.0.1", "port": $SSUP_PORT, "protocol": "shadowsocks",
+   "settings": {"method": "aes-128-gcm", "password": "$UPSTREAM_UUID", "network": "tcp,udp"}}],
  "outbounds": [{"protocol": "freedom"}]}
 JSON
 "$XRAY" run -c "$WORK/upstream.json" > "$WORK/upstream.log" 2>&1 &
@@ -137,13 +142,15 @@ upstream_check() {
 }
 upstream_check "tcp, ip rule -> vless upstream" "accepted tcp:127.0.0.4:$PORT" fetch 127.0.0.4
 upstream_check "udp, ip rule -> vless upstream (XUDP)" "accepted udp:127.0.0.4:$ECHO_PORT" "$WORK/helper" socksudp "$SOCKS" 127.0.0.4:$ECHO_PORT
+upstream_check "tcp, ip rule -> shadowsocks upstream (aes-128-gcm)" "accepted tcp:127.0.0.5:$PORT" fetch 127.0.0.5
+upstream_check "udp, ip rule -> shadowsocks upstream (aes-128-gcm)" "accepted udp:127.0.0.5:$ECHO_PORT" "$WORK/helper" socksudp "$SOCKS" 127.0.0.5:$ECHO_PORT
 route_check "udp, no rule -> exit1 (native SS UDP)" exit1 "$WORK/helper" socksudp "$SOCKS" 127.0.0.1:$ECHO_PORT
 route_check "udp, ip rule -> exit2 (UDP over TCP)" exit2 "$WORK/helper" socksudp "$SOCKS" 127.0.0.2:$ECHO_PORT
 
 # The entry still counts everything for its own user.
 kill -USR1 $ENTRY_PID; sleep 0.3
 alice=$(python3 -c "import json; print(json.load(open('$WORK/entry/usage.json'))['users']['alice']['down'])")
-check "entry counts the user's traffic" $([ "$alice" -ge $((100*MB)) ] && echo 0 || echo 1) "(alice down $((alice/MB)) MB for 5 x 20 MB)"
+check "entry counts the user's traffic" $([ "$alice" -ge $((120*MB)) ] && echo 0 || echo 1) "(alice down $((alice/MB)) MB for 6 x 20 MB)"
 
 # Fallback: stop exit1, wait for the entry to notice, then bring it back.
 # wait_log <pattern> <seconds>: seconds it took for pattern to show up in the entry log.

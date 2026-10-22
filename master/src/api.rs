@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use crate::app::App;
 use crate::db;
+use crate::link;
 use crate::nodecfg::{self, ProbeTarget};
 use crate::period::{format_date_end, month_label, now, parse_date_end, period_end};
 use crate::util::{random_b64, random_hex};
@@ -541,7 +542,7 @@ fn apply_exit_fields(conn: &Connection, id: i64, b: &Map<String, Value>) -> Resu
             "quota_bytes" => ("quota_bytes", int_field(v, 0, i64::MAX / 2)?.into()),
             "reset_day" => ("reset_day", int_field(v, 1, 31)?.into()),
             "udp_over_tcp" => ("udp_over_tcp", (bool_field(v)? as i64).into()),
-            "node_id" => continue,
+            "node_id" | "link" => continue,
             _ => return Err(bad(format!("不能改 {k}"))),
         };
         conn.execute(&format!("UPDATE exits SET {col}=?1 WHERE id=?2"), params![val, id]).map_err(internal)?;
@@ -549,7 +550,56 @@ fn apply_exit_fields(conn: &Connection, id: i64, b: &Map<String, Value>) -> Resu
     Ok(())
 }
 
+/// Saves imported servers as external exits; returns their ids.
+fn import_exits(conn: &mut Connection, text: &str, name: Option<&str>) -> Result<Vec<i64>, Response> {
+    let items = link::parse_all(text).map_err(bad)?;
+    let tx = conn.transaction().map_err(internal)?;
+    let mut sort: i64 = tx.query_row("SELECT COALESCE(MAX(sort),0)+1 FROM exits", [], |r| r.get(0)).map_err(internal)?;
+    let mut ids = Vec::new();
+    for it in &items {
+        let name = match name {
+            Some(n) if items.len() == 1 && !n.trim().is_empty() => n.trim().to_string(),
+            _ if it.name.is_empty() => it.server.clone(),
+            _ => it.name.clone(),
+        };
+        tx.execute(
+            "INSERT INTO exits(node_id,name,kind,server,uuid,method,psk,sort) VALUES(NULL,?1,?2,?3,?4,?5,?6,?7)",
+            params![name.chars().take(40).collect::<String>(), it.kind, it.server, it.uuid, it.method, it.password, sort],
+        )
+        .map_err(internal)?;
+        ids.push(tx.last_insert_rowid());
+        sort += 1;
+    }
+    tx.commit().map_err(internal)?;
+    Ok(ids)
+}
+
+/// Re-imports an external exit's server from a new link, keeping its name,
+/// routes and fallbacks.
+fn reimport_exit(conn: &Connection, id: i64, text: &str) -> Result<(), Response> {
+    let mut items = link::parse_all(text).map_err(bad)?;
+    if items.len() != 1 {
+        return Err(bad("换链接时只能粘一条"));
+    }
+    let it = items.remove(0);
+    let n = conn
+        .execute(
+            "UPDATE exits SET kind=?1, server=?2, uuid=?3, method=?4, psk=?5 WHERE id=?6 AND node_id IS NULL",
+            params![it.kind, it.server, it.uuid, it.method, it.password, id],
+        )
+        .map_err(internal)?;
+    if n == 0 {
+        return Err(bad("只有外部出口能换链接"));
+    }
+    Ok(())
+}
+
 pub async fn create_exit(State(app): State<Arc<App>>, Json(b): Json<Map<String, Value>>) -> ApiResult {
+    if let Some(text) = b.get("link").and_then(Value::as_str) {
+        let ids = import_exits(&mut app.db(), text, b.get("name").and_then(Value::as_str))?;
+        app.sync();
+        return ok(json!({"id": ids[0], "ids": ids}));
+    }
     let id = {
         let mut conn = app.db();
         let tx = conn.transaction().map_err(internal)?;
@@ -580,6 +630,9 @@ pub async fn update_exit(State(app): State<Arc<App>>, Path(id): Path<i64>, Json(
         let conn = app.db();
         if !exists(&conn, "exits", id) {
             return Err(bad("没有这个出口"));
+        }
+        if let Some(text) = b.get("link").and_then(Value::as_str).filter(|t| !t.trim().is_empty()) {
+            reimport_exit(&conn, id, text)?;
         }
         apply_exit_fields(&conn, id, &b)?;
     }

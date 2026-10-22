@@ -58,7 +58,7 @@ KEEL_TOKEN=<节点令牌> keel-node -master https://panel.example:8443 \
 - `quota_bytes` 按上行加下行算，超额后 1 秒内断开并拒绝新连接；`expire_at` 是 unix 秒数。`period` 一变，这个用户的计数就从零开始（每月重置就靠主控下发新的 period）。
 - 计数每 10 秒和退出时写入 `-state` 文件，重启后同一 period 的计数接着算；`kill -USR1` 立刻写一次。
 - 删除用户会断开他所有正在用的连接。
-- `outbounds` 里定义出口：`ss2022`（连出口节点，`password` 写 `出口password:入口的ss_key`，`udp_over_tcp` 让 UDP 走 TCP 连接，适合入口到出口之间 UDP 不稳的线路）、`socks`（比如本机 sslocal 走家宽落地）和 `vless`（第三方 VLESS 上游，明文 TCP、不带 TLS，只填 `server` 和 `uuid`，UDP 走 XUDP）。`direct` 是内置的直连。
+- `outbounds` 里定义出口：`ss2022`（连出口节点，`password` 写 `出口password:入口的ss_key`；`method` 也可以是 aes-128/256-gcm、chacha20-ietf-poly1305 这类普通加密，连第三方 SS，`password` 就是普通密码；`udp_over_tcp` 让 UDP 走 TCP 连接，适合入口到出口之间 UDP 不稳的线路）、`socks`（比如本机 sslocal 走家宽落地）和 `vless`（第三方 VLESS 上游，明文 TCP、不带 TLS，只填 `server` 和 `uuid`，UDP 走 XUDP）。`direct` 是内置的直连。
 - `route.rules` 从上往下匹配，第一条命中的规则决定出口，都没命中走 `route.final`（默认 `direct`）。规则的 `outbound` 和 `final` 可以写成有顺序的列表，比如 `["us1", "us2"]`：节点定时经每个出口发一个 HTTP 请求检测，排在前面的出口挂了就自动用下一个，恢复后切回来（细节见 [docs/node-protocol.md](docs/node-protocol.md#出口回退)）。每条规则用 `file`（名单文件，改了自动重新加载）或 `domains`（直接写在配置里）。`route.ipv4_only` 就是原来的 `-4`。
 - 名单格式，每行一条，`#` 后面是注释：`example.com` 匹配它和所有子域名，`=api.example.com` 只匹配这一个，`~emby` 匹配包含这个词的域名，`91.108.4.0/22` 或单个 IP 匹配目标 IP。原来的 `direct.list` 可以直接用。
 - [rules/](rules/) 里有常用名单：`ai.list`（OpenAI、Claude、Gemini 等）、`streaming.list`（Netflix、Disney+、YouTube、日本流媒体等）。
@@ -113,7 +113,7 @@ keel-master -data /var/lib/keel-master -listen 0.0.0.0:8443
 三个页面，每个对象只有一个右侧抽屉，手机上单列、全程不需要左右滑动：
 
 - **探针**：总速率、在线数、本月流量；每台节点的 CPU、内存、硬盘、速率、本月流量、开机时长。点开卡片看到国内三网（电信 / 联通 / 移动）的延迟、波动、重传和近 1 小时曲线（默认测上海三网，用的是 [Zstatic](https://china-tcping-list.vercel.app/) 公开的 TCPing 节点 `sh-ct/cu/cm-v4.ip.zstaticcdn.com:80`，可在「设置」里改；节点每 30 秒 TCPing 一轮）。
-- **线路**：入口卡片上点一下出口就是改默认出口；分流按规则集（AI、YouTube、流媒体、Telegram、游戏、Google，名单在 [rules/](rules/)）各选一个出口或直连。下面是出口卡片，显示额度和哪些入口在用。改完立刻下发，节点热更新，现有连接不断。
+- **线路**：入口卡片上点一下出口就是改默认出口；分流按规则集（AI、YouTube、流媒体、Telegram、游戏、Google，名单在 [rules/](rules/)）各选一个出口或直连。下面是出口卡片，显示额度和哪些入口在用。别人的服务器（比如买的家宽落地）点「导入外部出口」，粘贴 `vless://`（明文 TCP）或 `ss://` 分享链接，或者 3x-ui / Xray 的出站 JSON，一行一条；导入后和自建出口一样能设成默认、分流和备用，入口直接连它。商家换了地址就在出口抽屉里粘新链接，线路设置不变。改完立刻下发，节点热更新，现有连接不断。
 - **用户**：额度、到期日、每月重置日、可用入口，一个订阅链接。Stash / Clash / mihomo 拿到 Clash 配置，其他客户端拿到 vless:// anytls:// ss:// 通用链接。
 
 ### 额度怎么算
