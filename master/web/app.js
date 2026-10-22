@@ -288,6 +288,38 @@ function linesPage() {
   return html;
 }
 
+// Exit health as this entry's node sees it: true, false, or undefined
+// (not checked yet). Direct (0) is always usable.
+function exitAlive(n, id) {
+  if (!id) return true;
+  const h = (n.health || {})['x' + id];
+  return h ? h.alive : undefined;
+}
+function exitLabel(id) { return id ? (exit(id) || {}).name || '?' : '直连'; }
+// The exit new connections take: the first in the list not marked dead.
+function inUse(n, primary, fallback) {
+  const list = [primary].concat(fallback || []);
+  const hit = list.find(id => exitAlive(n, id) !== false);
+  return hit === undefined ? primary : hit;
+}
+// Fallback chips plus a "+ 备用" select. rule '' means the default exit.
+function fallbackLine(n, rule, primary, fallback) {
+  fallback = fallback || [];
+  const chips = fallback.map((id, i) => {
+    const dead = exitAlive(n, id) === false;
+    return `<span class="fb-chip ${dead ? 'dead' : ''}" title="${dead ? '不通' : ''}">${i + 1}. ${esc(exitLabel(id))}<button class="fb-x" data-act="fb-del" data-id="${n.id}" data-rule="${esc(rule)}" data-exit="${id}" aria-label="去掉备用 ${esc(exitLabel(id))}"><svg width="9" height="9" viewBox="0 0 12 12" aria-hidden="true"><path d="M1 1L11 11M11 1L1 11" stroke="currentColor" stroke-width="1.6"></path></svg></button></span>`;
+  }).join('');
+  const free = S.data.exits.map(e => e.id).concat([0]).filter(id => id !== primary && !fallback.includes(id));
+  const add = free.length ? `<select class="fb-select" data-change="fb-add" data-id="${n.id}" data-rule="${esc(rule)}" aria-label="添加备用出口">
+      <option value="">＋ 备用</option>${free.map(id => `<option value="${id}">${esc(exitLabel(id))}</option>`).join('')}</select>` : '';
+  const now = inUse(n, primary, fallback);
+  let note = '';
+  if (now !== primary) note = `<span class="fb-now">${shape({ color: C.amber, shape: 'tri' }, 9)}${esc(exitLabel(primary))} 不通，现在走 ${esc(exitLabel(now))}</span>`;
+  else if (exitAlive(n, primary) === false) note = `<span class="fb-now" style="color:${C.danger}">${shape({ color: C.red, shape: 'square' }, 8)}${fallback.length ? '全都不通' : esc(exitLabel(primary)) + ' 不通'}</span>`;
+  if (!chips && !note && !add) return '';
+  return `<div class="fb">${fallback.length ? '<span>备用</span>' : ''}${chips}${add}${note}</div>`;
+}
+
 function entryCard(n) {
   const st = nodeStatus(n);
   const editing = S.editing === n.id;
@@ -301,8 +333,9 @@ function entryCard(n) {
        <span style="flex:1 1 auto" class="small muted">${protos}</span>`;
   const chip = (id, label, style, ghost) => {
     const on = n.default_exit === id;
+    const dead = exitAlive(n, id) === false;
     const mark = ghost ? shape({ color: on ? C.paper : C.faint, shape: 'circle' }, 8) : shape(style, 8);
-    return `<button class="chip ${ghost ? 'ghost' : ''}" aria-pressed="${on}" data-act="default-exit" data-id="${n.id}" data-exit="${id}">${mark}${esc(label)}</button>`;
+    return `<button class="chip ${ghost ? 'ghost' : ''} ${dead ? 'dead' : ''}" aria-pressed="${on}" data-act="default-exit" data-id="${n.id}" data-exit="${id}" ${dead ? 'title="这个入口连不上它"' : ''}>${mark}${esc(label)}${dead ? '<span class="sr">（不通）</span>' : ''}</button>`;
   };
   const chips = S.data.exits.map(e => chip(e.id, e.name, exitStyle(e.id), false)).join('') + chip(0, '直连', null, true);
   const options = sel => S.data.exits.map(e => `<option value="${e.id}" ${sel === e.id ? 'selected' : ''}>${esc(e.name)}</option>`).join('')
@@ -310,12 +343,12 @@ function entryCard(n) {
   const used = n.rules.map(r => r.ruleset);
   const rows = n.rules.map(r => {
     const set = S.data.rulesets.find(s => s.id === r.ruleset) || { label: r.ruleset, description: '' };
-    return `<div class="rule">
+    return `<div class="rule-wrap"><div class="rule">
       <span class="what"><span style="font-size:15px;font-weight:500">${esc(set.label)}</span> <span class="small muted">${esc(set.description)}</span></span>
       <span class="muted" style="font-size:13px">走</span>
       <select class="line-select" data-change="rule" data-id="${n.id}" data-rule="${esc(r.ruleset)}" aria-label="${esc(n.code)} ${esc(set.label)} 走哪个出口">${options(r.exit_id)}</select>
       <button class="icon-btn" data-act="rule-del" data-id="${n.id}" data-rule="${esc(r.ruleset)}" aria-label="删除 ${esc(set.label)} 分流"><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M1 1L11 11M11 1L1 11" stroke="currentColor" stroke-width="1.5"></path></svg></button>
-    </div>`;
+    </div>${fallbackLine(n, r.ruleset, r.exit_id, r.fallback)}</div>`;
   }).join('');
   const free = S.data.rulesets.filter(s => !used.includes(s.id));
   const add = free.length ? `<select class="add-select" data-change="rule-add" data-id="${n.id}" aria-label="${esc(n.code)} 添加分流">
@@ -323,7 +356,7 @@ function entryCard(n) {
     </select>` : '';
   return `<div class="card entry ${st.kind === 'off' ? 'off' : ''}">
     <div class="row">${head}<span style="font-size:13px;color:${st.kind === 'off' ? C.danger : C.muted}">${esc(st.text)}</span></div>
-    <div><div class="sublabel">默认出口</div><div class="chips" role="group" aria-label="${esc(n.code)} 默认出口">${chips}</div></div>
+    <div><div class="sublabel">默认出口</div><div class="chips" role="group" aria-label="${esc(n.code)} 默认出口">${chips}</div>${fallbackLine(n, '', n.default_exit, n.default_fallback)}</div>
     <div><div class="sublabel" style="margin-bottom:4px">分流</div>${rows}${add}</div>
   </div>`;
 }
@@ -341,9 +374,11 @@ function exitCard(e, x) {
     const hit = n.rules.filter(r => r.exit_id === e.id).map(r => (S.data.rulesets.find(s => s.id === r.ruleset) || {}).label || r.ruleset);
     if (hit.length) split.push(n.code + ' ' + hit.join('/'));
   }
+  const backup = entries().filter(n => (n.default_fallback || []).includes(e.id) || n.rules.some(r => (r.fallback || []).includes(e.id))).map(n => n.code);
   const usedBy = [];
   if (defaults.length) usedBy.push('默认：' + defaults.join(' · '));
   if (split.length) usedBy.push('分流：' + split.join('，'));
+  if (backup.length) usedBy.push('备用：' + backup.join(' · '));
   const bar = e.quota_bytes ? `<span style="display:block;height:3px;background:#D6D1C6"><span style="display:block;height:100%;width:${pct(e.used, e.quota_bytes).toFixed(0)}%;background:${e.used >= e.quota_bytes ? C.red : C.ink}"></span></span>` : '';
   const off = !x.online ? ` <span style="font-size:13px;font-weight:400;color:${C.danger}">失联</span>` : '';
   return `<button class="exit-card" data-act="node" data-id="${x.id}">
@@ -663,12 +698,17 @@ const actions = {
   'default-exit'(el) {
     const n = node(+el.dataset.id), x = +el.dataset.exit;
     const label = x ? exit(x).name : '直连';
-    act(() => api('PATCH', `/api/nodes/${n.id}`, { default_exit: x }), `${n.code} 默认改走 ${label}。已热更新，现有连接不断。`);
+    const fallback = (n.default_fallback || []).filter(id => id !== x);
+    act(() => api('PATCH', `/api/nodes/${n.id}`, { default_exit: x, default_fallback: fallback }), `${n.code} 默认改走 ${label}。已热更新，现有连接不断。`);
   },
   'rule-del'(el) {
     const n = node(+el.dataset.id), rid = el.dataset.rule;
     const set = S.data.rulesets.find(s => s.id === rid);
     setRules(n, n.rules.filter(r => r.ruleset !== rid), `${n.code} 的 ${set ? set.label : rid} 改回走默认出口。`);
+  },
+  'fb-del'(el) {
+    const n = node(+el.dataset.id), x = +el.dataset.exit;
+    changeFallback(n, el.dataset.rule, list => list.filter(id => id !== x), `去掉了备用 ${exitLabel(x)}。`);
   },
   node(el) { openDrawer({ kind: 'node', id: +el.dataset.id }); },
   'new-node'() { openDrawer({ kind: 'new-node', role: 'entry' }); },
@@ -821,7 +861,17 @@ async function copyText(text) {
 }
 
 function setRules(n, rules, msg) {
-  act(() => api('PUT', `/api/nodes/${n.id}/rules`, { rules: rules.map(r => ({ ruleset: r.ruleset, exit_id: r.exit_id })) }), msg + '已热更新。');
+  const body = rules.map(r => ({ ruleset: r.ruleset, exit_id: r.exit_id, fallback: (r.fallback || []).filter(id => id !== r.exit_id) }));
+  act(() => api('PUT', `/api/nodes/${n.id}/rules`, { rules: body }), msg + '已热更新。');
+}
+
+// rule '' is the default exit's fallback list, otherwise that rule's.
+function changeFallback(n, rule, fn, msg) {
+  if (!rule) {
+    act(() => api('PATCH', `/api/nodes/${n.id}`, { default_fallback: fn(n.default_fallback || []) }), msg + '已热更新。');
+  } else {
+    setRules(n, n.rules.map(r => r.ruleset === rule ? Object.assign({}, r, { fallback: fn(r.fallback || []) }) : r), msg);
+  }
 }
 
 function commitRename(id) {
@@ -847,7 +897,12 @@ document.addEventListener('change', e => {
     const n = node(+el.dataset.id), x = +el.value, rid = el.dataset.rule;
     const set = S.data.rulesets.find(s => s.id === rid);
     el.blur();
-    setRules(n, n.rules.map(r => r.ruleset === rid ? { ruleset: rid, exit_id: x } : r), `${n.code} 的 ${set.label} 走 ${x ? exit(x).name : '直连'}。`);
+    setRules(n, n.rules.map(r => r.ruleset === rid ? { ruleset: rid, exit_id: x, fallback: r.fallback } : r), `${n.code} 的 ${set.label} 走 ${x ? exit(x).name : '直连'}。`);
+  } else if (el.dataset.change === 'fb-add') {
+    const n = node(+el.dataset.id), x = el.value;
+    if (x === '') return;
+    el.blur();
+    changeFallback(n, el.dataset.rule, list => list.concat([+x]), `加了备用 ${exitLabel(+x)}，主出口不通时自动换过去。`);
   } else if (el.dataset.change === 'rule-add') {
     const n = node(+el.dataset.id), rid = el.value;
     if (!rid) return;

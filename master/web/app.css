@@ -89,6 +89,18 @@ h2 .muted { font-size: 14px; font-weight: 400; }
 .chip[aria-pressed="true"] { background: var(--ink); color: var(--paper); }
 .chip.ghost { border-color: var(--faint); }
 .chip.ghost[aria-pressed="true"] { border-color: var(--ink); }
+.chip.dead { border-style: dashed; }
+.chip.dead::after { content: ""; width: 7px; height: 7px; background: var(--red); margin-left: 2px; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+.rule-wrap { border-bottom: 1px solid var(--line); }
+.rule-wrap .rule { border-bottom: 0; }
+.fb { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); margin: 2px 0 6px; }
+.fb-chip { display: inline-flex; align-items: center; gap: 2px; min-height: 36px; padding-left: 10px; border: 1px solid var(--line); color: var(--ink); }
+.fb-chip.dead { border-style: dashed; color: var(--danger); }
+.fb-x { width: 32px; height: 34px; border: 0; background: transparent; color: var(--muted); display: inline-flex; align-items: center; justify-content: center; padding: 0; }
+.fb-select { min-height: 36px; padding: 0 2px; border: 0; background: transparent; font-size: 13px; color: var(--muted); }
+.fb-select:hover { color: var(--ink); }
+.fb-now { display: inline-flex; align-items: center; gap: 6px; color: var(--ink); }
 .rule { display: flex; align-items: center; gap: 8px; padding: 4px 0; border-bottom: 1px solid var(--line); }
 .rule .what { flex: 1 1 auto; min-width: 0; }
 .line-select { min-height: 44px; padding: 0 6px; border: 0; border-bottom: 1px solid var(--ink); background: transparent; font-size: 15px; max-width: 46%; }

@@ -110,6 +110,34 @@ pub fn build(w: &World, node: &Node, secret: &str, probes: &[ProbeTarget], now: 
     config
 }
 
+/// The outbound for a primary exit plus ordered fallbacks (0 = direct): a
+/// tag, or a list when there is more than one, which keel-node walks in
+/// order skipping exits its health check marks dead.
+fn outbound_choice(w: &World, primary: i64, fallback: &[i64], used: &mut Vec<i64>) -> Option<Value> {
+    let mut tags: Vec<String> = Vec::new();
+    for id in std::iter::once(&primary).chain(fallback) {
+        let tag = if *id == 0 {
+            "direct".to_string()
+        } else {
+            match exit_tag(w, *id) {
+                Some(t) => {
+                    used.push(*id);
+                    t
+                }
+                None => continue,
+            }
+        };
+        if !tags.contains(&tag) {
+            tags.push(tag);
+        }
+    }
+    match tags.len() {
+        0 => None,
+        1 => Some(json!(tags[0])),
+        _ => Some(json!(tags)),
+    }
+}
+
 fn entry(w: &World, node: &Node, secret: &str, now: i64) -> Value {
     let mut rules = Vec::new();
     let direct = lines(&node.direct_list);
@@ -118,19 +146,9 @@ fn entry(w: &World, node: &Node, secret: &str, now: i64) -> Value {
     }
     let mut used_exits = Vec::new();
     for r in w.rules_of(node.id) {
-        let outbound = if r.exit_id == 0 {
-            "direct".to_string()
-        } else {
-            match exit_tag(w, r.exit_id) {
-                Some(tag) => {
-                    used_exits.push(r.exit_id);
-                    tag
-                }
-                // Unreachable exit: leave the rule out so traffic follows the
-                // default instead of failing validation on the node.
-                None => continue,
-            }
-        };
+        // Unreachable exits are left out; a rule with none left is dropped so
+        // its traffic follows the default instead of failing validation.
+        let Some(outbound) = outbound_choice(w, r.exit_id, &r.fallback, &mut used_exits) else { continue };
         let Some(set) = w.rulesets.iter().find(|s| s.id == r.ruleset) else { continue };
         rules.push(json!({"name": set.id, "domains": lines(&set.domains), "outbound": outbound}));
     }
@@ -138,10 +156,9 @@ fn entry(w: &World, node: &Node, secret: &str, now: i64) -> Value {
     if !rules.is_empty() {
         route["rules"] = Value::Array(rules);
     }
-    if node.default_exit != 0 {
-        if let Some(tag) = exit_tag(w, node.default_exit) {
-            used_exits.push(node.default_exit);
-            route["final"] = json!(tag);
+    if node.default_exit != 0 || !node.default_fallback.is_empty() {
+        if let Some(choice) = outbound_choice(w, node.default_exit, &node.default_fallback, &mut used_exits) {
+            route["final"] = choice;
         }
     }
     used_exits.sort_unstable();

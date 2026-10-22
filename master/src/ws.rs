@@ -139,6 +139,7 @@ async fn serve(app: Arc<App>, node_id: i64, ip: String, socket: WebSocket) {
             if l.conn.as_ref().is_some_and(|c| c.id == conn_id) {
                 l.conn = None;
                 l.conns.clear();
+                l.outbounds.clear();
             }
         }
     }
