@@ -19,7 +19,6 @@ const S = {
   data: null,
   loggedIn: null,
   openProbe: null,
-  editing: null,      // entry node id being renamed inline
   toast: '',
   picker: null,       // { id, kind: 'rule'|'primary'|'fb', rule } inline chooser open on the lines page
   drawer: null,       // { kind, id, ... }
@@ -30,6 +29,9 @@ function load(k) { try { return localStorage.getItem('keel.' + k); } catch (e) {
 function save(k, v) { try { localStorage.setItem('keel.' + k, v); } catch (e) { /* private mode */ } }
 
 // ---------- helpers ----------
+
+// What the panel calls a node. The code is an internal short id.
+function nm(n) { return n.name || n.code; }
 
 function esc(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -222,8 +224,8 @@ function probeCard(n) {
   return `<div class="card ${open ? 'wide' : ''} ${off ? 'off' : ''}">
     <button class="probe-btn" data-act="probe" data-id="${n.id}" aria-expanded="${open}">
       <div class="row">
-        <span class="code">${esc(n.code)}</span>
-        <span style="font-size:14px;flex:1 1 auto;min-width:0">${esc(n.name)} <span class="muted">· ${n.role === 'entry' ? '入口' : '出口'}</span></span>
+        <span class="code" style="flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(nm(n))}</span>
+        <span class="muted" style="font-size:14px;flex:1 1 auto">${n.role === 'entry' ? '入口' : '出口'}</span>
         ${statusMark(st.kind)}
         <span style="font-size:13px;color:${off ? C.danger : C.muted}">${esc(st.text)}</span>
       </div>
@@ -348,14 +350,8 @@ function fallbackLine(n, rule, primary, fallback) {
 
 function entryCard(n) {
   const st = nodeStatus(n);
-  const editing = S.editing === n.id;
   const protos = [n.anytls_on && 'AnyTLS', n.vless_on && 'Reality'].filter(Boolean).join(' · ') || '没开协议';
-  const head = editing
-    ? `<span class="code" style="font-size:28px">${esc(n.code)}</span>
-       <input class="rename-input" id="rename-input" value="${esc(n.name)}" aria-label="给 ${esc(n.code)} 改名" data-key="rename" data-id="${n.id}">
-       <button class="btn small solid" data-act="rename-done" data-id="${n.id}">完成</button>`
-    : `<button class="name-btn" data-act="node" data-id="${n.id}"><span class="code">${esc(n.code)}</span><span>${esc(n.name)}</span></button>
-       <button class="icon-btn" data-act="rename" data-id="${n.id}" aria-label="给 ${esc(n.code)} 改名" title="改名" style="width:40px;margin-left:-6px"><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M1.5 12.5L1.5 10L10 1.5L12.5 4L4 12.5Z" fill="none" stroke="currentColor" stroke-width="1.3"></path></svg></button>
+  const head = `<button class="name-btn" data-act="node" data-id="${n.id}"><span class="code">${esc(nm(n))}</span></button>
        <span style="flex:1 1 auto" class="small muted">${protos}</span>`;
   const chip = (id, label, style, ghost) => {
     const on = n.default_exit === id;
@@ -371,7 +367,7 @@ function entryCard(n) {
     return `<div class="rule-wrap"><div class="rule">
       <span class="what"><span style="font-size:15px;font-weight:500">${esc(set.label)}</span> <span class="small muted">${esc(set.description)}</span></span>
       <span class="muted" style="font-size:13px">走</span>
-      ${pickBtn(n, 'primary', r.ruleset, 'line-btn', `${r.exit_id ? shape(exitStyle(r.exit_id), 8) : shape({ color: C.faint, shape: 'circle' }, 8)}<span class="nm">${esc(exitLabel(r.exit_id))}</span>${CHEVRON}`, `${n.code} ${set.label} 走哪个出口，现在是 ${exitLabel(r.exit_id)}`)}
+      ${pickBtn(n, 'primary', r.ruleset, 'line-btn', `${r.exit_id ? shape(exitStyle(r.exit_id), 8) : shape({ color: C.faint, shape: 'circle' }, 8)}<span class="nm">${esc(exitLabel(r.exit_id))}</span>${CHEVRON}`, `${nm(n)} ${set.label} 走哪个出口，现在是 ${exitLabel(r.exit_id)}`)}
       <button class="icon-btn" data-act="rule-del" data-id="${n.id}" data-rule="${esc(r.ruleset)}" aria-label="删除 ${esc(set.label)} 分流"><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M1 1L11 11M11 1L1 11" stroke="currentColor" stroke-width="1.5"></path></svg></button>
     </div>${pickerOpen(n.id, 'primary', r.ruleset) ? exitPicker(n, 'primary', r.ruleset, allIds, r.exit_id) : ''}${fallbackLine(n, r.ruleset, r.exit_id, r.fallback)}</div>`;
   }).join('');
@@ -380,10 +376,10 @@ function entryCard(n) {
   const add = !free.length ? '' : addOpen
     ? `<div class="picker add-picker"><div class="sublabel" style="margin:0">选一类流量单独分流</div><div class="chips">${free.map(s => `<button class="chip set-chip" data-act="pick-do" data-id="${n.id}" data-kind="rule" data-rule="" data-value="${esc(s.id)}"><span>${esc(s.label)}</span>${s.description ? `<span class="d">${esc(s.description)}</span>` : ''}</button>`).join('')}</div>
         <button class="text-btn" data-act="pick" data-id="${n.id}" data-kind="rule" data-rule="">取消</button></div>`
-    : pickBtn(n, 'rule', '', 'add-btn', '＋ 添加分流', `${n.code} 添加分流`);
+    : pickBtn(n, 'rule', '', 'add-btn', '＋ 添加分流', `${nm(n)} 添加分流`);
   return `<div class="card entry ${st.kind === 'off' ? 'off' : ''}">
     <div class="row">${head}<span style="font-size:13px;color:${st.kind === 'off' ? C.danger : C.muted}">${esc(st.text)}</span></div>
-    <div><div class="sublabel">默认出口</div><div class="chips" role="group" aria-label="${esc(n.code)} 默认出口">${chips}</div>${fallbackLine(n, '', n.default_exit, n.default_fallback)}</div>
+    <div><div class="sublabel">默认出口</div><div class="chips" role="group" aria-label="${esc(nm(n))} 默认出口">${chips}</div>${fallbackLine(n, '', n.default_exit, n.default_fallback)}</div>
     <div><div class="sublabel" style="margin-bottom:4px">分流</div>${rows}${add}</div>
   </div>`;
 }
@@ -392,7 +388,7 @@ function exitCard(e, x) {
   const st = exitStyle(e.id);
   const parts = [];
   if (x) {
-    parts.push(`${esc(x.code)} :${e.port}`);
+    parts.push(`${esc(nm(x))} :${e.port}`);
     if (e.quota_bytes) parts.push(`${gib(e.used)} / ${gib(e.quota_bytes)} G`, `${e.reset_day} 号重置`);
     else parts.push(`本期 ${bytes(e.used)}`);
     if (e.udp_over_tcp) parts.push('UDP 走 TCP');
@@ -400,13 +396,13 @@ function exitCard(e, x) {
   } else {
     parts.push('外部', extProto(e), esc(e.server));
   }
-  const defaults = entries().filter(n => n.default_exit === e.id).map(n => n.code);
+  const defaults = entries().filter(n => n.default_exit === e.id).map(nm);
   const split = [];
   for (const n of entries()) {
     const hit = n.rules.filter(r => r.exit_id === e.id).map(r => (S.data.rulesets.find(s => s.id === r.ruleset) || {}).label || r.ruleset);
-    if (hit.length) split.push(n.code + ' ' + hit.join('/'));
+    if (hit.length) split.push(nm(n) + ' ' + hit.join('/'));
   }
-  const backup = entries().filter(n => (n.default_fallback || []).includes(e.id) || n.rules.some(r => (r.fallback || []).includes(e.id))).map(n => n.code);
+  const backup = entries().filter(n => (n.default_fallback || []).includes(e.id) || n.rules.some(r => (r.fallback || []).includes(e.id))).map(nm);
   const usedBy = [];
   if (defaults.length) usedBy.push('默认：' + defaults.join(' · '));
   if (split.length) usedBy.push('分流：' + split.join('，'));
@@ -423,7 +419,7 @@ function exitCard(e, x) {
 
 function exitNodeCard(x) {
   return `<button class="exit-card" data-act="node" data-id="${x.id}">
-    <span class="title">${shape({ color: C.faint, shape: 'circle' })}${esc(x.code)} ${esc(x.name)}</span>
+    <span class="title">${shape({ color: C.faint, shape: 'circle' })}${esc(nm(x))}</span>
     <span class="muted" style="font-size:13px">还没有 SS 端口，点开添加</span>
   </button>`;
 }
@@ -436,7 +432,7 @@ function usersPage() {
     const p = pct(u.used, u.quota_bytes), bad = ['over', 'expired', 'disabled'].includes(u.status);
     const barColor = p >= 100 ? C.red : p >= 90 ? C.amber : C.ink;
     const nodesText = !u.entries.length ? '没有入口' : (all.length && all.every(id => u.entries.includes(id))) ? '全部入口'
-      : u.entries.map(id => (node(id) || {}).code).filter(Boolean).join(' · ');
+      : u.entries.map(id => node(id)).filter(Boolean).map(nm).join(' · ');
     const online = u.conns ? ` · ${u.conns} 个连接` : '';
     return `<button class="user" data-act="user" data-id="${u.id}">
       <span class="n">${esc(u.name)} <span style="font-size:13px;font-weight:400" class="muted">${esc(u.plan)}</span></span>
@@ -510,8 +506,7 @@ function nodeDrawer(d) {
   const st = nodeStatus(n);
   const isEntry = n.role === 'entry';
   let body = `<section class="sec"><div class="fields two">
-      ${field('代号', 'code', n.code)}
-      ${field('名称', 'name', n.name)}
+      ${field('名称', 'name', n.name, { full: true })}
       ${field('地址（域名或 IP）', 'host', n.host, { full: true, placeholder: n.last_ip ? '留空用 ' + n.last_ip : '节点连上后自动填' })}
     </div></section>`;
   if (isEntry) {
@@ -586,7 +581,7 @@ function nodeDrawer(d) {
       </div>
     </section>`;
   return {
-    title: `${n.code} ${n.name}`,
+    title: nm(n),
     mark: shape({ color: isEntry ? C.red : C.blue, shape: isEntry ? 'square' : 'circle' }, 16),
     body,
     foot: `<button class="btn solid" data-act="save-node" data-id="${n.id}">保存并热更新</button>
@@ -612,7 +607,6 @@ function newNodeDrawer(d) {
         </div>
         <p class="small muted" style="margin:0">${role === 'entry' ? '入口：用户连它（AnyTLS / VLESS Reality），再按规则把流量交给出口。' : '出口：只开 SS-2022，接各个入口转来的流量，比如家宽落地。'}</p>
         <div class="fields two">
-          ${field('代号', 'code', d.code || '', { placeholder: role === 'entry' ? 'JP' : 'UK' })}
           ${field('名称', 'name', d.name || '', { placeholder: role === 'entry' ? '日本' : '英国' })}
         </div>
       </section>`,
@@ -666,7 +660,7 @@ function installBody(cmd) {
 function installDrawer(d) {
   const n = node(d.id);
   return {
-    title: n ? `${n.code} 安装命令` : '安装命令', mark: shape({ color: C.red, shape: 'square' }, 16),
+    title: n ? `${nm(n)} 安装命令` : '安装命令', mark: shape({ color: C.red, shape: 'square' }, 16),
     body: installBody(d.install) + (d.rotated ? '<p class="err">令牌已换，旧令牌立即失效，节点要用新命令重装一次。</p>' : ''),
     foot: `<button class="btn solid" data-act="close">完成</button>`
   };
@@ -686,7 +680,7 @@ function userDrawer(d) {
   if (d.id && !u) return null;
   const f = S.draft || (S.draft = userDraft(u));
   const plans = PLANS.map(p => `<button type="button" data-act="plan" data-plan="${p.label}" aria-pressed="${f.plan === p.label}"><b>${p.label}</b><span>${p.gb ? p.gb + ' G' : '手填'}</span></button>`).join('');
-  const chips = entries().map(n => `<button type="button" class="chip" style="min-width:60px;justify-content:center;font-size:15px;font-weight:500" data-act="user-entry" data-id="${n.id}" aria-pressed="${f.entries.includes(n.id)}">${esc(n.code)}</button>`).join('');
+  const chips = entries().map(n => `<button type="button" class="chip" style="min-width:60px;justify-content:center;font-size:15px;font-weight:500" data-act="user-entry" data-id="${n.id}" aria-pressed="${f.entries.includes(n.id)}">${esc(nm(n))}</button>`).join('');
   let body = `<section class="sec">
       <label class="field">名称<input name="name" value="${esc(f.name)}" placeholder="用户名" data-draft="name"></label>
       <div class="plans" role="group" aria-label="套餐">${plans}</div>
@@ -791,7 +785,7 @@ const actions = {
       const x = +v, set = S.data.rulesets.find(s => s.id === rid);
       const r0 = n.rules.find(r => r.ruleset === rid);
       if (r0 && r0.exit_id === x) { render(); return; }
-      setRules(n, n.rules.map(r => r.ruleset === rid ? { ruleset: rid, exit_id: x, fallback: r.fallback } : r), `${n.code} 的 ${set.label} 走 ${exitLabel(x)}。`);
+      setRules(n, n.rules.map(r => r.ruleset === rid ? { ruleset: rid, exit_id: x, fallback: r.fallback } : r), `${nm(n)} 的 ${set.label} 走 ${exitLabel(x)}。`);
     } else if (kind === 'fb') {
       changeFallback(n, rid, list => list.concat([+v]), `加了备用 ${exitLabel(+v)}，主出口不通时自动换过去。`);
     } else if (kind === 'rule') {
@@ -799,25 +793,20 @@ const actions = {
       // A new split starts on the first exit that is not the default.
       const first = S.data.exits.find(x => x.id !== n.default_exit);
       const target = first ? first.id : 0;
-      setRules(n, n.rules.concat([{ ruleset: v, exit_id: target }]), `${n.code} 的 ${set.label} 走 ${exitLabel(target)}，点出口可以换。`);
+      setRules(n, n.rules.concat([{ ruleset: v, exit_id: target }]), `${nm(n)} 的 ${set.label} 走 ${exitLabel(target)}，点出口可以换。`);
     }
   },
   probe(el) { const id = +el.dataset.id; S.openProbe = S.openProbe === id ? null : id; render(); },
-  rename(el) {
-    S.editing = +el.dataset.id; S.picker = null; render();
-    const i = document.getElementById('rename-input'); if (i) { i.focus(); i.select(); }
-  },
-  'rename-done'(el) { commitRename(+el.dataset.id); },
   'default-exit'(el) {
     const n = node(+el.dataset.id), x = +el.dataset.exit;
     const label = x ? exit(x).name : '直连';
     const fallback = (n.default_fallback || []).filter(id => id !== x);
-    act(() => api('PATCH', `/api/nodes/${n.id}`, { default_exit: x, default_fallback: fallback }), `${n.code} 默认改走 ${label}。已热更新，现有连接不断。`);
+    act(() => api('PATCH', `/api/nodes/${n.id}`, { default_exit: x, default_fallback: fallback }), `${nm(n)} 默认改走 ${label}。已热更新，现有连接不断。`);
   },
   'rule-del'(el) {
     const n = node(+el.dataset.id), rid = el.dataset.rule;
     const set = S.data.rulesets.find(s => s.id === rid);
-    setRules(n, n.rules.filter(r => r.ruleset !== rid), `${n.code} 的 ${set ? set.label : rid} 改回走默认出口。`);
+    setRules(n, n.rules.filter(r => r.ruleset !== rid), `${nm(n)} 的 ${set ? set.label : rid} 改回走默认出口。`);
   },
   'fb-del'(el) {
     const n = node(+el.dataset.id), x = +el.dataset.exit;
@@ -825,11 +814,11 @@ const actions = {
   },
   node(el) { openDrawer({ kind: 'node', id: +el.dataset.id }); },
   'new-node'() { openDrawer({ kind: 'new-node', role: 'entry' }); },
-  role(el) { const f = form(); Object.assign(S.drawer, { role: el.dataset.role, code: f.code, name: f.name }); renderDrawer(); },
+  role(el) { const f = form(); Object.assign(S.drawer, { role: el.dataset.role, name: f.name }); renderDrawer(); },
   async 'create-node'() {
     const f = form();
     try {
-      const r = await api('POST', '/api/nodes', { role: S.drawer.role || 'entry', code: f.code, name: f.name });
+      const r = await api('POST', '/api/nodes', { role: S.drawer.role || 'entry', name: f.name });
       S.drawer.install = r.install; S.drawerErr = '';
       await refresh(); renderDrawer();
     } catch (e) { drawerError(e.message); }
@@ -860,7 +849,7 @@ const actions = {
   },
   async 'save-node'(el) {
     const n = node(+el.dataset.id), f = form();
-    const patch = { code: f.code, name: f.name, host: f.host, ipv4_only: f.ipv4_only === '1' };
+    const patch = { name: f.name.trim(), host: f.host, ipv4_only: f.ipv4_only === '1' };
     if (n.role === 'entry') {
       Object.assign(patch, {
         anytls_on: f.anytls_on === '1', vless_on: f.vless_on === '1',
@@ -886,15 +875,15 @@ const actions = {
           await api('PATCH', `/api/exits/${e.id}`, { name: f[`x${e.id}_name`], port, quota_bytes: quota, reset_day: reset, udp_over_tcp: f[`x${e.id}_uot`] === '1' });
         }
       }
-      flash(`${patch.code || n.code} 已保存并热更新。`);
+      flash(`${patch.name || nm(n)} 已保存并热更新。`);
       closeDrawer(); await refresh(); render();
     } catch (e) { drawerError(e.message); }
   },
   async 'node-del'(el) {
     const n = node(+el.dataset.id);
-    if (!confirm(`删除 ${n.code} ${n.name}？节点会断开，用它的线路改回直连。`)) return;
+    if (!confirm(`删除 ${nm(n)}？节点会断开，用它的线路改回直连。`)) return;
     closeDrawer();
-    act(() => api('DELETE', `/api/nodes/${n.id}`), `已删除 ${n.code}。`);
+    act(() => api('DELETE', `/api/nodes/${n.id}`), `已删除 ${nm(n)}。`);
   },
   async 'exit-add'(el) {
     try { await api('POST', '/api/exits', { node_id: +el.dataset.id }); await refresh(); S.drawerErr = ''; renderDrawer(); }
@@ -1024,32 +1013,16 @@ function changeFallback(n, rule, fn, msg) {
   }
 }
 
-function commitRename(id) {
-  const n = node(id), input = document.getElementById('rename-input');
-  const name = input ? input.value.trim() : '';
-  S.editing = null;
-  if (!name || name === n.name) { render(); return; }
-  act(() => api('PATCH', `/api/nodes/${id}`, { name }), `已改名为「${name}」。`);
-}
-
 document.addEventListener('click', e => {
   const el = e.target.closest('[data-act]');
   if (!el) return;
   const fn = actions[el.dataset.act];
   if (!fn) return;
   e.preventDefault();
-  // Tapping anything else while renaming finishes the rename first, so
-  // one tap both closes what was open and does what was tapped.
-  if (S.editing !== null && !['rename-done', 'rename', 'switch', 'fp'].includes(el.dataset.act) && !el.closest('.drawer')) commitRename(S.editing);
   fn(el);
 });
 
 document.addEventListener('keydown', e => {
-  if (e.target.id === 'rename-input') {
-    if (e.key === 'Enter') { e.preventDefault(); commitRename(+e.target.dataset.id); }
-    if (e.key === 'Escape') { S.editing = null; render(); }
-    return;
-  }
   if (e.key === 'Escape' && S.drawer) closeDrawer();
   else if (e.key === 'Escape' && S.picker) { S.picker = null; render(); }
 });
