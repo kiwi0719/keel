@@ -21,6 +21,7 @@ const S = {
   openProbe: null,
   editing: null,      // entry node id being renamed inline
   toast: '',
+  picker: null,       // { id, kind: 'rule'|'primary'|'fb', rule } inline chooser open on the lines page
   drawer: null,       // { kind, id, ... }
   draft: null         // drawer form state
 };
@@ -120,7 +121,7 @@ async function refresh() {
 }
 
 // True while the user is typing or choosing in the main area: re-rendering
-// would steal focus or close an open select.
+// would steal focus.
 function busy() {
   const a = document.activeElement;
   if (!a || a === document.body) return false;
@@ -302,7 +303,26 @@ function inUse(n, primary, fallback) {
   const hit = list.find(id => exitAlive(n, id) !== false);
   return hit === undefined ? primary : hit;
 }
-// Fallback chips plus a "+ 备用" select. rule '' means the default exit.
+// Inline chooser: a row of chips under the button that opened it.
+function pickerOpen(id, kind, rule) {
+  const p = S.picker;
+  return !!p && p.id === id && p.kind === kind && p.rule === (rule || '');
+}
+function pickBtn(n, kind, rule, cls, inner, label) {
+  const open = pickerOpen(n.id, kind, rule);
+  return `<button class="${cls}" data-act="pick" data-id="${n.id}" data-kind="${kind}" data-rule="${esc(rule || '')}" aria-expanded="${open}" aria-label="${esc(label)}">${inner}</button>`;
+}
+function exitPicker(n, kind, rule, ids, current) {
+  const chips = ids.map(id => {
+    const dead = exitAlive(n, id) === false;
+    const mark = id ? shape(exitStyle(id), 8) : shape({ color: id === current ? C.paper : C.faint, shape: 'circle' }, 8);
+    return `<button class="chip ${id ? '' : 'ghost'} ${dead ? 'dead' : ''}" aria-pressed="${id === current}" data-act="pick-do" data-id="${n.id}" data-kind="${kind}" data-rule="${esc(rule || '')}" data-value="${id}">${mark}${esc(exitLabel(id))}</button>`;
+  }).join('');
+  return `<div class="picker chips" role="group">${chips}</div>`;
+}
+const CHEVRON = '<svg class="chev" width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="M1.5 3.5L5 7L8.5 3.5" fill="none" stroke="currentColor" stroke-width="1.4"></path></svg>';
+
+// Fallback chips plus a "+ 备用" picker. rule '' means the default exit.
 function fallbackLine(n, rule, primary, fallback) {
   fallback = fallback || [];
   const chips = fallback.map((id, i) => {
@@ -310,14 +330,14 @@ function fallbackLine(n, rule, primary, fallback) {
     return `<span class="fb-chip ${dead ? 'dead' : ''}" title="${dead ? '不通' : ''}">${i + 1}. ${esc(exitLabel(id))}<button class="fb-x" data-act="fb-del" data-id="${n.id}" data-rule="${esc(rule)}" data-exit="${id}" aria-label="去掉备用 ${esc(exitLabel(id))}"><svg width="9" height="9" viewBox="0 0 12 12" aria-hidden="true"><path d="M1 1L11 11M11 1L1 11" stroke="currentColor" stroke-width="1.6"></path></svg></button></span>`;
   }).join('');
   const free = S.data.exits.map(e => e.id).concat([0]).filter(id => id !== primary && !fallback.includes(id));
-  const add = free.length ? `<select class="fb-select" data-change="fb-add" data-id="${n.id}" data-rule="${esc(rule)}" aria-label="添加备用出口">
-      <option value="">＋ 备用</option>${free.map(id => `<option value="${id}">${esc(exitLabel(id))}</option>`).join('')}</select>` : '';
+  const open = pickerOpen(n.id, 'fb', rule);
+  const add = free.length ? pickBtn(n, 'fb', rule, 'text-btn', open ? '收起' : '＋ 备用', '添加备用出口') : '';
   const now = inUse(n, primary, fallback);
   let note = '';
   if (now !== primary) note = `<span class="fb-now">${shape({ color: C.amber, shape: 'tri' }, 9)}${esc(exitLabel(primary))} 不通，现在走 ${esc(exitLabel(now))}</span>`;
   else if (exitAlive(n, primary) === false) note = `<span class="fb-now" style="color:${C.danger}">${shape({ color: C.red, shape: 'square' }, 8)}${fallback.length ? '全都不通' : esc(exitLabel(primary)) + ' 不通'}</span>`;
   if (!chips && !note && !add) return '';
-  return `<div class="fb">${fallback.length ? '<span>备用</span>' : ''}${chips}${add}${note}</div>`;
+  return `<div class="fb">${fallback.length ? '<span>备用</span>' : ''}${chips}${add}${note}</div>${open && free.length ? exitPicker(n, 'fb', rule, free, null) : ''}`;
 }
 
 function entryCard(n) {
@@ -338,22 +358,23 @@ function entryCard(n) {
     return `<button class="chip ${ghost ? 'ghost' : ''} ${dead ? 'dead' : ''}" aria-pressed="${on}" data-act="default-exit" data-id="${n.id}" data-exit="${id}" ${dead ? 'title="这个入口连不上它"' : ''}>${mark}${esc(label)}${dead ? '<span class="sr">（不通）</span>' : ''}</button>`;
   };
   const chips = S.data.exits.map(e => chip(e.id, e.name, exitStyle(e.id), false)).join('') + chip(0, '直连', null, true);
-  const options = sel => S.data.exits.map(e => `<option value="${e.id}" ${sel === e.id ? 'selected' : ''}>${esc(e.name)}</option>`).join('')
-    + `<option value="0" ${sel === 0 ? 'selected' : ''}>直连</option>`;
+  const allIds = S.data.exits.map(e => e.id).concat([0]);
   const used = n.rules.map(r => r.ruleset);
   const rows = n.rules.map(r => {
     const set = S.data.rulesets.find(s => s.id === r.ruleset) || { label: r.ruleset, description: '' };
     return `<div class="rule-wrap"><div class="rule">
       <span class="what"><span style="font-size:15px;font-weight:500">${esc(set.label)}</span> <span class="small muted">${esc(set.description)}</span></span>
       <span class="muted" style="font-size:13px">走</span>
-      <select class="line-select" data-change="rule" data-id="${n.id}" data-rule="${esc(r.ruleset)}" aria-label="${esc(n.code)} ${esc(set.label)} 走哪个出口">${options(r.exit_id)}</select>
+      ${pickBtn(n, 'primary', r.ruleset, 'line-btn', `${r.exit_id ? shape(exitStyle(r.exit_id), 8) : shape({ color: C.faint, shape: 'circle' }, 8)}<span class="nm">${esc(exitLabel(r.exit_id))}</span>${CHEVRON}`, `${n.code} ${set.label} 走哪个出口，现在是 ${exitLabel(r.exit_id)}`)}
       <button class="icon-btn" data-act="rule-del" data-id="${n.id}" data-rule="${esc(r.ruleset)}" aria-label="删除 ${esc(set.label)} 分流"><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M1 1L11 11M11 1L1 11" stroke="currentColor" stroke-width="1.5"></path></svg></button>
-    </div>${fallbackLine(n, r.ruleset, r.exit_id, r.fallback)}</div>`;
+    </div>${pickerOpen(n.id, 'primary', r.ruleset) ? exitPicker(n, 'primary', r.ruleset, allIds, r.exit_id) : ''}${fallbackLine(n, r.ruleset, r.exit_id, r.fallback)}</div>`;
   }).join('');
   const free = S.data.rulesets.filter(s => !used.includes(s.id));
-  const add = free.length ? `<select class="add-select" data-change="rule-add" data-id="${n.id}" aria-label="${esc(n.code)} 添加分流">
-      <option value="">＋ 添加分流</option>${free.map(s => `<option value="${esc(s.id)}">${esc(s.label)}${s.description ? '（' + esc(s.description) + '）' : ''}</option>`).join('')}
-    </select>` : '';
+  const addOpen = pickerOpen(n.id, 'rule', '');
+  const add = !free.length ? '' : addOpen
+    ? `<div class="picker add-picker"><div class="sublabel" style="margin:0">选一类流量单独分流</div><div class="chips">${free.map(s => `<button class="chip set-chip" data-act="pick-do" data-id="${n.id}" data-kind="rule" data-rule="" data-value="${esc(s.id)}"><span>${esc(s.label)}</span>${s.description ? `<span class="d">${esc(s.description)}</span>` : ''}</button>`).join('')}</div>
+        <button class="text-btn" data-act="pick" data-id="${n.id}" data-kind="rule" data-rule="">取消</button></div>`
+    : pickBtn(n, 'rule', '', 'add-btn', '＋ 添加分流', `${n.code} 添加分流`);
   return `<div class="card entry ${st.kind === 'off' ? 'off' : ''}">
     <div class="row">${head}<span style="font-size:13px;color:${st.kind === 'off' ? C.danger : C.muted}">${esc(st.text)}</span></div>
     <div><div class="sublabel">默认出口</div><div class="chips" role="group" aria-label="${esc(n.code)} 默认出口">${chips}</div>${fallbackLine(n, '', n.default_exit, n.default_fallback)}</div>
@@ -689,6 +710,29 @@ const actions = {
   tab(el) { S.tab = el.dataset.tab; save('tab', S.tab); S.toast = ''; render(); window.scrollTo(0, 0); },
   settings() { openDrawer({ kind: 'settings' }); },
   close() { closeDrawer(); },
+  pick(el) {
+    const p = { id: +el.dataset.id, kind: el.dataset.kind, rule: el.dataset.rule || '' };
+    S.picker = pickerOpen(p.id, p.kind, p.rule) ? null : p;
+    render();
+  },
+  'pick-do'(el) {
+    const n = node(+el.dataset.id), kind = el.dataset.kind, rid = el.dataset.rule, v = el.dataset.value;
+    S.picker = null;
+    if (kind === 'primary') {
+      const x = +v, set = S.data.rulesets.find(s => s.id === rid);
+      const r0 = n.rules.find(r => r.ruleset === rid);
+      if (r0 && r0.exit_id === x) { render(); return; }
+      setRules(n, n.rules.map(r => r.ruleset === rid ? { ruleset: rid, exit_id: x, fallback: r.fallback } : r), `${n.code} 的 ${set.label} 走 ${exitLabel(x)}。`);
+    } else if (kind === 'fb') {
+      changeFallback(n, rid, list => list.concat([+v]), `加了备用 ${exitLabel(+v)}，主出口不通时自动换过去。`);
+    } else if (kind === 'rule') {
+      const set = S.data.rulesets.find(s => s.id === v);
+      // A new split starts on the first exit that is not the default.
+      const first = S.data.exits.find(x => x.id !== n.default_exit);
+      const target = first ? first.id : 0;
+      setRules(n, n.rules.concat([{ ruleset: v, exit_id: target }]), `${n.code} 的 ${set.label} 走 ${exitLabel(target)}，点出口可以换。`);
+    }
+  },
   probe(el) { const id = +el.dataset.id; S.openProbe = S.openProbe === id ? null : id; render(); },
   rename(el) {
     S.editing = +el.dataset.id; render();
@@ -891,30 +935,6 @@ document.addEventListener('click', e => {
   fn(el);
 });
 
-document.addEventListener('change', e => {
-  const el = e.target;
-  if (el.dataset.change === 'rule') {
-    const n = node(+el.dataset.id), x = +el.value, rid = el.dataset.rule;
-    const set = S.data.rulesets.find(s => s.id === rid);
-    el.blur();
-    setRules(n, n.rules.map(r => r.ruleset === rid ? { ruleset: rid, exit_id: x, fallback: r.fallback } : r), `${n.code} 的 ${set.label} 走 ${x ? exit(x).name : '直连'}。`);
-  } else if (el.dataset.change === 'fb-add') {
-    const n = node(+el.dataset.id), x = el.value;
-    if (x === '') return;
-    el.blur();
-    changeFallback(n, el.dataset.rule, list => list.concat([+x]), `加了备用 ${exitLabel(+x)}，主出口不通时自动换过去。`);
-  } else if (el.dataset.change === 'rule-add') {
-    const n = node(+el.dataset.id), rid = el.value;
-    if (!rid) return;
-    const set = S.data.rulesets.find(s => s.id === rid);
-    // A new split starts on the first exit that is not the default.
-    const first = S.data.exits.find(x => x.id !== n.default_exit);
-    const target = first ? first.id : 0;
-    el.blur();
-    setRules(n, n.rules.concat([{ ruleset: rid, exit_id: target }]), `${n.code} 的 ${set.label} 走 ${target ? exit(target).name : '直连'}。`);
-  }
-});
-
 document.addEventListener('keydown', e => {
   if (e.target.id === 'rename-input') {
     if (e.key === 'Enter') { e.preventDefault(); commitRename(+e.target.dataset.id); }
@@ -922,6 +942,7 @@ document.addEventListener('keydown', e => {
     return;
   }
   if (e.key === 'Escape' && S.drawer) closeDrawer();
+  else if (e.key === 'Escape' && S.picker) { S.picker = null; render(); }
 });
 
 document.addEventListener('submit', async e => {
