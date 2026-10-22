@@ -526,19 +526,15 @@ function sw(name, on, label) {
   return `<button type="button" class="switch" data-act="switch" data-name="${name}" aria-pressed="${!!on}" aria-label="${esc(label)}"><i></i></button><input type="hidden" name="${name}" value="${on ? 1 : 0}">`;
 }
 
-// The node's address stays hidden until asked for, so it is not on screen
-// or in a screenshot by accident. A domain can replace the detected IP.
+// The node's address is read-only (detected from its connection) and stays
+// hidden until asked for, so it is not on screen or in a screenshot by accident.
 const MASK = '••••••••••';
-function hostInput(n) {
-  return `<input name="node_domain" value="${esc(n.host)}" placeholder="域名，留空用自动识别的 IP" autocomplete="off" autocapitalize="off" spellcheck="false" data-1p-ignore data-lpignore="true">`;
-}
 function addressField(n) {
   const addr = n.host || n.last_ip;
   return `<div class="field full">地址
       <div class="addr"><span class="mono" id="addr-v">${addr ? MASK : '<span class="muted">节点连上后自动识别</span>'}</span>
         ${addr ? `<button type="button" class="text-btn" data-act="addr-toggle" data-id="${n.id}">显示</button>` : ''}
-        ${n.host ? '' : `<button type="button" class="text-btn" data-act="host-edit" data-id="${n.id}">改用域名</button>`}
-      </div>${n.host ? hostInput(n) : ''}
+      </div>
     </div>`;
 }
 
@@ -875,11 +871,6 @@ const actions = {
     v.textContent = show ? (n.host || n.last_ip) : MASK;
     el.textContent = show ? '隐藏' : '显示';
   },
-  'host-edit'(el) {
-    el.closest('.field').insertAdjacentHTML('beforeend', hostInput(node(+el.dataset.id)));
-    el.closest('.field').querySelector('input[name="node_domain"]').focus();
-    el.remove();
-  },
   fp(el) {
     el.parentElement.querySelectorAll('.chip').forEach(b => b.setAttribute('aria-pressed', b === el));
     el.closest('.field').querySelector('input[name="reality_fp"]').value = el.dataset.v;
@@ -897,7 +888,7 @@ const actions = {
   },
   async 'save-node'(el) {
     const n = node(+el.dataset.id), f = form();
-    const patch = { name: f.name.trim(), host: f.node_domain, ipv4_only: f.ipv4_only === '1' };
+    const patch = { name: f.name.trim(), ipv4_only: f.ipv4_only === '1' };
     if (n.role === 'entry') {
       Object.assign(patch, {
         anytls_on: f.anytls_on === '1', vless_on: f.vless_on === '1',
