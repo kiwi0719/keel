@@ -34,6 +34,19 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     Sha256::digest(data).into()
 }
 
+/// A random high port for a new listener, so fresh nodes do not sit on
+/// ports scanners try first. `taken` are ports already used on that node.
+pub fn random_port(taken: &[i64]) -> i64 {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    loop {
+        let p = rng.gen_range(20000..=59999);
+        if !taken.contains(&p) && p % 1000 != 0 {
+            return p;
+        }
+    }
+}
+
 /// Reality X25519 key pair as Xray prints it: (private, public), base64 raw URL.
 pub fn reality_keypair() -> (String, String) {
     let secret = x25519_dalek::StaticSecret::random_from_rng(rand::thread_rng());

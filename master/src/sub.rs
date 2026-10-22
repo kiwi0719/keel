@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use crate::app::App;
 use crate::db::{self, Node, User};
-use crate::nodecfg::{self, SS_METHOD};
+use crate::nodecfg;
 use crate::period::now;
 use crate::util::percent_encode;
 
@@ -26,9 +26,9 @@ struct Proxy {
 }
 
 enum Kind {
-    AnyTls { password: String, sni: String },
-    Reality { uuid: String, sni: String, public_key: String, short_id: String },
-    Ss { password: String },
+    // verify: the entry uses a real certificate, so clients check it.
+    AnyTls { password: String, sni: String, verify: bool },
+    Reality { uuid: String, sni: String, public_key: String, short_id: String, fp: String },
 }
 
 fn proxies(user: &User, entries: &[&Node]) -> Vec<Proxy> {
@@ -44,9 +44,10 @@ fn proxies(user: &User, entries: &[&Node]) -> Vec<Proxy> {
                 name: format!("{label} · Reality"),
                 kind: Kind::Reality {
                     uuid: user.uuid.clone(),
-                    sni: n.reality_sni.clone(),
+                    sni: n.reality_names().into_iter().next().unwrap_or_default(),
                     public_key: n.reality_public.clone(),
-                    short_id: n.reality_short_id.clone(),
+                    short_id: n.reality_short_ids().into_iter().next().unwrap_or_default(),
+                    fp: if n.reality_fp.is_empty() { "chrome".into() } else { n.reality_fp.clone() },
                 },
                 server: server.clone(),
                 port: n.vless_port,
@@ -55,17 +56,13 @@ fn proxies(user: &User, entries: &[&Node]) -> Vec<Proxy> {
         if n.anytls_on && n.anytls_port > 0 {
             list.push(Proxy {
                 name: format!("{label} · AnyTLS"),
-                kind: Kind::AnyTls { password: user.anytls_password.clone(), sni: n.anytls_sni.clone() },
+                kind: Kind::AnyTls {
+                    password: user.anytls_password.clone(),
+                    sni: n.anytls_sni.clone(),
+                    verify: !n.anytls_cert.is_empty() && !n.anytls_key.is_empty(),
+                },
                 server: server.clone(),
                 port: n.anytls_port,
-            });
-        }
-        if n.ss_on && n.ss_port > 0 {
-            list.push(Proxy {
-                name: format!("{label} · SS"),
-                kind: Kind::Ss { password: format!("{}:{}", n.ss_psk, user.ss_key) },
-                server: server.clone(),
-                port: n.ss_port,
             });
         }
     }
@@ -82,21 +79,18 @@ fn clash(list: &[Proxy]) -> String {
     for p in list {
         let _ = write!(y, "  - name: {}\n    server: {}\n    port: {}\n    udp: true\n", q(&p.name), q(&p.server), p.port);
         match &p.kind {
-            Kind::Reality { uuid, sni, public_key, short_id } => {
+            Kind::Reality { uuid, sni, public_key, short_id, fp } => {
                 let _ = write!(
                     y,
-                    "    type: vless\n    uuid: {}\n    flow: xtls-rprx-vision\n    network: tcp\n    tls: true\n    servername: {}\n    client-fingerprint: chrome\n    reality-opts:\n      public-key: {}\n      short-id: {}\n",
-                    q(uuid), q(sni), q(public_key), q(short_id)
+                    "    type: vless\n    uuid: {}\n    flow: xtls-rprx-vision\n    network: tcp\n    tls: true\n    servername: {}\n    client-fingerprint: {}\n    reality-opts:\n      public-key: {}\n      short-id: {}\n",
+                    q(uuid), q(sni), q(fp), q(public_key), q(short_id)
                 );
             }
-            Kind::AnyTls { password, sni } => {
-                let _ = write!(y, "    type: anytls\n    password: {}\n    skip-cert-verify: true\n", q(password));
+            Kind::AnyTls { password, sni, verify } => {
+                let _ = write!(y, "    type: anytls\n    password: {}\n    skip-cert-verify: {}\n", q(password), !verify);
                 if !sni.is_empty() {
                     let _ = writeln!(y, "    sni: {}", q(sni));
                 }
-            }
-            Kind::Ss { password } => {
-                let _ = write!(y, "    type: ss\n    cipher: {SS_METHOD}\n    password: {}\n", q(password));
             }
         }
     }
@@ -115,20 +109,17 @@ fn share_links(list: &[Proxy]) -> String {
         let host = if p.server.contains(':') { format!("[{}]", p.server) } else { p.server.clone() };
         let tag = percent_encode(&p.name);
         out.push(match &p.kind {
-            Kind::Reality { uuid, sni, public_key, short_id } => format!(
-                "vless://{uuid}@{host}:{}?encryption=none&flow=xtls-rprx-vision&security=reality&sni={}&fp=chrome&pbk={}&sid={}&type=tcp#{tag}",
+            Kind::Reality { uuid, sni, public_key, short_id, fp } => format!(
+                "vless://{uuid}@{host}:{}?encryption=none&flow=xtls-rprx-vision&security=reality&sni={}&fp={}&pbk={}&sid={}&type=tcp#{tag}",
                 p.port,
                 percent_encode(sni),
+                percent_encode(fp),
                 percent_encode(public_key),
                 percent_encode(short_id)
             ),
-            Kind::AnyTls { password, sni } => {
+            Kind::AnyTls { password, sni, verify } => {
                 let sni = if sni.is_empty() { String::new() } else { format!("&sni={}", percent_encode(sni)) };
-                format!("anytls://{}@{host}:{}?insecure=1{sni}#{tag}", percent_encode(password), p.port)
-            }
-            // SIP002 with the 2022 key left unencoded except for URL escaping.
-            Kind::Ss { password } => {
-                format!("ss://{}@{host}:{}#{tag}", percent_encode(&format!("{SS_METHOD}:{password}")), p.port)
+                format!("anytls://{}@{host}:{}?insecure={}{sni}#{tag}", percent_encode(password), p.port, if *verify { 0 } else { 1 })
             }
         });
     }
