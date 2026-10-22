@@ -81,6 +81,12 @@ func newRouter(c *Config, previous *router) (*router, error) {
 				return nil, fmt.Errorf("outbound %s: %w", o.Tag, err)
 			}
 			r.outbound[o.Tag] = &ssOutbound{method: ss, server: M.ParseSocksaddr(o.Server), direct: direct, udpOverTCP: o.UDPOverTCP}
+		case "vless":
+			v, err := newVLESSOutbound(o, direct)
+			if err != nil {
+				return nil, fmt.Errorf("outbound %s: %w", o.Tag, err)
+			}
+			r.outbound[o.Tag] = v
 		}
 	}
 	for i, rc := range c.Route.Rules {

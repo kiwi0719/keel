@@ -85,7 +85,7 @@ type RuleConfig struct {
 // OutboundConfig is a way out of the node besides the built-in "direct".
 type OutboundConfig struct {
 	Tag    string `json:"tag"`
-	Type   string `json:"type"`   // ss2022 | socks
+	Type   string `json:"type"`   // ss2022 | socks | vless
 	Server string `json:"server"` // host:port
 
 	// ss2022: Password is "<server psk>:<user key>" as for any SS 2022 client.
@@ -94,6 +94,9 @@ type OutboundConfig struct {
 	// UDPOverTCP carries UDP inside the TCP connection to the server instead
 	// of SS 2022 UDP packets.
 	UDPOverTCP bool `json:"udp_over_tcp,omitempty"`
+
+	// vless: a third-party VLESS server over plain TCP (no TLS, no flow).
+	UUID string `json:"uuid,omitempty"`
 }
 
 // InboundConfig describes one listener. Which fields apply depends on Type.
@@ -195,11 +198,14 @@ func (c *Config) validate() error {
 		if o.Tag == "" || tags[o.Tag] {
 			return fmt.Errorf("outbound tag %q is empty or used twice (\"direct\" is built in)", o.Tag)
 		}
-		if o.Type != "ss2022" && o.Type != "socks" {
+		if o.Type != "ss2022" && o.Type != "socks" && o.Type != "vless" {
 			return fmt.Errorf("outbound %s: unknown type %q", o.Tag, o.Type)
 		}
 		if o.Server == "" {
 			return fmt.Errorf("outbound %s: server is required", o.Tag)
+		}
+		if o.Type == "vless" && o.UUID == "" {
+			return fmt.Errorf("outbound %s: uuid is required", o.Tag)
 		}
 		tags[o.Tag] = true
 	}

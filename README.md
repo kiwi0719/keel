@@ -58,7 +58,7 @@ KEEL_TOKEN=<节点令牌> keel-node -master https://panel.example:8443 \
 - `quota_bytes` 按上行加下行算，超额后 1 秒内断开并拒绝新连接；`expire_at` 是 unix 秒数。`period` 一变，这个用户的计数就从零开始（每月重置就靠主控下发新的 period）。
 - 计数每 10 秒和退出时写入 `-state` 文件，重启后同一 period 的计数接着算；`kill -USR1` 立刻写一次。
 - 删除用户会断开他所有正在用的连接。
-- `outbounds` 里定义出口：`ss2022`（连出口节点，`password` 写 `出口password:入口的ss_key`，`udp_over_tcp` 让 UDP 走 TCP 连接，适合入口到出口之间 UDP 不稳的线路）和 `socks`（比如本机 sslocal 走家宽落地）。`direct` 是内置的直连。
+- `outbounds` 里定义出口：`ss2022`（连出口节点，`password` 写 `出口password:入口的ss_key`，`udp_over_tcp` 让 UDP 走 TCP 连接，适合入口到出口之间 UDP 不稳的线路）、`socks`（比如本机 sslocal 走家宽落地）和 `vless`（第三方 VLESS 上游，明文 TCP、不带 TLS，只填 `server` 和 `uuid`，UDP 走 XUDP）。`direct` 是内置的直连。
 - `route.rules` 从上往下匹配，第一条命中的规则决定出口，都没命中走 `route.final`（默认 `direct`）。规则的 `outbound` 和 `final` 可以写成有顺序的列表，比如 `["us1", "us2"]`：节点定时经每个出口发一个 HTTP 请求检测，排在前面的出口挂了就自动用下一个，恢复后切回来（细节见 [docs/node-protocol.md](docs/node-protocol.md#出口回退)）。每条规则用 `file`（名单文件，改了自动重新加载）或 `domains`（直接写在配置里）。`route.ipv4_only` 就是原来的 `-4`。
 - 名单格式，每行一条，`#` 后面是注释：`example.com` 匹配它和所有子域名，`=api.example.com` 只匹配这一个，`~emby` 匹配包含这个词的域名，`91.108.4.0/22` 或单个 IP 匹配目标 IP。原来的 `direct.list` 可以直接用。
 - [rules/](rules/) 里有常用名单：`ai.list`（OpenAI、Claude、Gemini 等）、`streaming.list`（Netflix、Disney+、YouTube、日本流媒体等）。
