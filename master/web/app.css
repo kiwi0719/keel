@@ -98,13 +98,22 @@ h2 .muted { font-size: 14px; font-weight: 400; }
 .fb-chip { display: inline-flex; align-items: center; gap: 2px; min-height: 36px; padding-left: 10px; border: 1px solid var(--line); color: var(--ink); }
 .fb-chip.dead { border-style: dashed; color: var(--danger); }
 .fb-x { width: 32px; height: 34px; border: 0; background: transparent; color: var(--muted); display: inline-flex; align-items: center; justify-content: center; padding: 0; }
-.fb-select { min-height: 36px; padding: 0 2px; border: 0; background: transparent; font-size: 13px; color: var(--muted); }
-.fb-select:hover { color: var(--ink); }
+.text-btn { min-height: 36px; padding: 0 4px; border: 0; background: transparent; font-size: 13px; color: var(--muted); }
+.text-btn:hover { color: var(--ink); }
 .fb-now { display: inline-flex; align-items: center; gap: 6px; color: var(--ink); }
 .rule { display: flex; align-items: center; gap: 8px; padding: 4px 0; border-bottom: 1px solid var(--line); }
 .rule .what { flex: 1 1 auto; min-width: 0; }
-.line-select { min-height: 44px; padding: 0 6px; border: 0; border-bottom: 1px solid var(--ink); background: transparent; font-size: 15px; max-width: 46%; }
-.add-select { margin-top: 6px; min-height: 44px; padding: 0 12px; border: 1px dashed var(--ink); background: transparent; font-size: 14px; }
+.line-btn { display: inline-flex; align-items: center; gap: 8px; min-height: 40px; max-width: 46%; padding: 0 10px 0 12px; border: 1px solid var(--ink); background: transparent; font-size: 14px; }
+.line-btn .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.line-btn .chev { flex: none; color: var(--muted); transition: transform .15s; }
+.line-btn[aria-expanded="true"] { background: var(--ink); color: var(--paper); }
+.line-btn[aria-expanded="true"] .chev { transform: rotate(180deg); color: var(--paper); }
+.add-btn { margin-top: 8px; min-height: 40px; padding: 0 2px; border: 0; background: transparent; font-size: 14px; color: var(--ink); border-bottom: 1px solid transparent; }
+.add-btn:hover { border-bottom-color: var(--ink); }
+.picker { padding: 10px 0 12px; }
+.add-picker { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; margin-top: 6px; padding: 12px; background: var(--ground); }
+.set-chip { flex-direction: column; align-items: flex-start; justify-content: center; gap: 0; padding: 6px 14px; text-align: left; }
+.set-chip .d { font-size: 11px; color: var(--muted); }
 .exit-card { display: flex; flex-direction: column; gap: 8px; padding: 20px; border: 0; background: var(--paper); text-align: left; min-height: 120px; width: 100%; }
 .exit-card .title { display: flex; align-items: center; gap: 10px; font-size: 18px; font-weight: 500; }
 
