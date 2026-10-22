@@ -11,7 +11,6 @@ const EXIT_STYLE = [
   { color: C.ink, shape: 'square' }, { color: C.yellow, shape: 'circle' }
 ];
 const ISP_COLOR = { ct: [C.blue, C.blue], cu: [C.red, C.red], cm: [C.yellow, '#B08900'] };
-const PLANS = [{ label: '轻量', gb: 100 }, { label: '标准', gb: 300 }, { label: '自用', gb: 1000 }, { label: '自定义', gb: null }];
 const GB = 1024 ** 3;
 
 const S = {
@@ -435,7 +434,7 @@ function usersPage() {
       : u.entries.map(id => node(id)).filter(Boolean).map(nm).join(' · ');
     const online = u.conns ? ` · ${u.conns} 个连接` : '';
     return `<button class="user" data-act="user" data-id="${u.id}">
-      <span class="n">${esc(u.name)} <span style="font-size:13px;font-weight:400" class="muted">${esc(u.plan)}</span></span>
+      <span class="n">${esc(u.name)}</span>
       <span class="bar">
         <span style="display:flex;justify-content:space-between;font-size:14px"><span>${gib(u.used)} / ${u.quota_bytes ? gib(u.quota_bytes) + ' GB' : '不限'}</span><span style="color:${bad ? C.danger : C.muted}">${USTATUS[u.status]}${online}</span></span>
         <span style="display:block;height:3px;background:#D6D1C6;margin-top:6px"><span style="display:block;height:100%;width:${u.quota_bytes ? p.toFixed(0) : 0}%;background:${barColor}"></span></span>
@@ -668,8 +667,8 @@ function installDrawer(d) {
 
 function userDraft(u) {
   return {
-    name: u ? u.name : '', plan: u ? u.plan : '标准',
-    quota: u ? quotaGB(u.quota_bytes) : 300,
+    name: u ? u.name : '', plan: u ? u.plan : '',
+    quota: u ? quotaGB(u.quota_bytes) : 100,
     expire: u ? u.expire_date : '', reset: u ? u.reset_day : new Date().getDate(),
     entries: u ? u.entries.slice() : entries().map(n => n.id), enabled: u ? u.enabled : true
   };
@@ -679,11 +678,9 @@ function userDrawer(d) {
   const u = d.id ? S.data.users.find(x => x.id === d.id) : null;
   if (d.id && !u) return null;
   const f = S.draft || (S.draft = userDraft(u));
-  const plans = PLANS.map(p => `<button type="button" data-act="plan" data-plan="${p.label}" aria-pressed="${f.plan === p.label}"><b>${p.label}</b><span>${p.gb ? p.gb + ' G' : '手填'}</span></button>`).join('');
   const chips = entries().map(n => `<button type="button" class="chip" style="min-width:60px;justify-content:center;font-size:15px;font-weight:500" data-act="user-entry" data-id="${n.id}" aria-pressed="${f.entries.includes(n.id)}">${esc(nm(n))}</button>`).join('');
   let body = `<section class="sec">
       <label class="field">名称<input name="name" value="${esc(f.name)}" placeholder="用户名" data-draft="name"></label>
-      <div class="plans" role="group" aria-label="套餐">${plans}</div>
       <div class="fields three">
         ${field('额度 GB', 'quota', f.quota, { inputmode: 'numeric', placeholder: '不限' })}
         ${field('到期', 'expire', f.expire, { type: 'date' })}
@@ -919,13 +916,6 @@ const actions = {
   },
   user(el) { openDrawer({ kind: 'user', id: +el.dataset.id }); },
   'new-user'() { openDrawer({ kind: 'user', id: 0 }); },
-  plan(el) {
-    keepUserDraft();
-    const p = PLANS.find(x => x.label === el.dataset.plan);
-    S.draft.plan = p.label;
-    if (p.gb) S.draft.quota = p.gb;
-    renderDrawer();
-  },
   'user-entry'(el) {
     keepUserDraft();
     const id = +el.dataset.id, list = S.draft.entries;
