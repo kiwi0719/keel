@@ -379,22 +379,33 @@ function exitPicker(n, kind, rule, ids, current) {
 const FLIP_ICON = '<svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M2 5.5A5 5 0 0 1 11.5 4M12 8.5A5 5 0 0 1 2.5 10" fill="none" stroke="currentColor" stroke-width="1.3"></path><path d="M11.8 1.2V4.3H8.7M2.2 12.8V9.7H5.3" fill="none" stroke="currentColor" stroke-width="1.3"></path></svg>';
 const CHEVRON = '<svg class="chev" width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="M1.5 3.5L5 7L8.5 3.5" fill="none" stroke="currentColor" stroke-width="1.4"></path></svg>';
 
-// Fallback chips plus a "+ 备用" picker. rule '' means the default exit.
-function fallbackLine(n, rule, primary, fallback) {
+const ARROW = '<svg class="arrow" width="14" height="8" viewBox="0 0 14 8" aria-hidden="true"><path d="M0 4H12M9 1L12 4L9 7" fill="none" stroke="currentColor" stroke-width="1.2"></path></svg>';
+const XS = '<svg width="8" height="8" viewBox="0 0 12 12" aria-hidden="true"><path d="M1 1L11 11M11 1L1 11" stroke="currentColor" stroke-width="1.8"></path></svg>';
+
+// A route as one chain: the exit it prefers, then backups in order. The
+// link carrying traffic now is filled; dead links are dashed. rule '' is
+// the default route, whose first exit is picked by the chips above it.
+function chain(n, rule, primary, fallback, label) {
   fallback = fallback || [];
-  const chips = fallback.map((id, i) => {
-    const dead = exitAlive(n, id) === false;
-    return `<span class="fb-chip ${dead ? 'dead' : ''}" title="${dead ? '不通' : ''}">${i + 1}. ${esc(exitLabel(id))}<button class="fb-x" data-act="fb-del" data-id="${n.id}" data-rule="${esc(rule)}" data-exit="${id}" aria-label="去掉备用 ${esc(exitLabel(id))}"><svg width="9" height="9" viewBox="0 0 12 12" aria-hidden="true"><path d="M1 1L11 11M11 1L1 11" stroke="currentColor" stroke-width="1.6"></path></svg></button></span>`;
-  }).join('');
-  const free = S.data.exits.map(e => e.id).concat([0]).filter(id => id !== primary && !fallback.includes(id));
-  const open = pickerOpen(n.id, 'fb', rule);
-  const add = free.length ? pickBtn(n, 'fb', rule, 'text-btn', open ? '收起' : '＋ 备用', '添加备用出口') : '';
   const now = inUse(n, primary, fallback);
-  let note = '';
-  if (now !== primary) note = `<span class="fb-now">${shape({ color: C.amber, shape: 'tri' }, 9)}${esc(exitLabel(primary))} 不通，现在走 ${esc(exitLabel(now))}</span>`;
-  else if (exitAlive(n, primary) === false) note = `<span class="fb-now" style="color:${C.danger}">${shape({ color: C.red, shape: 'square' }, 8)}${fallback.length ? '全都不通' : esc(exitLabel(primary)) + ' 不通'}</span>`;
-  if (!chips && !note && !add) return '';
-  return `<div class="fb">${fallback.length ? '<span>备用</span>' : ''}${chips}${add}${note}</div>${open && free.length ? exitPicker(n, 'fb', rule, free, null) : ''}`;
+  const allDead = [primary].concat(fallback).every(id => exitAlive(n, id) === false);
+  const mark = id => id ? shape(exitStyle(id), 7) : shape({ color: C.faint, shape: 'circle' }, 7);
+  const cls = id => `link ${exitAlive(n, id) === false ? 'dead' : ''} ${id === now && !allDead ? 'cur' : ''}`;
+  const links = [];
+  if (rule) {
+    const open = pickerOpen(n.id, 'primary', rule);
+    links.push(`<button class="${cls(primary)} first" data-act="pick" data-id="${n.id}" data-kind="primary" data-rule="${esc(rule)}" aria-expanded="${open}" aria-label="${esc(label)} 走哪个出口，现在是 ${esc(exitLabel(primary))}">${mark(primary)}<span class="nm">${esc(exitLabel(primary))}</span>${CHEVRON}</button>`);
+  }
+  fallback.forEach(id => links.push(`<span class="${cls(id)}">${mark(id)}<span class="nm">${esc(exitLabel(id))}</span><button class="link-x" data-act="fb-del" data-id="${n.id}" data-rule="${esc(rule)}" data-exit="${id}" aria-label="去掉备用 ${esc(exitLabel(id))}">${XS}</button></span>`));
+  const free = S.data.exits.map(e => e.id).concat([0]).filter(id => id !== primary && !fallback.includes(id));
+  const fbOpen = pickerOpen(n.id, 'fb', rule);
+  if (free.length) links.push(`<button class="link-add" data-act="pick" data-id="${n.id}" data-kind="fb" data-rule="${esc(rule)}" aria-expanded="${fbOpen}">${fbOpen ? '收起' : (fallback.length || rule ? '＋ 备用' : '＋ 不通时换到')}</button>`);
+  const head = rule ? '' : (fallback.length ? '<span class="chain-label">不通时依次换</span>' : '');
+  const warn = allDead ? `<span class="chain-warn">${shape({ color: C.red, shape: 'square' }, 7)}全都不通</span>` : '';
+  const pick = rule && pickerOpen(n.id, 'primary', rule)
+    ? exitPicker(n, 'primary', rule, S.data.exits.map(e => e.id).concat([0]), primary)
+    : fbOpen && free.length ? exitPicker(n, 'fb', rule, free, null) : '';
+  return `<div class="chain">${head}${links.join(ARROW)}${warn}</div>${pick}`;
 }
 
 function entryCard(n) {
@@ -409,16 +420,14 @@ function entryCard(n) {
     return `<button class="chip ${ghost ? 'ghost' : ''} ${dead ? 'dead' : ''}" aria-pressed="${on}" data-act="default-exit" data-id="${n.id}" data-exit="${id}" ${dead ? 'title="这个入口连不上它"' : ''}>${mark}${esc(label)}${dead ? '<span class="sr">（不通）</span>' : ''}</button>`;
   };
   const chips = S.data.exits.map(e => chip(e.id, e.name, exitStyle(e.id), false)).join('') + chip(0, '直连', null, true);
-  const allIds = S.data.exits.map(e => e.id).concat([0]);
   const used = n.rules.map(r => r.ruleset);
   const rows = n.rules.map(r => {
     const set = S.data.rulesets.find(s => s.id === r.ruleset) || { label: r.ruleset, description: '' };
-    return `<div class="rule-wrap"><div class="rule">
-      <span class="what"><span style="font-size:15px;font-weight:500">${esc(set.label)}</span> <span class="small muted">${esc(set.description)}</span></span>
-      <span class="muted" style="font-size:13px">走</span>
-      ${pickBtn(n, 'primary', r.ruleset, 'line-btn', `${r.exit_id ? shape(exitStyle(r.exit_id), 8) : shape({ color: C.faint, shape: 'circle' }, 8)}<span class="nm">${esc(exitLabel(r.exit_id))}</span>${CHEVRON}`, `${nm(n)} ${set.label} 走哪个出口，现在是 ${exitLabel(r.exit_id)}`)}
-      <button class="icon-btn" data-act="rule-del" data-id="${n.id}" data-rule="${esc(r.ruleset)}" aria-label="删除 ${esc(set.label)} 分流"><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M1 1L11 11M11 1L1 11" stroke="currentColor" stroke-width="1.5"></path></svg></button>
-    </div>${pickerOpen(n.id, 'primary', r.ruleset) ? exitPicker(n, 'primary', r.ruleset, allIds, r.exit_id) : ''}${fallbackLine(n, r.ruleset, r.exit_id, r.fallback)}</div>`;
+    return `<div class="route">
+      <div class="route-head"><span class="rname">${esc(set.label)}</span><span class="rdesc">${esc(set.description)}</span>
+        <button class="route-del" data-act="rule-del" data-id="${n.id}" data-rule="${esc(r.ruleset)}" aria-label="删除 ${esc(set.label)} 分流" title="删除这条分流">${XS}</button></div>
+      ${chain(n, r.ruleset, r.exit_id, r.fallback, nm(n) + ' ' + set.label)}
+    </div>`;
   }).join('');
   const free = S.data.rulesets.filter(s => !used.includes(s.id));
   const addOpen = pickerOpen(n.id, 'rule', '');
@@ -428,8 +437,8 @@ function entryCard(n) {
     : pickBtn(n, 'rule', '', 'add-btn', '＋ 添加分流', `${nm(n)} 添加分流`);
   return `<div class="card entry ${st.kind === 'off' ? 'off' : ''}">
     <div class="row">${head}<span style="font-size:13px;color:${st.kind === 'off' ? C.danger : C.muted}">${esc(st.text)}</span></div>
-    <div><div class="sublabel">默认出口</div><div class="chips" role="group" aria-label="${esc(nm(n))} 默认出口">${chips}</div>${fallbackLine(n, '', n.default_exit, n.default_fallback)}</div>
-    <div><div class="sublabel" style="margin-bottom:4px">分流</div>${rows}${add}</div>
+    <div><div class="sublabel">默认出口</div><div class="chips" role="group" aria-label="${esc(nm(n))} 默认出口">${chips}</div>${chain(n, '', n.default_exit, n.default_fallback)}</div>
+    <div><div class="sublabel">分流</div><div class="routes">${rows}</div>${add}</div>
   </div>`;
 }
 
@@ -772,9 +781,8 @@ function userDrawer(d) {
     <section class="sec"><h3>可用入口</h3><div class="chips">${chips || '<span class="muted">还没有入口节点</span>'}</div></section>`;
   if (u) {
     body += `<section class="sec">
-      <h3>订阅</h3>
-      <div class="sub-list">${subClients(u)}</div>
       <div style="display:flex;gap:8px">
+        <button type="button" class="btn small" data-act="copy" data-text="${esc(u.sub_url)}">复制订阅</button>
         <button type="button" class="btn small" data-act="sub-rotate" data-id="${u.id}">重置订阅</button>
       </div>
       <p class="small muted" style="margin:0">本期已用 ${bytes(u.used)}，${u.reset_day} 号清零${u.conns ? ' · 当前 ' + u.conns + ' 个连接' : ''}。</p>
@@ -789,25 +797,6 @@ function userDrawer(d) {
          <button class="btn danger" data-act="user-del" data-id="${u.id}">删除</button>`
       : `<button class="btn solid" data-act="save-user">创建</button>`
   };
-}
-
-// One subscription link serves every client: it answers by User-Agent, and
-// format= pins it for clients that do not say who they are.
-function subClients(u) {
-  const url = u.sub_url, enc = encodeURIComponent, name = enc('keel-' + u.name);
-  const fmt = f => url + '?format=' + f;
-  const rows = [
-    ['Clash / mihomo', 'Clash Verge、FlClash、Clash Meta', fmt('clash'), `clash://install-config?url=${enc(fmt('clash'))}&name=${name}`],
-    ['Stash', '', fmt('stash'), `stash://install-config?url=${enc(fmt('stash'))}&name=${name}`],
-    ['sing-box', 'iOS / Android / macOS 官方客户端', fmt('singbox'), `sing-box://import-remote-profile?url=${enc(fmt('singbox'))}#${name}`],
-    ['Surge', 'Surge 不支持 VLESS，只含 AnyTLS 入口', fmt('surge'), `surge:///install-config?url=${enc(fmt('surge'))}`],
-    ['Shadowrocket', '节点列表，分流用小火箭自己的配置', fmt('links'), `shadowrocket://add/sub://${btoa(fmt('links'))}?remark=${name}`],
-    ['v2rayN / NekoBox', '节点列表', fmt('links'), '']
-  ];
-  return `<div class="sub-row"><div><div class="sub-name">通用链接</div><div class="small muted">自动识别客户端，发给别人用这个</div></div>
-      <div class="sub-acts"><button type="button" class="btn small solid" data-act="copy" data-text="${esc(url)}">复制</button></div></div>` +
-    rows.map(([t, note, link, deep]) => `<div class="sub-row"><div><div class="sub-name">${t}</div>${note ? `<div class="small muted">${note}</div>` : ''}</div>
-      <div class="sub-acts">${deep ? `<a class="btn small" href="${esc(deep)}">导入</a>` : ''}<button type="button" class="btn small" data-act="copy" data-text="${esc(link)}">复制</button></div></div>`).join('');
 }
 
 function settingsDrawer() {
