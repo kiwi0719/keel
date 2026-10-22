@@ -51,6 +51,7 @@ if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
 Description=keel-node
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 EnvironmentFile=/etc/keel/token.env
@@ -75,11 +76,28 @@ command_args="$ARGS"
 output_log=/var/log/keel-node.log
 error_log=/var/log/keel-node.log
 respawn_delay=3
+respawn_max=0
 rc_ulimit="-n 1048576"
 depend() { need net; }
-start_pre() { set -a; . /etc/keel/token.env; set +a; }
+start_pre() {
+	# Keep the log bounded even without logrotate.
+	if [ -f /var/log/keel-node.log ] && [ "\$(wc -c </var/log/keel-node.log)" -gt 10485760 ]; then : >/var/log/keel-node.log; fi
+	set -a; . /etc/keel/token.env; set +a
+}
 RC
 	chmod 755 /etc/init.d/keel-node
+	if [ -d /etc/logrotate.d ]; then
+		cat >/etc/logrotate.d/keel-node <<'LR'
+/var/log/keel-node.log {
+	size 5M
+	rotate 2
+	compress
+	missingok
+	notifempty
+	copytruncate
+}
+LR
+	fi
 	rc-update add keel-node default >/dev/null 2>&1
 	rc-service keel-node restart
 else
