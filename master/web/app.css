@@ -168,11 +168,6 @@ aside.drawer { position: fixed; top: 0; right: 0; bottom: 0; width: 100%; max-wi
 .seg { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); }
 .seg button { min-height: 48px; border: 1px solid var(--ink); margin-left: -1px; background: transparent; font-size: 15px; }
 .seg button[aria-pressed="true"] { background: var(--ink); color: var(--paper); }
-.plans { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; }
-.plans button { min-height: 52px; border: 1px solid var(--ink); background: transparent; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 0; }
-.plans button[aria-pressed="true"] { background: var(--ink); color: var(--paper); }
-.plans b { font-size: 14px; font-weight: 500; }
-.plans span { font-size: 11px; }
 .code-box { background: var(--ink); color: var(--ground); padding: 16px; font-family: ui-monospace, Menlo, monospace; font-size: 13px; line-height: 1.7; word-break: break-all; user-select: all; }
 .port-block { display: flex; flex-direction: column; gap: 14px; padding-bottom: 16px; border-bottom: 1px solid var(--line); }
 .err { color: var(--danger); font-size: 14px; min-height: 1em; }
@@ -188,5 +183,4 @@ aside.drawer { position: fixed; top: 0; right: 0; bottom: 0; width: 100%; max-wi
   .hero { padding: 20px; }
   main { padding-top: 20px; }
   .fields.three { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .plans { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
