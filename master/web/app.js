@@ -603,7 +603,7 @@ function settingsDrawer() {
   const tz = st.tz_offset / 60;
   const tzOpts = [];
   for (let h = -12; h <= 14; h++) tzOpts.push(`<option value="${h * 60}" ${h === tz ? 'selected' : ''}>UTC${h >= 0 ? '+' : ''}${h}</option>`);
-  const targets = st.probe_targets.map(t => field(`${esc(t.label)}（IP:端口）`, `probe_${t.name}`, t.host, { full: true, placeholder: '比如 某地电信的 IP:80' })).join('');
+  const targets = st.probe_targets.map(t => field(`${esc(t.label)}（IP:端口）`, `probe_${t.name}`, t.host, { full: true, placeholder: 'sh-' + t.name + '-v4.ip.zstaticcdn.com:80' })).join('');
   return {
     title: '设置', mark: shape({ color: C.ink, shape: 'circle' }, 16),
     body: `<section class="sec"><div class="fields two">
@@ -611,7 +611,7 @@ function settingsDrawer() {
         <label class="field">时区（重置日按它算）<select name="tz_offset">${tzOpts.join('')}</select></label>
       </div></section>
       <section class="sec"><h3>三网测速目标</h3><div class="fields">${targets}</div>
-        <p class="small muted" style="margin:0">节点每 30 秒对每个目标 TCP 连 10 次，算延迟、波动和重传。留空就不测。</p></section>
+        <p class="small muted" style="margin:0">默认是上海三网（Zstatic 公开的 TCPing 节点，地址由对方自动更新）。换省份就把 sh 改成对应代号。节点每 30 秒对每个目标 TCP 连 10 次，算延迟、波动和重传。留空就不测。</p></section>
       ${st.fingerprint ? `<section class="sec"><h3>主控证书指纹</h3><div class="mono small" style="word-break:break-all">${esc(st.fingerprint)}</div></section>` : ''}
       <section class="sec"><h3>改密码</h3><div class="fields two">
         ${field('当前密码', 'current_password', '', { type: 'password' })}

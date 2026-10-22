@@ -20,10 +20,18 @@ pub struct ProbeTarget {
     pub host: String,
 }
 
+/// Shanghai targets from Zstatic's public TCPing list
+/// (https://china-tcping-list.vercel.app/): one domain per carrier whose
+/// address is kept current upstream, so nothing here goes stale. Port 80;
+/// they answer TCP only, not ICMP.
 pub fn default_probe_targets() -> Vec<ProbeTarget> {
     [("ct", "电信"), ("cu", "联通"), ("cm", "移动")]
         .iter()
-        .map(|(n, l)| ProbeTarget { name: n.to_string(), label: l.to_string(), host: String::new() })
+        .map(|(n, l)| ProbeTarget {
+            name: n.to_string(),
+            label: l.to_string(),
+            host: format!("sh-{n}-v4.ip.zstaticcdn.com:80"),
+        })
         .collect()
 }
 
