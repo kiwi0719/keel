@@ -13,6 +13,7 @@ require (
 	github.com/sagernet/sing v0.8.12-0.20260702081104-2ded2af32d3d
 	github.com/sagernet/sing-shadowsocks v0.2.8
 	github.com/sagernet/sing-vmess v0.2.8-0.20250909125414-3aed155119a1
+	golang.org/x/crypto v0.33.0
 )
 
 require (
@@ -20,7 +21,6 @@ require (
 	github.com/gofrs/uuid/v5 v5.3.2 // indirect
 	github.com/klauspost/compress v1.17.9 // indirect
 	github.com/klauspost/cpuid/v2 v2.0.12 // indirect
-	golang.org/x/crypto v0.33.0 // indirect
 	golang.org/x/exp v0.0.0-20240904232852-e7e105dedf7e // indirect
 	golang.org/x/sys v0.41.0 // indirect
 	lukechampine.com/blake3 v1.3.0 // indirect

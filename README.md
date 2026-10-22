@@ -31,10 +31,10 @@ VLESS 必须同时带 `with_utls` 标签（Vision 靠它识别 Reality 连接）
 
 | 构建 | linux-amd64 大小 | 空闲内存 | 8 路并发下载时 |
 | --- | --- | --- | --- |
-| 只有 anytls | 5.7 MB | 5.8 MB | 11.9 MB |
-| anytls + vless + ss | 7.9 MB | 7.0 MB | 13.4 MB |
+| 只有 anytls | 7.9 MB | 7.4 MB | 14.1 MB |
+| anytls + vless + ss | 9.5 MB | 8.7 MB | 15.2 MB |
 
-内存数据来自 `test/bench/mem.sh`（本机回环，AnyTLS，8 个客户端各下 100 MB，每个限速 50 MB/s）。
+大小包含主控连接（WebSocket / HTTP 客户端）、出口健康检测和自动申请证书；最早只有代理功能时分别是 5.7 MB 和 7.9 MB。内存数据来自 `test/bench/mem.sh`（本机回环，AnyTLS，8 个客户端各下 100 MB，每个限速 50 MB/s）。
 
 ### 运行
 
@@ -49,7 +49,7 @@ KEEL_TOKEN=<节点令牌> keel-node -master https://panel.example:8443 \
     -fingerprint <主控证书 SHA-256> -c /etc/keel/node.json -state /var/lib/keel/usage.json
 ```
 
-节点每 5 秒上报一次每个用户的流量、连接数和整机状态（CPU、内存、硬盘、网速、连接数、TCP 重传率、在线时长），配置了 `probes` 时还会定时对电信、联通、移动的目标做 TCPing（延迟、波动、丢包）。入口的可选参数（AnyTLS 的域名、证书、填充方案，Reality 的 SNI、dest、shortId 等）见 [docs/node-protocol.md](docs/node-protocol.md#入口入站的可选参数)。
+节点每 5 秒上报一次每个用户的流量、连接数和整机状态（CPU、内存、硬盘、网速、连接数、TCP 重传率、在线时长），配置了 `probes` 时还会定时对电信、联通、移动的目标做 TCPing（延迟、波动、丢包）。入口的可选参数（AnyTLS 的域名、证书（可以自动向 Let's Encrypt 申请和续期，支持 Cloudflare DNS 验证，NAT 机器也能用）、填充方案，Reality 的 SNI、dest、shortId 等）见 [docs/node-protocol.md](docs/node-protocol.md#入口入站的可选参数)。
 
 配置格式见 [examples/entry.json](examples/entry.json)（入口）和 [examples/exit.json](examples/exit.json)（出口）。
 
@@ -69,7 +69,8 @@ KEEL_TOKEN=<节点令牌> keel-node -master https://panel.example:8443 \
 make test                                    # 单元测试（带竞态检测）
 BIN=/path/to/clients test/compat/run.sh      # 客户端兼容性
 BIN=/path/to/clients test/compat/limits.sh   # 额度、到期、热更新、删用户、重启
-BIN=/path/to/clients test/compat/chain.sh    # 入口 → 两个出口的分流，TCP 和 UDP
+BIN=/path/to/clients test/compat/chain.sh    # 入口 → 两个出口的分流，TCP 和 UDP，出口挂掉后回退
+PEBBLE_DIR=... PEBBLE_SRC=... go test -tags anytls -run ACME ./cmd/keel-node   # 用 Let's Encrypt 的测试 CA（pebble）走三种验证方式，见 acme_test.go
 ```
 
 `BIN` 目录里放客户端程序：`xray-<版本>`（可以放多个版本）、`mihomo`、`sing-box`。测试全部在本机回环上跑，不连外网，也不碰任何真实服务器。兼容性测试里每个用例都会：

@@ -23,13 +23,10 @@ type anytlsInbound struct {
 	listener  net.Listener
 	service   *anytls.Service
 	tlsConfig *tls.Config
+	acme      *certManager // nil unless the certificate comes from ACME
 }
 
 func newAnyTLSInbound(config InboundConfig, h *handler) (inbound, error) {
-	cert, err := anytlsCert(config)
-	if err != nil {
-		return nil, err
-	}
 	scheme := padding.DefaultPaddingScheme
 	if len(config.PaddingScheme) > 0 {
 		scheme = []byte(strings.Join(config.PaddingScheme, "\n"))
@@ -45,16 +42,26 @@ func newAnyTLSInbound(config InboundConfig, h *handler) (inbound, error) {
 	if err != nil {
 		return nil, err
 	}
-	listener, err := net.Listen("tcp", config.Listen)
-	if err != nil {
+	in := &anytlsInbound{service: service}
+	if config.ACME != nil {
+		if in.acme, err = newCertManager(config.ServerName, config.Listen, *config.ACME); err != nil {
+			return nil, err
+		}
+		in.tlsConfig = in.acme.tlsConfig()
+	} else {
+		cert, err := anytlsCert(config)
+		if err != nil {
+			return nil, err
+		}
+		in.tlsConfig = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+	}
+	if in.listener, err = net.Listen("tcp", config.Listen); err != nil {
+		if in.acme != nil {
+			in.acme.close()
+		}
 		return nil, err
 	}
-	in := &anytlsInbound{
-		listener:  listener,
-		service:   service,
-		tlsConfig: &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12},
-	}
-	go acceptLoop(listener, in.serve)
+	go acceptLoop(in.listener, in.serve)
 	return in, nil
 }
 
@@ -69,6 +76,10 @@ func (in *anytlsInbound) serve(conn net.Conn) {
 		if verbose {
 			log.Print("anytls: tls handshake from ", source, ": ", err)
 		}
+		return
+	}
+	if tlsConn.ConnectionState().NegotiatedProtocol == acmeTLSALPN {
+		tlsConn.Close() // the CA's tls-alpn-01 check is done with the handshake
 		return
 	}
 	if err = in.service.NewConnection(context.Background(), tlsConn, source, nil); err != nil {
@@ -89,5 +100,8 @@ func (in *anytlsInbound) updateUsers(users []UserConfig) error {
 }
 
 func (in *anytlsInbound) close() error {
+	if in.acme != nil {
+		in.acme.close()
+	}
 	return in.listener.Close()
 }

@@ -98,6 +98,16 @@ keel-node -master https://panel.example:8443 -token <节点令牌> \
 - `latency_ms`：最近一次检测成功时，经这个出口完成一次 HTTP 请求的耗时（包括入口到出口、出口到检测网址），不是单纯的入口到出口延迟。
 - `checked_at`：最近一次检测的时间，0 表示还没测过。`error` 是最近一次失败的原因，成功后清空。
 
+`certs`（只有用了 `acme` 的入站才有）：
+
+```json
+"certs":[{"domain":"a.example.com","issuer":"acme","not_after":1768900000},
+         {"domain":"b.example.com","issuer":"self-signed","error":"dns challenge: cloudflare ...: Authentication error","next_try":1761100300}]
+```
+
+- `issuer`：`acme` 表示已经在用 CA 签的证书，`self-signed` 表示还没申请下来、在用自签证书。
+- `error` / `next_try`：最近一次申请失败的原因和下次重试时间，成功后清空。
+
 `probes`（三网 TCPing）：
 
 - 只在有新一轮测完时出现，每一轮只发一次；没有新结果的帧不带这个字段。主控存下来画图就行。
@@ -174,6 +184,24 @@ AnyTLS：
   3. 都不给：节点用自签 ECDSA 证书，域名是 `server_name`（没写就是 `localhost`），保存在 `-c` 配置文件所在目录的 `anytls.crt` / `anytls.key`，重启后不变；`server_name` 改了会重新生成。AnyTLS 客户端通常不校验证书（订阅里写 `skip-cert-verify` / `insecure`）。
 - 换证书文件后要重新下发配置（或改动这个入站）才会加载新证书。
 - `padding_scheme`：可选，覆盖 AnyTLS 默认的填充方案，格式和 sing-box 的 `padding_scheme` 一样，每行一条。服务端会把它推给客户端，客户端不用配置。写错（缺 `stop=`）这个入站起不来。
+
+自动申请证书（ACME）：
+
+```json
+{"type":"anytls","listen":"0.0.0.0:443","server_name":"a.example.com",
+ "acme":{"email":"me@example.com","challenge":"dns","dns_provider":"cloudflare","dns_token":"<Cloudflare API 令牌>"}}
+```
+
+- 写了 `acme` 就不能再写 `cert` / `key` / `cert_pem`，`server_name` 必填，域名要已经解析到这台机器（`dns` 方式除外）。
+- 节点先用自签证书把入站开起来，后台向 Let's Encrypt 申请，拿到后直接换上，不用重启、不断连接。证书存在 `-c` 所在目录的 `acme/` 下，重启后直接用；到期前 30 天自动续期。
+- `challenge` 验证方式：
+  - `dns`：在 Cloudflare 上临时加一条 `_acme-challenge` TXT 记录。不需要开任何端口，NAT 机器、443 被别的程序占着都能用。需要 `dns_provider: "cloudflare"` 和一个有这个域名 DNS 编辑权限的 API 令牌（Cloudflare 后台 → API 令牌 → “编辑区域 DNS” 模板）。
+  - `tls-alpn`：Let's Encrypt 连这个域名的 443 端口，由这个 AnyTLS 入站自己应答。要求外网 443 端口通到这个入站（直接监听 443，或 NAT 把公网 443 转到它）。
+  - `http`：申请时临时监听 80 端口，申请完就关。要求 80 端口空着、外网能连到。
+  - 不写：有 `dns_token` 就用 `dns`，否则入站监听 443 就用 `tls-alpn`，再否则用 `http`。主控知道 NAT 公网端口时最好明确写。
+- 失败了 5 分钟后重试，之后每次加倍，最长 6 小时，期间一直用原来的证书（或自签证书）。
+- `ca`：可选，ACME 目录地址，默认 Let's Encrypt。`email`：可选。
+- 令牌只在主控数据库和节点的缓存配置里，不进仓库。
 
 VLESS Reality：
 

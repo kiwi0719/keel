@@ -76,6 +76,8 @@ type reportMessage struct {
 	System    SystemStats `json:"system"`
 	// Outbounds is the health of every outbound but direct.
 	Outbounds []OutboundStatus `json:"outbounds,omitempty"`
+	// Certs is the state of ACME certificates.
+	Certs []CertStatus `json:"certs,omitempty"`
 	// Probes holds results of probe rounds finished since the previous
 	// report, so each round is sent once; omitted when there is none.
 	Probes []ProbeResult `json:"probes,omitempty"`
@@ -239,6 +241,7 @@ func (m *masterClient) report() reportMessage {
 		Users:     m.node.users.usage(),
 		System:    m.sampler.sample(),
 		Outbounds: currentRouter.Load().outboundStatus(),
+		Certs:     certStatuses(),
 		Probes:    probes,
 	}
 }
