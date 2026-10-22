@@ -50,7 +50,7 @@ fn proxies(user: &User, entries: &[&Node]) -> Vec<Proxy> {
                     fp: if n.reality_fp.is_empty() { "chrome".into() } else { n.reality_fp.clone() },
                 },
                 server: server.clone(),
-                port: n.vless_port,
+                port: if n.vless_pub > 0 { n.vless_pub } else { n.vless_port },
             });
         }
         if n.anytls_on && n.anytls_port > 0 {
@@ -62,7 +62,7 @@ fn proxies(user: &User, entries: &[&Node]) -> Vec<Proxy> {
                     verify: !n.anytls_cert.is_empty() && !n.anytls_key.is_empty(),
                 },
                 server: server.clone(),
-                port: n.anytls_port,
+                port: if n.anytls_pub > 0 { n.anytls_pub } else { n.anytls_port },
             });
         }
     }

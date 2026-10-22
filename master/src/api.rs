@@ -453,6 +453,7 @@ pub async fn update_node(State(app): State<Arc<App>>, Path(id): Path<i64>, Json(
                 }
                 "ipv4_only" | "anytls_on" | "vless_on" | "ss_on" => (k.as_str(), json!(bool_field(v)?)),
                 "anytls_port" | "vless_port" | "ss_port" => (k.as_str(), json!(port_field(v)?)),
+                "anytls_pub" | "vless_pub" => (k.as_str(), json!(if v.is_null() || v.as_i64() == Some(0) { 0 } else { port_field(v)? })),
                 "default_exit" => {
                     let e = int_field(v, 0, i64::MAX)?;
                     if e != 0 && !exists(&conn, "exits", e) {
@@ -615,6 +616,7 @@ fn apply_exit_fields(conn: &Connection, id: i64, b: &Map<String, Value>) -> Resu
                 ("name", s.into())
             }
             "port" => ("port", port_field(v)?.into()),
+            "pub_port" => ("pub_port", (if v.is_null() || v.as_i64() == Some(0) { 0 } else { port_field(v)? }).into()),
             "quota_bytes" => ("quota_bytes", int_field(v, 0, i64::MAX / 2)?.into()),
             "reset_day" => ("reset_day", int_field(v, 1, 31)?.into()),
             "udp_over_tcp" => ("udp_over_tcp", (bool_field(v)? as i64).into()),
