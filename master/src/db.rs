@@ -43,14 +43,21 @@ CREATE TABLE IF NOT EXISTS nodes(
 );
 CREATE TABLE IF NOT EXISTS exits(
   id INTEGER PRIMARY KEY,
-  node_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+  -- NULL for an external exit: a third-party server entries dial directly.
+  node_id INTEGER REFERENCES nodes(id) ON DELETE CASCADE,
   name TEXT NOT NULL,
-  port INTEGER NOT NULL,
-  psk TEXT NOT NULL,
+  port INTEGER NOT NULL DEFAULT 0,
+  psk TEXT NOT NULL DEFAULT '',
   quota_bytes INTEGER NOT NULL DEFAULT 0,
   reset_day INTEGER NOT NULL DEFAULT 1,
   udp_over_tcp INTEGER NOT NULL DEFAULT 0,
-  sort INTEGER NOT NULL DEFAULT 0
+  sort INTEGER NOT NULL DEFAULT 0,
+  -- ss: an SS 2022 port on a keel exit node. External, imported from a share
+  -- link: vless (plain TCP, uuid) or shadowsocks (method, password in psk).
+  kind TEXT NOT NULL DEFAULT 'ss',
+  server TEXT NOT NULL DEFAULT '',
+  uuid TEXT NOT NULL DEFAULT '',
+  method TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS rulesets(
   id TEXT PRIMARY KEY,
@@ -115,6 +122,31 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     ("entry_rules", "fallback", "TEXT NOT NULL DEFAULT ''"),
 ];
 
+/// Databases from before external exits have exits.node_id NOT NULL and no
+/// kind/server/uuid columns; SQLite cannot drop NOT NULL, so rebuild the table.
+fn migrate_exits(conn: &mut Connection) -> rusqlite::Result<()> {
+    let old: bool = conn.prepare("SELECT 1 FROM pragma_table_info('exits') WHERE name='node_id' AND \"notnull\"=1")?.exists([])?;
+    if !old {
+        return Ok(());
+    }
+    conn.pragma_update(None, "foreign_keys", "OFF")?;
+    let tx = conn.transaction()?;
+    let create = SCHEMA
+        .split("CREATE TABLE IF NOT EXISTS exits(")
+        .nth(1)
+        .and_then(|rest| rest.split(");").next())
+        .expect("exits table in SCHEMA");
+    tx.execute_batch(&format!(
+        "CREATE TABLE exits_new({create});
+         INSERT INTO exits_new(id,node_id,name,port,psk,quota_bytes,reset_day,udp_over_tcp,sort)
+           SELECT id,node_id,name,port,psk,quota_bytes,reset_day,udp_over_tcp,sort FROM exits;
+         DROP TABLE exits;
+         ALTER TABLE exits_new RENAME TO exits;"
+    ))?;
+    tx.commit()?;
+    conn.pragma_update(None, "foreign_keys", "ON")
+}
+
 pub fn ids_from_text(s: &str) -> Vec<i64> {
     s.split(',').filter_map(|x| x.trim().parse().ok()).collect()
 }
@@ -136,12 +168,13 @@ const RULESETS: &[(&str, &str, &str, &str)] = &[
 ];
 
 pub fn open(path: &Path) -> rusqlite::Result<Connection> {
-    let conn = Connection::open(path)?;
+    let mut conn = Connection::open(path)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
     conn.execute_batch(SCHEMA)?;
+    migrate_exits(&mut conn)?;
     for (table, col, ddl) in MIGRATIONS {
         let has: bool = conn
             .prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name=?1"))?
@@ -266,6 +299,21 @@ pub struct Exit {
     pub reset_day: i64,
     pub udp_over_tcp: bool,
     pub sort: i64,
+    /// "ss" (a port on a keel exit node, node_id set), or an external exit
+    /// with node_id 0: "vless" or "shadowsocks" (password in psk).
+    pub kind: String,
+    /// External: host:port of the third-party server.
+    pub server: String,
+    #[serde(skip)]
+    pub uuid: String,
+    /// External shadowsocks: the cipher.
+    pub method: String,
+}
+
+impl Exit {
+    pub fn is_external(&self) -> bool {
+        self.kind != "ss"
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -367,7 +415,7 @@ pub fn load_world(conn: &Connection) -> rusqlite::Result<World> {
     w.tz = get_setting(conn, "tz_offset")?.and_then(|v| v.parse().ok()).unwrap_or(480);
     let mut st = conn.prepare(&format!("SELECT {NODE_COLS} FROM nodes ORDER BY sort, id"))?;
     w.nodes = st.query_map([], node_from_row)?.collect::<Result<_, _>>()?;
-    let mut st = conn.prepare("SELECT id,node_id,name,port,psk,quota_bytes,reset_day,udp_over_tcp,sort FROM exits ORDER BY sort, id")?;
+    let mut st = conn.prepare("SELECT id,COALESCE(node_id,0),name,port,psk,quota_bytes,reset_day,udp_over_tcp,sort,kind,server,uuid,method FROM exits ORDER BY sort, id")?;
     w.exits = st
         .query_map([], |r| {
             Ok(Exit {
@@ -380,6 +428,10 @@ pub fn load_world(conn: &Connection) -> rusqlite::Result<World> {
                 reset_day: r.get(6)?,
                 udp_over_tcp: r.get(7)?,
                 sort: r.get(8)?,
+                kind: r.get(9)?,
+                server: r.get(10)?,
+                uuid: r.get(11)?,
+                method: r.get(12)?,
             })
         })?
         .collect::<Result<_, _>>()?;

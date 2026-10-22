@@ -89,6 +89,8 @@ type OutboundConfig struct {
 	Server string `json:"server"` // host:port
 
 	// ss2022: Password is "<server psk>:<user key>" as for any SS 2022 client.
+	// Method defaults to 2022-blake3-aes-128-gcm; classic AEAD methods
+	// (aes-128-gcm, chacha20-ietf-poly1305, ...) take a plain password.
 	Method   string `json:"method,omitempty"`
 	Password string `json:"password,omitempty"`
 	// UDPOverTCP carries UDP inside the TCP connection to the server instead

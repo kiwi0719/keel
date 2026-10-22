@@ -6,10 +6,12 @@ import (
 	"log"
 	"net"
 	"net/netip"
+	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-shadowsocks"
+	"github.com/sagernet/sing-shadowsocks/shadowaead"
 	"github.com/sagernet/sing-shadowsocks/shadowaead_2022"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
@@ -76,7 +78,14 @@ func newRouter(c *Config, previous *router) (*router, error) {
 			if method == "" {
 				method = "2022-blake3-aes-128-gcm"
 			}
-			ss, err := shadowaead_2022.NewWithPassword(method, o.Password, time.Now)
+			var ss shadowsocks.Method
+			var err error
+			if strings.HasPrefix(method, "2022-") {
+				ss, err = shadowaead_2022.NewWithPassword(method, o.Password, time.Now)
+			} else {
+				// Classic AEAD methods, for imported third-party servers.
+				ss, err = shadowaead.New(method, nil, o.Password)
+			}
 			if err != nil {
 				return nil, fmt.Errorf("outbound %s: %w", o.Tag, err)
 			}
@@ -245,7 +254,8 @@ func (s *socksOutbound) listenUDP(ctx context.Context, destination M.Socksaddr) 
 	return conn.(N.PacketConn), nil
 }
 
-// ssOutbound is a Shadowsocks 2022 client, used by entry nodes to reach exits.
+// ssOutbound is a Shadowsocks client: SS 2022 to reach keel exits, or a
+// classic AEAD method for an imported third-party server.
 type ssOutbound struct {
 	method     shadowsocks.Method
 	server     M.Socksaddr
