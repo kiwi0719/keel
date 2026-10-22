@@ -324,6 +324,7 @@ pub async fn state(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult
 #[derive(Deserialize)]
 pub struct NewNode {
     role: String,
+    #[serde(default)]
     code: String,
     name: String,
 }
@@ -332,10 +333,14 @@ pub async fn create_node(State(app): State<Arc<App>>, headers: HeaderMap, Json(b
     if b.role != "entry" && b.role != "exit" {
         return Err(bad("角色只能是入口或出口"));
     }
-    let code = str_field(&json!(b.code), 8)?.to_uppercase();
     let name = str_field(&json!(b.name), 40)?;
+    // The panel shows only the name; the code stays as an internal short id.
+    let mut code = str_field(&json!(b.code), 8)?.to_uppercase();
     if code.is_empty() {
-        return Err(bad("请填代号，比如 JP"));
+        code = format!("N{}", random_hex(3).to_uppercase());
+    }
+    if name.is_empty() {
+        return Err(bad("请填名称"));
     }
     let id = {
         let conn = app.db();

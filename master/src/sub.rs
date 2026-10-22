@@ -38,7 +38,7 @@ fn proxies(user: &User, entries: &[&Node]) -> Vec<Proxy> {
         if server.is_empty() {
             continue;
         }
-        let label = if n.name.is_empty() || n.name == n.code { n.code.clone() } else { format!("{} {}", n.code, n.name) };
+        let label = if n.name.is_empty() { n.code.clone() } else { n.name.clone() };
         if n.vless_on && n.vless_port > 0 {
             list.push(Proxy {
                 name: format!("{label} · Reality"),
