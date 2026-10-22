@@ -157,6 +157,8 @@ aside.drawer { position: fixed; top: 0; right: 0; bottom: 0; width: 100%; max-wi
 .field textarea { border: 1px solid var(--ink); background: transparent; padding: 10px; font-size: 14px; color: var(--ink); resize: vertical; margin-top: 6px; }
 .proto { display: flex; align-items: center; gap: 14px; padding: 10px 0; border-bottom: 1px solid var(--line); }
 .proto .info { flex: 1 1 auto; min-width: 0; }
+.addr { display: flex; align-items: center; gap: 12px; min-height: 40px; border-bottom: 1px solid var(--line); color: var(--ink); }
+.addr .mono { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .proto-opts { padding: 4px 0 14px; border-bottom: 1px solid var(--line); }
 .small-chip { min-height: 36px; padding: 0 10px; font-size: 13px; }
 .proto .port { width: 72px; height: 36px; border: 0; border-bottom: 1px solid var(--ink); background: transparent; padding: 0; font-size: 16px; text-align: right; }
