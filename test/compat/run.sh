@@ -51,15 +51,14 @@ UUID_PLAIN=$("$XRAY" uuid)
 ANYTLS_PW=$(openssl rand -hex 12)
 SS_PSK=$(openssl rand -base64 16)
 SS_KEY=$(openssl rand -base64 16)
-openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -days 1 -nodes \
-  -keyout "$WORK/key.pem" -out "$WORK/cert.pem" -subj "/CN=anytls.test" 2>/dev/null
 
 cat > "$WORK/node.json" <<JSON
 {
   "inbounds": [
     {"type": "vless", "listen": "127.0.0.1:$VLESS_PORT",
      "reality": {"dest": "$DEST", "server_names": ["$SNI"], "private_key": "$PRIV", "short_ids": ["$SID"]}},
-    {"type": "anytls", "listen": "127.0.0.1:$ANYTLS_PORT", "cert": "$WORK/cert.pem", "key": "$WORK/key.pem"},
+    {"type": "anytls", "listen": "127.0.0.1:$ANYTLS_PORT", "server_name": "anytls.test",
+     "padding_scheme": ["stop=8", "0=30-30", "1=100-400", "2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000", "3=9-9,500-1000", "4=500-1000", "5=500-1000", "6=500-1000", "7=500-1000"]},
     {"type": "ss2022", "listen": "127.0.0.1:$SS_PORT", "method": "2022-blake3-aes-128-gcm", "password": "$SS_PSK"}
   ],
   "users": [

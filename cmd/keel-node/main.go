@@ -44,6 +44,7 @@ func main() {
 	flag.Parse()
 	log.Print("keel-node ", version, " protocols: ", builtProtocols())
 
+	certDir = filepath.Dir(*configPath)
 	n := &node{users: newRegistry(*statePath), running: make(map[string]*runningInbound), prober: newProber()}
 	n.handler = &handler{users: n.users}
 	config, err := loadConfig(*configPath, *master == "")

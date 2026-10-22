@@ -5,8 +5,10 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"log"
 	"net"
+	"strings"
 
 	anytls "github.com/anytls/sing-anytls"
 	"github.com/anytls/sing-anytls/padding"
@@ -24,12 +26,19 @@ type anytlsInbound struct {
 }
 
 func newAnyTLSInbound(config InboundConfig, h *handler) (inbound, error) {
-	cert, err := loadOrCreateCert(config.Cert, config.Key)
+	cert, err := anytlsCert(config)
 	if err != nil {
 		return nil, err
 	}
+	scheme := padding.DefaultPaddingScheme
+	if len(config.PaddingScheme) > 0 {
+		scheme = []byte(strings.Join(config.PaddingScheme, "\n"))
+		if padding.NewPaddingFactory(scheme) == nil {
+			return nil, errors.New("anytls: invalid padding_scheme (needs a stop=N line)")
+		}
+	}
 	service, err := anytls.NewService(anytls.ServiceConfig{
-		PaddingScheme: padding.DefaultPaddingScheme,
+		PaddingScheme: scheme,
 		Handler:       h,
 		Logger:        stdLogger{},
 	})
