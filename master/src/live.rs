@@ -90,6 +90,25 @@ pub struct Report {
     /// Present only in the first report after a probe round finished.
     pub probes: Vec<ProbeReport>,
     pub outbounds: Vec<OutboundHealth>,
+    pub certs: Vec<CertStatus>,
+}
+
+/// A certificate the node serves, as of its last report.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct CertStatus {
+    pub domain: String,
+    /// "acme" or "self-signed".
+    pub issuer: String,
+    pub not_after: i64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub error: String,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub next_try: i64,
+}
+
+fn is_zero(v: &i64) -> bool {
+    *v == 0
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -120,6 +139,7 @@ pub struct NodeLive {
     pub conns: HashMap<String, i64>,
     /// Exit health from the last report, by outbound tag.
     pub outbounds: HashMap<String, OutboundHealth>,
+    pub certs: Vec<CertStatus>,
     pub applied_rev: i64,
     pub apply_error: String,
     pub sent_rev: i64,

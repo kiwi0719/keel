@@ -130,6 +130,8 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     ("nodes", "anytls_pub", "INTEGER NOT NULL DEFAULT 0"),
     ("nodes", "vless_pub", "INTEGER NOT NULL DEFAULT 0"),
     ("exits", "pub_port", "INTEGER NOT NULL DEFAULT 0"),
+    // AnyTLS gets a Let's Encrypt cert for anytls_sni from the node itself.
+    ("nodes", "anytls_acme", "INTEGER NOT NULL DEFAULT 0"),
 ];
 
 /// Databases from before external exits have exits.node_id NOT NULL and no
@@ -252,6 +254,7 @@ pub struct Node {
     pub anytls_cert: String,
     pub anytls_key: String,
     pub anytls_pub: i64,
+    pub anytls_acme: bool,
     pub vless_on: bool,
     pub vless_port: i64,
     pub reality_dest: String,
@@ -297,7 +300,7 @@ impl Node {
     }
 }
 
-const NODE_COLS: &str = "id,code,name,role,host,last_ip,token,sort,ipv4_only,direct_list,anytls_on,anytls_port,anytls_sni,vless_on,vless_port,reality_dest,reality_sni,reality_private,reality_public,reality_short_id,ss_on,ss_port,ss_psk,default_exit,config_rev,default_fallback,anytls_cert,anytls_key,reality_fp,anytls_pub,vless_pub";
+const NODE_COLS: &str = "id,code,name,role,host,last_ip,token,sort,ipv4_only,direct_list,anytls_on,anytls_port,anytls_sni,vless_on,vless_port,reality_dest,reality_sni,reality_private,reality_public,reality_short_id,ss_on,ss_port,ss_psk,default_exit,config_rev,default_fallback,anytls_cert,anytls_key,reality_fp,anytls_pub,vless_pub,anytls_acme";
 
 fn node_from_row(r: &rusqlite::Row) -> rusqlite::Result<Node> {
     Ok(Node {
@@ -332,6 +335,7 @@ fn node_from_row(r: &rusqlite::Row) -> rusqlite::Result<Node> {
         reality_fp: r.get(28)?,
         anytls_pub: r.get(29)?,
         vless_pub: r.get(30)?,
+        anytls_acme: r.get(31)?,
     })
 }
 
@@ -445,6 +449,10 @@ pub struct World {
     /// (node id, name, period) -> up + down
     pub usage: HashMap<(i64, String, String), i64>,
     pub tz: i64,
+    /// ACME account email and Cloudflare API token (Zone DNS edit), shared
+    /// by every node that requests certificates.
+    pub acme_email: String,
+    pub cf_token: String,
 }
 
 impl World {
@@ -470,6 +478,8 @@ impl World {
 pub fn load_world(conn: &Connection) -> rusqlite::Result<World> {
     let mut w = World::default();
     w.tz = get_setting(conn, "tz_offset")?.and_then(|v| v.parse().ok()).unwrap_or(480);
+    w.acme_email = get_setting(conn, "acme_email")?.unwrap_or_default();
+    w.cf_token = get_setting(conn, "cf_token")?.unwrap_or_default();
     let mut st = conn.prepare(&format!("SELECT {NODE_COLS} FROM nodes ORDER BY sort, id"))?;
     w.nodes = st.query_map([], node_from_row)?.collect::<Result<_, _>>()?;
     let mut st = conn.prepare("SELECT id,COALESCE(node_id,0),name,port,psk,quota_bytes,reset_day,udp_over_tcp,sort,kind,server,uuid,method,pub_port FROM exits ORDER BY sort, id")?;

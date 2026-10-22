@@ -82,6 +82,24 @@ fn lines(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// How the node proves the domain: Cloudflare DNS when a token is set (works
+/// behind NAT), else TLS-ALPN on the AnyTLS listener when clients reach it on
+/// 443, else a temporary HTTP listener on :80.
+fn acme(w: &World, node: &Node) -> Value {
+    let public = if node.anytls_pub > 0 { node.anytls_pub } else { node.anytls_port };
+    let mut a = if !w.cf_token.is_empty() {
+        json!({"challenge": "dns", "dns_provider": "cloudflare", "dns_token": w.cf_token})
+    } else if public == 443 {
+        json!({"challenge": "tls-alpn"})
+    } else {
+        json!({"challenge": "http"})
+    };
+    if !w.acme_email.is_empty() {
+        a["email"] = json!(w.acme_email);
+    }
+    a
+}
+
 fn listen(port: i64) -> String {
     format!(":{port}")
 }
@@ -190,7 +208,9 @@ fn entry(w: &World, node: &Node, secret: &str, now: i64) -> Value {
     if node.anytls_on && node.anytls_port > 0 {
         // Without cert files the node keeps its own self-signed cert.
         let mut a = json!({"type": "anytls", "listen": listen(node.anytls_port)});
-        if !node.anytls_cert.is_empty() && !node.anytls_key.is_empty() {
+        if node.anytls_acme && !node.anytls_sni.is_empty() {
+            a["acme"] = acme(w, node);
+        } else if !node.anytls_cert.is_empty() && !node.anytls_key.is_empty() {
             a["cert"] = json!(node.anytls_cert);
             a["key"] = json!(node.anytls_key);
         }

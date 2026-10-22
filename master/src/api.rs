@@ -260,6 +260,7 @@ pub async fn state(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult
                 o.insert("sent_rev".into(), json!(l.sent_rev));
                 o.insert("apply_error".into(), json!(l.apply_error));
                 o.insert("health".into(), json!(l.outbounds));
+                o.insert("certs".into(), json!(l.certs));
                 let probes: Vec<Value> = targets
                     .iter()
                     .filter_map(|t| {
@@ -343,6 +344,9 @@ pub async fn state(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult
             "tz_offset": w.tz,
             "probe_targets": targets,
             "fingerprint": app.tls.as_ref().map(|t| t.cert_sha256.clone()),
+            "acme_email": w.acme_email,
+            // Never sent back: only whether it is set and its last 4 chars.
+            "cf_token_tail": if w.cf_token.is_empty() { String::new() } else { w.cf_token[w.cf_token.len().saturating_sub(4)..].to_string() },
         },
     }))
 }
@@ -451,7 +455,7 @@ pub async fn update_node(State(app): State<Arc<App>>, Path(id): Path<i64>, Json(
                     }
                     continue;
                 }
-                "ipv4_only" | "anytls_on" | "vless_on" | "ss_on" => (k.as_str(), json!(bool_field(v)?)),
+                "ipv4_only" | "anytls_on" | "vless_on" | "ss_on" | "anytls_acme" => (k.as_str(), json!(bool_field(v)?)),
                 "anytls_port" | "vless_port" | "ss_port" => (k.as_str(), json!(port_field(v)?)),
                 "anytls_pub" | "vless_pub" => (k.as_str(), json!(if v.is_null() || v.as_i64() == Some(0) { 0 } else { port_field(v)? })),
                 "default_exit" => {
@@ -876,6 +880,22 @@ pub async fn update_settings(State(app): State<Arc<App>>, Json(b): Json<Map<Stri
                 return Err(bad("面板地址应以 https:// 开头"));
             }
             db::set_setting(&conn, "panel_url", u.trim_end_matches('/')).map_err(internal)?;
+        }
+        if let Some(v) = b.get("acme_email") {
+            let s = str_field(v, 120)?;
+            if !s.is_empty() && !s.contains('@') {
+                return Err(bad("邮箱格式不对"));
+            }
+            db::set_setting(&conn, "acme_email", &s).map_err(internal)?;
+        }
+        // Empty or missing leaves the token as is; "-" clears it.
+        if let Some(v) = b.get("cf_token") {
+            let s = str_field(v, 200)?;
+            if s == "-" {
+                db::set_setting(&conn, "cf_token", "").map_err(internal)?;
+            } else if !s.is_empty() {
+                db::set_setting(&conn, "cf_token", &s).map_err(internal)?;
+            }
         }
         if let Some(v) = b.get("tz_offset") {
             db::set_setting(&conn, "tz_offset", &int_field(v, -720, 840)?.to_string()).map_err(internal)?;
