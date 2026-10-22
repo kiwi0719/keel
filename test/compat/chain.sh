@@ -7,6 +7,8 @@
 # go to exit2, whose SS outbound carries UDP over TCP; 127.0.0.3 goes direct;
 # everything else goes to exit1 (final) with native SS 2022 UDP. Each check
 # reads the exits' per-user counters to prove which way the traffic went.
+# Finally exit1 is stopped and started again: final is [exit1, exit2], so
+# traffic must fall back to exit2 and come back to exit1.
 #
 #   BIN=/path/to/clients test/compat/chain.sh      (needs xray-*)
 set -uo pipefail
@@ -25,7 +27,7 @@ MB=1048576
 
 "$WORK/helper" dest "$DEST" "$SNI" 2>/dev/null &
 "$WORK/helper" udpecho "0.0.0.0:$ECHO_PORT" &
-mkdir -p "$WORK/www" && head -c 20M /dev/urandom > "$WORK/www/20m.bin"
+mkdir -p "$WORK/www" && head -c 20M /dev/urandom > "$WORK/www/20m.bin" && echo ok > "$WORK/www/ok"
 WANT_SHA=$(sha256sum "$WORK/www/20m.bin" | cut -d' ' -f1)
 (cd "$WORK/www" && exec python3 -m http.server -b 0.0.0.0 $PORT >/dev/null 2>&1) &
 
@@ -37,6 +39,10 @@ UUID=$("$XRAY" uuid)
 PSK1=$(openssl rand -base64 16) KEY1=$(openssl rand -base64 16)
 PSK2=$(openssl rand -base64 16) KEY2=$(openssl rand -base64 16)
 
+start_exit() {
+  "$WORK/keel-node" -v -c "$WORK/exit$1/node.json" -state "$WORK/exit$1/usage.json" >> "$WORK/exit$1/node.log" 2>&1 &
+  eval "EXIT$1_PID=$!"
+}
 for i in 1 2; do
   psk=PSK$i key=KEY$i port=EXIT${i}_PORT
   mkdir -p "$WORK/exit$i"
@@ -44,8 +50,7 @@ for i in 1 2; do
 {"inbounds": [{"type": "ss2022", "listen": "127.0.0.1:${!port}", "password": "${!psk}"}],
  "users": [{"name": "entry", "ss_key": "${!key}"}]}
 JSON
-  "$WORK/keel-node" -v -c "$WORK/exit$i/node.json" -state "$WORK/exit$i/usage.json" > "$WORK/exit$i/node.log" 2>&1 &
-  eval "EXIT${i}_PID=$!"
+  start_exit $i
 done
 mkdir -p "$WORK/entry"
 cat > "$WORK/entry/node.json" <<JSON
@@ -55,7 +60,8 @@ cat > "$WORK/entry/node.json" <<JSON
       {"name": "ai", "domains": ["=localhost", "127.0.0.2/32"], "outbound": "exit2"},
       {"name": "direct", "domains": ["127.0.0.3"], "outbound": "direct"}
     ],
-    "final": "exit1"
+    "final": ["exit1", "exit2"],
+    "health_check": {"url": "http://127.0.0.1:$PORT/ok", "interval": "5s"}
   },
   "outbounds": [
     {"tag": "exit1", "type": "ss2022", "server": "127.0.0.1:$EXIT1_PORT", "password": "$PSK1:$KEY1"},
@@ -84,7 +90,7 @@ sleep 2
 # down <dir>: bytes the node in <dir> counted as sent to its user.
 down() {
   local pid_var=$(echo "$1" | tr a-z A-Z)_PID
-  kill -USR1 "${!pid_var}"; sleep 0.3
+  kill -USR1 "${!pid_var}" 2>/dev/null; sleep 0.3
   python3 -c "import json; u=json.load(open('$WORK/$1/usage.json'))['users']; print(sum(x['down'] for x in u.values()))"
 }
 PASS=0 FAIL=0
@@ -117,6 +123,24 @@ route_check "udp, ip rule -> exit2 (UDP over TCP)" exit2 "$WORK/helper" socksudp
 kill -USR1 $ENTRY_PID; sleep 0.3
 alice=$(python3 -c "import json; print(json.load(open('$WORK/entry/usage.json'))['users']['alice']['down'])")
 check "entry counts the user's traffic" $([ "$alice" -ge $((80*MB)) ] && echo 0 || echo 1) "(alice down $((alice/MB)) MB for 4 x 20 MB)"
+
+# Fallback: stop exit1, wait for the entry to notice, then bring it back.
+# wait_log <pattern> <seconds>: seconds it took for pattern to show up in the entry log.
+wait_log() {
+  local start=$SECONDS
+  until grep -q "$1" "$WORK/entry/node.log"; do
+    [ $((SECONDS - start)) -ge "$2" ] && { echo "timeout"; return 1; }
+    sleep 0.5
+  done
+  echo "$((SECONDS - start)) s"
+}
+kill -USR1 $EXIT1_PID; sleep 0.3; kill $EXIT1_PID; wait $EXIT1_PID 2>/dev/null
+took=$(wait_log "outbound exit1 is dead" 40); check "exit1 stopped: entry marks it dead" $? "($took)"
+route_check "tcp, final falls back to exit2" exit2 fetch 127.0.0.1
+route_check "udp, final falls back to exit2" exit2 "$WORK/helper" socksudp "$SOCKS" 127.0.0.1:$ECHO_PORT
+start_exit 1
+took=$(wait_log "outbound exit1 is alive again" 40); check "exit1 back: entry marks it alive" $? "($took)"
+route_check "tcp, final returns to exit1" exit1 fetch 127.0.0.1
 
 echo
 echo "passed $PASS, failed $FAIL"

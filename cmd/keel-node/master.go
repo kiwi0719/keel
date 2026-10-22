@@ -74,6 +74,8 @@ type reportMessage struct {
 	ConfigRev int64       `json:"config_rev"`
 	Users     []UserUsage `json:"users"`
 	System    SystemStats `json:"system"`
+	// Outbounds is the health of every outbound but direct.
+	Outbounds []OutboundStatus `json:"outbounds,omitempty"`
 	// Probes holds results of probe rounds finished since the previous
 	// report, so each round is sent once; omitted when there is none.
 	Probes []ProbeResult `json:"probes,omitempty"`
@@ -236,6 +238,7 @@ func (m *masterClient) report() reportMessage {
 		ConfigRev: m.node.rev(),
 		Users:     m.node.users.usage(),
 		System:    m.sampler.sample(),
+		Outbounds: currentRouter.Load().outboundStatus(),
 		Probes:    probes,
 	}
 }

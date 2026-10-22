@@ -87,6 +87,17 @@ keel-node -master https://panel.example:8443 -token <节点令牌> \
 - `tcp_retrans_pct`：和上一帧相比，整机重传的 TCP 段占发出段的百分比（来自 `/proc/net/snmp`）。
 - 非 Linux 系统上大部分字段是 0。
 
+`outbounds`（出口健康状态，入口节点才有，`direct` 不在里面）：
+
+```json
+"outbounds":[{"tag":"x3","alive":true,"latency_ms":182.4,"checked_at":1761099998},
+             {"tag":"x5","alive":false,"latency_ms":201.0,"checked_at":1761099997,"error":"dial tcp ...: connection refused"}]
+```
+
+- `alive`：节点现在是否认为这个出口能用。分流时跳过 `alive: false` 的出口。
+- `latency_ms`：最近一次检测成功时，经这个出口完成一次 HTTP 请求的耗时（包括入口到出口、出口到检测网址），不是单纯的入口到出口延迟。
+- `checked_at`：最近一次检测的时间，0 表示还没测过。`error` 是最近一次失败的原因，成功后清空。
+
 `probes`（三网 TCPing）：
 
 - 只在有新一轮测完时出现，每一轮只发一次；没有新结果的帧不带这个字段。主控存下来画图就行。
@@ -117,6 +128,25 @@ keel-node -master https://panel.example:8443 -token <节点令牌> \
 - 删用户：下发的配置里不再有这个用户，节点立刻断开他所有连接。
 - 恢复被封的用户：提高 `quota_bytes`、`used_base` 改小、改 `expire_at` 或换 `period`，下发后 1 秒内恢复。
 
+## 出口回退
+
+规则的 `outbound` 和 `route.final` 可以写一个标签，也可以写一个有顺序的列表：
+
+```json
+"route": {
+  "rules": [{"name":"ai","domains":["openai.com"],"outbound":["x3","x5"]}],
+  "final": ["x1","x2"],
+  "health_check": {"url":"http://www.gstatic.com/generate_204","interval":"15s"}
+}
+```
+
+- 每个连接用列表里第一个活着的出口；全挂了就用第一个（照样尝试）。
+- 节点每 `interval`（默认 15 秒，最小 5 秒）经每个出口请求一次 `url`（只支持 `http://`，默认 `http://www.gstatic.com/generate_204`），收到任何 HTTP 响应就算成功，5 秒超时。
+- 连续两次失败判为挂了，连续两次成功判为恢复。第一次失败（或挂掉后第一次成功）会在 2 秒后马上复查，所以出口停掉后大约 2 到 20 秒内切走，恢复后大约 2 到 20 秒内切回。本机回环测试里，停掉出口 7 秒后切走，恢复 5 秒后切回。
+- 正常连接连不上出口服务器时也会触发一次提前检测。
+- 切换只影响新连接，已经建立的连接留在原来的出口上。
+- 配置重载时，设置没变的出口保留健康状态。
+
 ## 主控生成配置的约定
 
 节点不关心名字的含义，下面是主控这边的命名习惯，便于对照日志：
@@ -124,5 +154,5 @@ keel-node -master https://panel.example:8443 -token <节点令牌> \
 - 出口节点在入口配置里的出站标签：`x<出口id>`，比如 `x3`。
 - 入口节点上的用户名：`u<用户id>`。
 - 出口节点上的用户名（每个入口一个）：`n<入口id>x<出口id>`。出口按这个名字统计每个入口走了多少流量。
-- 分流规则用 `domains` 直接写在配置里，不用 `file`（主控没法往节点上放文件）。顺序：直连名单放第一条（`outbound: "direct"`），然后是 AI、流媒体等规则集，最后 `final` 指向默认出口。
+- 分流规则用 `domains` 直接写在配置里，不用 `file`（主控没法往节点上放文件）。顺序：直连名单放第一条（`outbound: "direct"`），然后是 AI、流媒体等规则集，最后 `final` 指向默认出口。规则和 `final` 选了多个出口时按面板上的顺序写成列表。
 - AnyTLS 入站的 `cert` / `key`：两个文件都不存在时，节点会在那两个路径生成一张自签 ECDSA 证书（AnyTLS 客户端本来就不校验证书）；两个都留空则只在内存里生成。所以主控可以统一写 `/var/lib/keel/anytls.crt` 和 `/var/lib/keel/anytls.key`。

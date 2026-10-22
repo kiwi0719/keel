@@ -3,7 +3,7 @@
     "ipv4_only": true,
     "rules": [
       {"name": "direct", "file": "/etc/keel/direct.list", "outbound": "direct"},
-      {"name": "ai", "file": "/etc/keel/rules/ai.list", "outbound": "us"},
+      {"name": "ai", "file": "/etc/keel/rules/ai.list", "outbound": ["us", "uk"]},
       {"name": "streaming", "file": "/etc/keel/rules/streaming.list", "outbound": "jp-home"}
     ],
     "final": "uk"
