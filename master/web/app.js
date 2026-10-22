@@ -566,7 +566,7 @@ function nodeDrawer(d) {
         ${proto('anytls_on', 'AnyTLS', ownCert ? '自有证书，客户端校验' : '自签证书，客户端跳过校验', 'anytls_port', n.anytls_port)}
         <div class="fields two proto-opts">
           ${field('域名 · SNI', 'anytls_sni', n.anytls_sni, { placeholder: '比如 jp.example.com，留空不带 SNI' })}
-          ${field('对外端口（NAT 机）', 'anytls_pub', n.anytls_pub || '', { inputmode: 'numeric', placeholder: '留空同监听端口' })}
+          ${field('对外端口（NAT 映射才改）', 'anytls_pub', n.anytls_pub || n.anytls_port, { inputmode: 'numeric' })}
           ${field('证书文件（服务器上的路径）', 'anytls_cert', n.anytls_cert, { placeholder: '留空用自签' })}
           ${field('私钥文件', 'anytls_key', n.anytls_key, { placeholder: '留空用自签' })}
         </div>
@@ -575,7 +575,7 @@ function nodeDrawer(d) {
           ${field('SNI（多个用逗号隔开，第一个给订阅）', 'reality_sni', n.reality_sni, { full: true })}
           ${field('目标 dest', 'reality_dest', n.reality_dest, { placeholder: '留空为 ' + (sni0 || 'SNI') + ':443' })}
           ${field('Short ID', 'reality_short_id', n.reality_short_id, { placeholder: '十六进制，多个用逗号' })}
-          ${field('对外端口（NAT 机）', 'vless_pub', n.vless_pub || '', { inputmode: 'numeric', placeholder: '留空同监听端口' })}
+          ${field('对外端口（NAT 映射才改）', 'vless_pub', n.vless_pub || n.vless_port, { inputmode: 'numeric' })}
           <div class="field full">客户端指纹
             <div class="chips" role="group" aria-label="客户端指纹" style="margin-top:6px">${['chrome', 'firefox', 'safari', 'ios', 'android', 'edge', 'random'].map(v => `<button type="button" class="chip small-chip" data-act="fp" data-v="${v}" aria-pressed="${v === fp}">${v}</button>`).join('')}</div>
             <input type="hidden" name="reality_fp" value="${esc(fp)}">
@@ -597,7 +597,7 @@ function nodeDrawer(d) {
         <div class="fields three">
           <label class="field full">出口名称<input name="x${e.id}_name" value="${esc(e.name)}"></label>
           ${field('监听端口', `x${e.id}_port`, e.port, { inputmode: 'numeric' })}
-          ${field('对外端口（NAT 机）', `x${e.id}_pub`, e.pub_port || '', { inputmode: 'numeric', placeholder: '留空同监听' })}
+          ${field('对外端口', `x${e.id}_pub`, e.pub_port || e.port, { inputmode: 'numeric' })}
           ${field('月额度 GB', `x${e.id}_quota`, quotaGB(e.quota_bytes), { inputmode: 'numeric', placeholder: '不限' })}
           ${field('重置日', `x${e.id}_reset`, e.reset_day, { inputmode: 'numeric' })}
         </div>
@@ -785,8 +785,16 @@ function form() {
   return out;
 }
 function drawerError(msg) { S.drawerErr = msg; renderDrawer(); }
-// An optional port field: empty is 0 (unset), otherwise a number or null.
-function optPort(v) { return (v || '').trim() === '' ? 0 : int(v); }
+// A public port field, shown filled with the listen port. Stored as 0
+// ("same as listen") unless it really differs, so a port that followed the
+// listen port keeps following it when that changes. null = not a number.
+function pubPort(v, listen, oldPub, oldListen) {
+  if ((v || '').trim() === '') return 0;
+  const p = int(v);
+  if (p === null) return null;
+  if (p === listen || (!oldPub && p === oldListen)) return 0;
+  return p;
+}
 function int(v) { const s = String(v).trim(); return /^\d+$/.test(s) ? parseInt(s, 10) : null; }
 // GB as typed in a quota field; '' is unlimited (0). Decimals are allowed.
 function quotaBytes(v) {
@@ -910,7 +918,8 @@ const actions = {
       if (patch.reality_sni !== n.reality_sni && patch.reality_dest === oldSni + ':443') patch.reality_dest = '';
       if (!patch.anytls_cert !== !patch.anytls_key) return drawerError('证书和私钥要一起填，或者都留空用自签');
       if (patch.anytls_port !== null && patch.anytls_port === patch.vless_port) return drawerError('两个协议不能用同一个端口');
-      patch.anytls_pub = optPort(f.anytls_pub); patch.vless_pub = optPort(f.vless_pub);
+      patch.anytls_pub = pubPort(f.anytls_pub, patch.anytls_port, n.anytls_pub, n.anytls_port);
+      patch.vless_pub = pubPort(f.vless_pub, patch.vless_port, n.vless_pub, n.vless_port);
       for (const k of ['anytls_port', 'vless_port', 'anytls_pub', 'vless_pub']) if (patch[k] === null) return drawerError('端口要填数字');
     }
     try {
@@ -918,7 +927,7 @@ const actions = {
       if (n.role === 'exit') {
         for (const e of S.data.exits.filter(x => x.node_id === n.id)) {
           const quota = quotaBytes(f[`x${e.id}_quota`] || '');
-          const port = int(f[`x${e.id}_port`]), reset = int(f[`x${e.id}_reset`]), pub = optPort(f[`x${e.id}_pub`]);
+          const port = int(f[`x${e.id}_port`]), reset = int(f[`x${e.id}_reset`]), pub = pubPort(f[`x${e.id}_pub`], port, e.pub_port, e.port);
           if (quota === null || port === null || reset === null || pub === null) return drawerError('端口、额度、重置日要填数字');
           await api('PATCH', `/api/exits/${e.id}`, { name: f[`x${e.id}_name`], port, pub_port: pub, quota_bytes: quota, reset_day: reset, udp_over_tcp: f[`x${e.id}_uot`] === '1' });
         }
