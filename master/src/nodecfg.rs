@@ -1,0 +1,282 @@
+//! Builds the config each node runs, in keel-node's own JSON format
+//! (examples/entry.json, examples/exit.json), from the panel's data.
+
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+use crate::db::{Exit, Node, User, World};
+use crate::period::period_label;
+use crate::util::exit_key;
+
+pub const SS_METHOD: &str = "2022-blake3-aes-128-gcm";
+/// keel-node creates a self-signed pair here when neither file exists.
+pub const CERT_PATH: &str = "/var/lib/keel/anytls.crt";
+pub const KEY_PATH: &str = "/var/lib/keel/anytls.key";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProbeTarget {
+    pub name: String,
+    pub label: String,
+    pub host: String,
+}
+
+pub fn default_probe_targets() -> Vec<ProbeTarget> {
+    [("ct", "电信"), ("cu", "联通"), ("cm", "移动")]
+        .iter()
+        .map(|(n, l)| ProbeTarget { name: n.to_string(), label: l.to_string(), host: String::new() })
+        .collect()
+}
+
+pub fn user_counter(user: i64) -> String {
+    format!("u{user}")
+}
+
+pub fn exit_counter(entry: i64, exit: i64) -> String {
+    format!("n{entry}x{exit}")
+}
+
+/// The exit id an exit-node counter name belongs to.
+pub fn counter_exit(name: &str) -> Option<i64> {
+    let rest = name.strip_prefix('n')?;
+    let (entry, exit) = rest.split_once('x')?;
+    entry.parse::<i64>().ok()?;
+    exit.parse().ok()
+}
+
+pub fn user_period(w: &World, u: &User, now: i64) -> String {
+    let base = period_label(now, w.tz, u.reset_day as u32, 0);
+    if u.reset_seq > 0 && u.reset_period == base {
+        format!("{base}#{}", u.reset_seq)
+    } else {
+        base
+    }
+}
+
+pub fn user_used(w: &World, u: &User, now: i64) -> i64 {
+    w.used(&user_counter(u.id), &user_period(w, u, now), None)
+}
+
+pub fn exit_period(w: &World, e: &Exit, now: i64) -> String {
+    period_label(now, w.tz, e.reset_day as u32, 0)
+}
+
+pub fn exit_used(w: &World, e: &Exit, now: i64) -> i64 {
+    let period = exit_period(w, e, now);
+    w.usage
+        .iter()
+        .filter(|((n, name, p), _)| *n == e.node_id && *p == period && counter_exit(name) == Some(e.id))
+        .map(|(_, v)| *v)
+        .sum()
+}
+
+fn lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim())
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn listen(port: i64) -> String {
+    format!(":{port}")
+}
+
+/// The outbound tag for an exit, or None if entries cannot reach it yet
+/// (its node has no known address).
+fn exit_tag(w: &World, exit_id: i64) -> Option<String> {
+    let e = w.exit(exit_id)?;
+    let n = w.node(e.node_id)?;
+    (!n.address().is_empty()).then(|| format!("x{exit_id}"))
+}
+
+pub fn build(w: &World, node: &Node, secret: &str, probes: &[ProbeTarget], now: i64) -> Value {
+    let mut config = if node.is_entry() { entry(w, node, secret, now) } else { exit(w, node, secret, now) };
+    let probes: Vec<Value> = probes
+        .iter()
+        .filter(|p| !p.host.is_empty())
+        .map(|p| json!({"name": p.name, "host": p.host}))
+        .collect();
+    if !probes.is_empty() {
+        config["probes"] = Value::Array(probes);
+    }
+    config
+}
+
+fn entry(w: &World, node: &Node, secret: &str, now: i64) -> Value {
+    let mut rules = Vec::new();
+    let direct = lines(&node.direct_list);
+    if !direct.is_empty() {
+        rules.push(json!({"name": "direct", "domains": direct, "outbound": "direct"}));
+    }
+    let mut used_exits = Vec::new();
+    for r in w.rules_of(node.id) {
+        let outbound = if r.exit_id == 0 {
+            "direct".to_string()
+        } else {
+            match exit_tag(w, r.exit_id) {
+                Some(tag) => {
+                    used_exits.push(r.exit_id);
+                    tag
+                }
+                // Unreachable exit: leave the rule out so traffic follows the
+                // default instead of failing validation on the node.
+                None => continue,
+            }
+        };
+        let Some(set) = w.rulesets.iter().find(|s| s.id == r.ruleset) else { continue };
+        rules.push(json!({"name": set.id, "domains": lines(&set.domains), "outbound": outbound}));
+    }
+    let mut route = json!({"ipv4_only": node.ipv4_only});
+    if !rules.is_empty() {
+        route["rules"] = Value::Array(rules);
+    }
+    if node.default_exit != 0 {
+        if let Some(tag) = exit_tag(w, node.default_exit) {
+            used_exits.push(node.default_exit);
+            route["final"] = json!(tag);
+        }
+    }
+    used_exits.sort_unstable();
+    used_exits.dedup();
+    let outbounds: Vec<Value> = used_exits
+        .iter()
+        .filter_map(|id| {
+            let e = w.exit(*id)?;
+            let n = w.node(e.node_id)?;
+            let mut o = json!({
+                "tag": format!("x{id}"),
+                "type": "ss2022",
+                "server": format!("{}:{}", n.address(), e.port),
+                "method": SS_METHOD,
+                "password": format!("{}:{}", e.psk, exit_key(secret, node.id, e.id)),
+            });
+            if e.udp_over_tcp {
+                o["udp_over_tcp"] = json!(true);
+            }
+            Some(o)
+        })
+        .collect();
+
+    let mut inbounds = Vec::new();
+    if node.anytls_on && node.anytls_port > 0 {
+        inbounds.push(json!({"type": "anytls", "listen": listen(node.anytls_port), "cert": CERT_PATH, "key": KEY_PATH}));
+    }
+    if node.vless_on && node.vless_port > 0 {
+        inbounds.push(json!({
+            "type": "vless",
+            "listen": listen(node.vless_port),
+            "reality": {
+                "dest": node.reality_dest,
+                "server_names": [node.reality_sni],
+                "private_key": node.reality_private,
+                "short_ids": [node.reality_short_id],
+            }
+        }));
+    }
+    if node.ss_on && node.ss_port > 0 {
+        inbounds.push(json!({"type": "ss2022", "listen": listen(node.ss_port), "method": SS_METHOD, "password": node.ss_psk}));
+    }
+
+    let users: Vec<Value> = w
+        .users
+        .iter()
+        .filter(|u| u.enabled && w.user_entries.get(&u.id).is_some_and(|e| e.contains(&node.id)))
+        .map(|u| {
+            let period = user_period(w, u, now);
+            let mut v = json!({
+                "name": user_counter(u.id),
+                "anytls_password": u.anytls_password,
+                "uuid": u.uuid,
+                "flow": "xtls-rprx-vision",
+                "ss_key": u.ss_key,
+                "period": period,
+            });
+            if u.quota_bytes > 0 {
+                v["quota_bytes"] = json!(u.quota_bytes);
+                let base = w.used(&user_counter(u.id), &period, Some(node.id));
+                if base > 0 {
+                    v["used_base"] = json!(base);
+                }
+            }
+            if u.expire_at > 0 {
+                v["expire_at"] = json!(u.expire_at);
+            }
+            v
+        })
+        .collect();
+
+    let mut config = json!({"route": route, "inbounds": inbounds, "users": users});
+    if !outbounds.is_empty() {
+        config["outbounds"] = Value::Array(outbounds);
+    }
+    config
+}
+
+fn exit(w: &World, node: &Node, secret: &str, now: i64) -> Value {
+    let exits: Vec<&Exit> = w.exits.iter().filter(|e| e.node_id == node.id).collect();
+    let inbounds: Vec<Value> = exits
+        .iter()
+        .map(|e| json!({"type": "ss2022", "listen": listen(e.port), "method": SS_METHOD, "password": e.psk}))
+        .collect();
+    let mut users = Vec::new();
+    for entry in w.nodes.iter().filter(|n| n.is_entry()) {
+        for e in &exits {
+            let name = exit_counter(entry.id, e.id);
+            let period = exit_period(w, e, now);
+            let mut v = json!({"name": name, "ss_key": exit_key(secret, entry.id, e.id), "period": period});
+            if e.quota_bytes > 0 {
+                // Each exit port has one monthly quota shared by all entries:
+                // every entry's counter carries what the others used.
+                let others: i64 = w
+                    .usage
+                    .iter()
+                    .filter(|((n, nm, p), _)| *n == node.id && *p == period && *nm != name && counter_exit(nm) == Some(e.id))
+                    .map(|(_, v)| *v)
+                    .sum();
+                v["quota_bytes"] = json!(e.quota_bytes);
+                if others > 0 {
+                    v["used_base"] = json!(others);
+                }
+            }
+            users.push(v);
+        }
+    }
+    json!({"route": {"ipv4_only": node.ipv4_only}, "inbounds": inbounds, "users": users})
+}
+
+/// Leaves out inbounds of protocols the node's binary was built without, so
+/// the rest of the config is still accepted. `built` is from its hello.
+pub fn drop_unsupported(config: &mut Value, built: &[String]) {
+    if built.is_empty() {
+        return;
+    }
+    if let Some(inbounds) = config.get_mut("inbounds").and_then(Value::as_array_mut) {
+        inbounds.retain(|i| i["type"].as_str().is_some_and(|t| built.iter().any(|b| b == t)));
+    }
+}
+
+/// The config with every used_base removed: a change here is pushed at once,
+/// while used_base alone only changes every minute or so.
+pub fn shape(config: &Value) -> Value {
+    let mut c = config.clone();
+    if let Some(users) = c.get_mut("users").and_then(Value::as_array_mut) {
+        for u in users {
+            if let Some(o) = u.as_object_mut() {
+                o.remove("used_base");
+            }
+        }
+    }
+    c
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counters() {
+        assert_eq!(counter_exit(&exit_counter(3, 12)), Some(12));
+        assert_eq!(counter_exit("u4"), None);
+        assert_eq!(counter_exit("nax2"), None);
+    }
+}

@@ -5,7 +5,7 @@
 - **keel-node**（Go，本仓库 `cmd/keel-node`）：每台服务器一个进程，跑代理、按用户统计流量、在本地执行额度和到期。节点分两种角色，用的是同一个程序：
   - **入口**：用 AnyTLS / VLESS Reality 接客户端，按用户计流量和额度，再按规则把流量分给不同出口（经 SS 2022），或者直连、走 SOCKS。
   - **出口**：只开 SS 2022，每个入口在出口上是一个用户。
-- **主控**（Rust，网页面板 + SQLite）：正在写。节点主动用 WebSocket over TLS 连主控，节点自己不开任何管理端口。协议见 [docs/node-protocol.md](docs/node-protocol.md)。
+- **keel-master**（Rust，本仓库 `master/`）：网页面板 + SQLite + 订阅链接，一个进程一个端口。节点主动用 WebSocket over TLS 连主控，节点自己不开任何管理端口。协议见 [docs/node-protocol.md](docs/node-protocol.md)。
 
 ## keel-node
 
@@ -91,6 +91,36 @@ BIN=/path/to/clients test/compat/chain.sh    # 入口 → 两个出口的分流�
 握手方式：Xray 的 chrome / firefox / safari 指纹用 X25519MLKEM768，ios / edge 指纹、mihomo、sing-box 用传统 X25519，节点两种都接受。另外，没有合法 Reality 凭据的连接（openssl 直连、HTTPS 请求、错误 shortId 的 Xray 客户端）看到的都是 dest 网站本身的证书和内容。
 
 Xray 的 Reality 服务端从 2026 年 9 月起要求客户端带 X25519MLKEM768，所以 sing-box 这类客户端连 Xray 服务端会失败；keel-node 不做这个限制。ML-DSA-65 签名不支持（开了连 Xray 自己的客户端都连不上）。
+
+## keel-master
+
+一个进程：网页面板、SQLite、订阅链接、节点控制通道，全在同一个 HTTPS 端口上。release 构建 3.5 MB，带两个节点、面板每 2 秒刷新时常驻内存约 7 MB。
+
+### 构建和启动
+
+```sh
+make master                    # 生成 master/target/release/keel-master
+keel-master -data /var/lib/keel-master -listen 0.0.0.0:8443
+```
+
+- 第一次启动会在日志里打印面板密码，进去后在「设置」里改；忘了可以 `keel-master -data ... -password 新密码`。
+- 不给证书时会在 `数据目录/tls/` 生成自签证书，节点按指纹认它（安装命令里自动带上），浏览器会提示不安全。有域名证书就用 `-cert fullchain.pem -key key.pem`；放在 Caddy / nginx 后面就用 `-no-tls -listen 127.0.0.1:8080`（反代要转发 WebSocket）。
+- 数据库是 `数据目录/keel.db`（WAL 模式，备份时连 `-wal`、`-shm` 一起拷，或者先停服务）。
+- 节点安装脚本从主控下载 keel-node：把 `make node-linux` 编出来的文件改名放进 `数据目录/dist/`，叫 `keel-node-linux-amd64`、`keel-node-linux-arm64`。
+
+### 面板
+
+三个页面，每个对象只有一个右侧抽屉，手机上单列、全程不需要左右滑动：
+
+- **探针**：总速率、在线数、本月流量；每台节点的 CPU、内存、硬盘、速率、本月流量、开机时长。点开卡片看到国内三网（电信 / 联通 / 移动）的延迟、波动、重传和近 1 小时曲线（测速目标在「设置」里填，节点每 30 秒 TCPing 一轮）。
+- **线路**：入口卡片上点一下出口就是改默认出口；分流按规则集（AI、YouTube、流媒体、Telegram、游戏、Google，名单在 [rules/](rules/)）各选一个出口或直连。下面是出口卡片，显示额度和哪些入口在用。改完立刻下发，节点热更新，现有连接不断。
+- **用户**：额度、到期日、每月重置日、可用入口，一个订阅链接。Stash / Clash / mihomo 拿到 Clash 配置，其他客户端拿到 vless:// anytls:// ss:// 通用链接。
+
+### 额度怎么算
+
+- 用户的流量是他在所有入口上的总和。每个入口节点本地按「本期在其他节点用掉的（主控下发的 `used_base`）+ 本机用掉的」卡额度，主控断线也照样生效，误差是两次下发之间别的节点新增的流量（主控至少每分钟更新一次）。
+- 重置日按「设置」里的时区算，31 号在小月就是月底。「清零流量」是给这个用户换一个新的计费周期，各节点的计数立即从零开始。
+- 出口端口的月额度（比如家宽 900G / 月）用同样的办法：出口节点上每个入口是一个用户，共用这个端口的额度。
 
 ## 许可
 

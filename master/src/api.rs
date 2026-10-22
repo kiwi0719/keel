@@ -1,0 +1,687 @@
+//! Panel JSON API. Every edit ends with App::sync, which pushes the changed
+//! node configs right away.
+
+use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::Argon2;
+use axum::extract::{Path, Request, State};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use rusqlite::{params, Connection};
+use serde::Deserialize;
+use serde_json::{json, Map, Value};
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::app::App;
+use crate::db;
+use crate::nodecfg::{self, ProbeTarget};
+use crate::period::{format_date_end, month_label, now, parse_date_end, period_end};
+use crate::util::{random_b64, random_hex};
+
+pub type ApiResult = Result<Response, Response>;
+
+fn bad(msg: impl Into<String>) -> Response {
+    (StatusCode::BAD_REQUEST, Json(json!({"error": msg.into()}))).into_response()
+}
+
+fn internal(e: impl std::fmt::Display) -> Response {
+    eprintln!("api: {e}");
+    (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "内部错误"}))).into_response()
+}
+
+fn ok(v: Value) -> ApiResult {
+    Ok(Json(v).into_response())
+}
+
+const SESSION_COOKIE: &str = "keel_session";
+const SESSION_DAYS: i64 = 30;
+
+// ---------- auth ----------
+
+pub fn hash_password(pw: &str) -> String {
+    let salt = SaltString::encode_b64(&crate::util::random_bytes(16)).expect("salt");
+    Argon2::default().hash_password(pw.as_bytes(), &salt).expect("hash").to_string()
+}
+
+fn verify_password(conn: &Connection, pw: &str) -> bool {
+    let Some(stored) = db::get_setting(conn, "admin_hash").ok().flatten() else { return false };
+    let Ok(parsed) = PasswordHash::new(&stored) else { return false };
+    Argon2::default().verify_password(pw.as_bytes(), &parsed).is_ok()
+}
+
+fn session_token(headers: &HeaderMap) -> Option<String> {
+    let cookies = headers.get(header::COOKIE)?.to_str().ok()?;
+    cookies.split(';').find_map(|c| {
+        let (k, v) = c.trim().split_once('=')?;
+        (k == SESSION_COOKIE).then(|| v.to_string())
+    })
+}
+
+pub fn logged_in(app: &App, headers: &HeaderMap) -> bool {
+    let Some(token) = session_token(headers) else { return false };
+    let conn = app.db();
+    conn.query_row("SELECT 1 FROM sessions WHERE token=?1 AND expires>?2", params![token, now()], |_| Ok(()))
+        .is_ok()
+}
+
+pub async fn require_login(State(app): State<Arc<App>>, req: Request, next: Next) -> Response {
+    if logged_in(&app, req.headers()) {
+        next.run(req).await
+    } else {
+        (StatusCode::UNAUTHORIZED, Json(json!({"error": "请先登录"}))).into_response()
+    }
+}
+
+#[derive(Deserialize)]
+pub struct Login {
+    password: String,
+}
+
+pub async fn login(State(app): State<Arc<App>>, Json(body): Json<Login>) -> ApiResult {
+    let good = verify_password(&app.db(), &body.password);
+    if !good {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        return Err((StatusCode::UNAUTHORIZED, Json(json!({"error": "密码不对"}))).into_response());
+    }
+    let token = random_hex(24);
+    app.db()
+        .execute("INSERT INTO sessions(token,expires) VALUES(?1,?2)", params![token, now() + SESSION_DAYS * 86_400])
+        .map_err(internal)?;
+    let secure = if app.tls.is_some() { "; Secure" } else { "" };
+    let cookie = format!(
+        "{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{secure}",
+        SESSION_DAYS * 86_400
+    );
+    Ok(([(header::SET_COOKIE, cookie)], Json(json!({"ok": true}))).into_response())
+}
+
+pub async fn logout(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult {
+    if let Some(token) = session_token(&headers) {
+        let _ = app.db().execute("DELETE FROM sessions WHERE token=?1", [token]);
+    }
+    let cookie = format!("{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0");
+    Ok(([(header::SET_COOKIE, cookie)], Json(json!({"ok": true}))).into_response())
+}
+
+// ---------- helpers ----------
+
+/// The URL nodes and subscription clients use for this master.
+pub fn base_url(app: &App, headers: &HeaderMap) -> String {
+    if let Some(u) = db::get_setting(&app.db(), "panel_url").ok().flatten().filter(|u| !u.is_empty()) {
+        return u.trim_end_matches('/').to_string();
+    }
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("localhost");
+    let scheme = if app.tls.is_some() {
+        "https"
+    } else {
+        headers.get("x-forwarded-proto").and_then(|v| v.to_str().ok()).unwrap_or("http")
+    };
+    format!("{scheme}://{host}")
+}
+
+pub fn install_command(app: &App, base: &str, token: &str) -> String {
+    let pin = app.tls.as_ref().and_then(|t| t.spki_pin.as_ref());
+    let curl = match pin {
+        Some(p) => format!("curl -fsSLk --pinnedpubkey 'sha256//{p}'"),
+        None => "curl -fsSL".to_string(),
+    };
+    let mut cmd = format!("{curl} {base}/install.sh | sh -s -- --master {base} --token {token}");
+    if let (Some(p), Some(t)) = (pin, &app.tls) {
+        cmd.push_str(&format!(" --fingerprint {} --pin '{p}'", t.cert_sha256));
+    }
+    cmd
+}
+
+fn str_field(v: &Value, max: usize) -> Result<String, Response> {
+    let s = v.as_str().ok_or_else(|| bad("应为文字"))?.trim().to_string();
+    if s.chars().count() > max {
+        return Err(bad(format!("太长了（最多 {max} 个字）")));
+    }
+    Ok(s)
+}
+
+fn port_field(v: &Value) -> Result<i64, Response> {
+    let p = v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())).ok_or_else(|| bad("端口应为数字"))?;
+    if !(1..=65535).contains(&p) {
+        return Err(bad("端口应在 1–65535"));
+    }
+    Ok(p)
+}
+
+fn int_field(v: &Value, min: i64, max: i64) -> Result<i64, Response> {
+    let n = v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)).ok_or_else(|| bad("应为数字"))?;
+    if n < min || n > max {
+        return Err(bad(format!("应在 {min}–{max}")));
+    }
+    Ok(n)
+}
+
+fn bool_field(v: &Value) -> Result<bool, Response> {
+    v.as_bool().ok_or_else(|| bad("应为开或关"))
+}
+
+fn exists(conn: &Connection, table: &str, id: i64) -> bool {
+    conn.query_row(&format!("SELECT 1 FROM {table} WHERE id=?1"), [id], |_| Ok(())).is_ok()
+}
+
+// ---------- state ----------
+
+pub async fn state(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult {
+    let ts = now();
+    let base = base_url(&app, &headers);
+    let conn = app.db();
+    let w = db::load_world(&conn).map_err(internal)?;
+    let months = db::node_months(&conn, &month_label(ts, w.tz)).map_err(internal)?;
+    let targets = App::probe_targets(&conn);
+    let panel_url = db::get_setting(&conn, "panel_url").ok().flatten().unwrap_or_default();
+    drop(conn);
+    let live = app.live();
+
+    let mut month_total = 0i64;
+    let mut online = 0;
+    let nodes: Vec<Value> = w
+        .nodes
+        .iter()
+        .map(|n| {
+            let mut v = serde_json::to_value(n).unwrap_or_default();
+            let o = v.as_object_mut().expect("object");
+            let (mrx, mtx) = months.get(&n.id).copied().unwrap_or((0, 0));
+            month_total += mrx + mtx;
+            o.insert("month_rx".into(), json!(mrx));
+            o.insert("month_tx".into(), json!(mtx));
+            o.insert("token_tail".into(), json!(&n.token[n.token.len().saturating_sub(4)..]));
+            o.insert("address".into(), json!(n.address()));
+            o.insert(
+                "rules".into(),
+                json!(w.rules_of(n.id).map(|r| json!({"ruleset": r.ruleset, "exit_id": r.exit_id})).collect::<Vec<_>>()),
+            );
+            let l = live.nodes.get(&n.id);
+            let is_online = l.is_some_and(|l| l.online());
+            if is_online {
+                online += 1;
+            }
+            o.insert("online".into(), json!(is_online));
+            if let Some(l) = l {
+                o.insert("last_seen".into(), json!(l.last_seen));
+                o.insert("connected_at".into(), json!(l.connected_at));
+                o.insert("version".into(), json!(l.hello.node_version));
+                o.insert("protocols".into(), json!(l.hello.protocols));
+                o.insert("system".into(), json!(l.system));
+                o.insert("conns".into(), json!(l.conns.values().sum::<i64>()));
+                o.insert("applied_rev".into(), json!(l.applied_rev));
+                o.insert("sent_rev".into(), json!(l.sent_rev));
+                o.insert("apply_error".into(), json!(l.apply_error));
+                let probes: Vec<Value> = targets
+                    .iter()
+                    .filter_map(|t| {
+                        let h = l.probes.get(&t.name)?;
+                        let last = h.back()?;
+                        let ok: Vec<f64> = h.iter().map(|p| p.latency).filter(|x| *x > 0.0).collect();
+                        Some(json!({
+                            "name": t.name, "label": t.label,
+                            "latency": last.latency, "jitter": last.jitter, "loss": last.loss,
+                            "min": ok.iter().cloned().fold(f64::INFINITY, f64::min).min(1e9),
+                            "max": ok.iter().cloned().fold(0.0, f64::max),
+                            "points": h.iter().map(|p| (p.latency * 10.0).round() / 10.0).collect::<Vec<_>>(),
+                            "since": h.front().map(|p| p.ts),
+                        }))
+                    })
+                    .collect();
+                o.insert("probes".into(), json!(probes));
+            }
+            v
+        })
+        .collect();
+
+    let exits: Vec<Value> = w
+        .exits
+        .iter()
+        .map(|e| {
+            let mut v = serde_json::to_value(e).unwrap_or_default();
+            let o = v.as_object_mut().expect("object");
+            o.insert("used".into(), json!(nodecfg::exit_used(&w, e, ts)));
+            o.insert("period_end".into(), json!(period_end(ts, w.tz, e.reset_day as u32)));
+            v
+        })
+        .collect();
+
+    let users: Vec<Value> = w
+        .users
+        .iter()
+        .map(|u| {
+            let used = nodecfg::user_used(&w, u, ts);
+            let status = if !u.enabled {
+                "disabled"
+            } else if u.expire_at > 0 && ts >= u.expire_at {
+                "expired"
+            } else if u.quota_bytes > 0 && used >= u.quota_bytes {
+                "over"
+            } else if u.quota_bytes > 0 && used * 10 >= u.quota_bytes * 9 {
+                "warn"
+            } else {
+                "ok"
+            };
+            let counter = nodecfg::user_counter(u.id);
+            let conns: i64 = live.nodes.values().filter_map(|l| l.conns.get(&counter)).sum();
+            let mut v = serde_json::to_value(u).unwrap_or_default();
+            let o = v.as_object_mut().expect("object");
+            o.insert("used".into(), json!(used));
+            o.insert("status".into(), json!(status));
+            o.insert("conns".into(), json!(conns));
+            o.insert("expire_date".into(), json!(format_date_end(u.expire_at, w.tz)));
+            o.insert("period_end".into(), json!(period_end(ts, w.tz, u.reset_day as u32)));
+            o.insert("entries".into(), json!(w.user_entries.get(&u.id).cloned().unwrap_or_default()));
+            o.insert("sub_url".into(), json!(format!("{base}/s/{}", u.sub_token)));
+            v
+        })
+        .collect();
+
+    ok(json!({
+        "now": ts,
+        "nodes": nodes,
+        "exits": exits,
+        "rulesets": w.rulesets,
+        "users": users,
+        "summary": {
+            "speed": live.speed.iter().map(|(rx, tx)| [rx.round(), tx.round()]).collect::<Vec<_>>(),
+            "online": online,
+            "month": month_total,
+        },
+        "settings": {
+            "panel_url": panel_url,
+            "base_url": base,
+            "tz_offset": w.tz,
+            "probe_targets": targets,
+            "fingerprint": app.tls.as_ref().map(|t| t.cert_sha256.clone()),
+        },
+    }))
+}
+
+// ---------- nodes ----------
+
+#[derive(Deserialize)]
+pub struct NewNode {
+    role: String,
+    code: String,
+    name: String,
+}
+
+pub async fn create_node(State(app): State<Arc<App>>, headers: HeaderMap, Json(b): Json<NewNode>) -> ApiResult {
+    if b.role != "entry" && b.role != "exit" {
+        return Err(bad("角色只能是入口或出口"));
+    }
+    let code = str_field(&json!(b.code), 8)?.to_uppercase();
+    let name = str_field(&json!(b.name), 40)?;
+    if code.is_empty() {
+        return Err(bad("请填代号，比如 JP"));
+    }
+    let id = {
+        let conn = app.db();
+        let id = db::insert_node(&conn, &b.role, &code, if name.is_empty() { &code } else { &name }, now()).map_err(internal)?;
+        if b.role == "exit" {
+            conn.execute(
+                "INSERT INTO exits(node_id,name,port,psk,reset_day,sort) VALUES(?1,?2,?3,?4,1,0)",
+                params![id, code, 20730, random_b64(16)],
+            )
+            .map_err(internal)?;
+        }
+        id
+    };
+    let token: String = app.db().query_row("SELECT token FROM nodes WHERE id=?1", [id], |r| r.get(0)).map_err(internal)?;
+    let base = base_url(&app, &headers);
+    ok(json!({"id": id, "install": install_command(&app, &base, &token)}))
+}
+
+pub async fn update_node(State(app): State<Arc<App>>, Path(id): Path<i64>, Json(b): Json<Map<String, Value>>) -> ApiResult {
+    {
+        let conn = app.db();
+        if !exists(&conn, "nodes", id) {
+            return Err(bad("没有这个节点"));
+        }
+        for (k, v) in &b {
+            let (col, val): (&str, Value) = match k.as_str() {
+                "code" => {
+                    let s = str_field(v, 8)?.to_uppercase();
+                    if s.is_empty() {
+                        return Err(bad("代号不能为空"));
+                    }
+                    ("code", json!(s))
+                }
+                "name" => ("name", json!(str_field(v, 40)?)),
+                "host" => ("host", json!(str_field(v, 255)?)),
+                "direct_list" => ("direct_list", json!(str_field(v, 200_000)?)),
+                "anytls_sni" => ("anytls_sni", json!(str_field(v, 255)?)),
+                "reality_dest" => ("reality_dest", json!(str_field(v, 255)?)),
+                "reality_sni" => ("reality_sni", json!(str_field(v, 255)?)),
+                "ipv4_only" | "anytls_on" | "vless_on" | "ss_on" => (k.as_str(), json!(bool_field(v)?)),
+                "anytls_port" | "vless_port" | "ss_port" => (k.as_str(), json!(port_field(v)?)),
+                "default_exit" => {
+                    let e = int_field(v, 0, i64::MAX)?;
+                    if e != 0 && !exists(&conn, "exits", e) {
+                        return Err(bad("没有这个出口"));
+                    }
+                    ("default_exit", json!(e))
+                }
+                _ => return Err(bad(format!("不能改 {k}"))),
+            };
+            let val: rusqlite::types::Value = match val {
+                Value::Bool(b) => rusqlite::types::Value::Integer(b as i64),
+                Value::Number(n) => rusqlite::types::Value::Integer(n.as_i64().unwrap_or(0)),
+                Value::String(s) => rusqlite::types::Value::Text(s),
+                _ => rusqlite::types::Value::Null,
+            };
+            conn.execute(&format!("UPDATE nodes SET {col}=?1 WHERE id=?2"), params![val, id]).map_err(internal)?;
+        }
+    }
+    app.sync();
+    ok(json!({"ok": true}))
+}
+
+#[derive(Deserialize)]
+pub struct Rules {
+    rules: Vec<RuleRow>,
+}
+
+#[derive(Deserialize)]
+pub struct RuleRow {
+    ruleset: String,
+    exit_id: i64,
+}
+
+pub async fn set_rules(State(app): State<Arc<App>>, Path(id): Path<i64>, Json(b): Json<Rules>) -> ApiResult {
+    {
+        let mut conn = app.db();
+        let tx = conn.transaction().map_err(internal)?;
+        let role: String = tx.query_row("SELECT role FROM nodes WHERE id=?1", [id], |r| r.get(0)).map_err(|_| bad("没有这个节点"))?;
+        if role != "entry" {
+            return Err(bad("只有入口有分流"));
+        }
+        tx.execute("DELETE FROM entry_rules WHERE node_id=?1", [id]).map_err(internal)?;
+        for (i, r) in b.rules.iter().enumerate() {
+            if r.exit_id != 0 && !exists(&tx, "exits", r.exit_id) {
+                return Err(bad("没有这个出口"));
+            }
+            tx.execute(
+                "INSERT OR REPLACE INTO entry_rules(node_id,ruleset,exit_id,sort) VALUES(?1,?2,?3,?4)",
+                params![id, r.ruleset, r.exit_id, i as i64],
+            )
+            .map_err(|_| bad("没有这个规则集"))?;
+        }
+        tx.commit().map_err(internal)?;
+    }
+    app.sync();
+    ok(json!({"ok": true}))
+}
+
+pub async fn rotate_token(State(app): State<Arc<App>>, headers: HeaderMap, Path(id): Path<i64>) -> ApiResult {
+    let token = random_hex(24);
+    let n = app.db().execute("UPDATE nodes SET token=?1 WHERE id=?2", params![token, id]).map_err(internal)?;
+    if n == 0 {
+        return Err(bad("没有这个节点"));
+    }
+    app.kick(id);
+    let base = base_url(&app, &headers);
+    ok(json!({"install": install_command(&app, &base, &token)}))
+}
+
+pub async fn install_of(State(app): State<Arc<App>>, headers: HeaderMap, Path(id): Path<i64>) -> ApiResult {
+    let token: String =
+        app.db().query_row("SELECT token FROM nodes WHERE id=?1", [id], |r| r.get(0)).map_err(|_| bad("没有这个节点"))?;
+    let base = base_url(&app, &headers);
+    ok(json!({"install": install_command(&app, &base, &token)}))
+}
+
+pub async fn delete_node(State(app): State<Arc<App>>, Path(id): Path<i64>) -> ApiResult {
+    {
+        let mut conn = app.db();
+        let tx = conn.transaction().map_err(internal)?;
+        let exits: Vec<i64> = {
+            let mut st = tx.prepare("SELECT id FROM exits WHERE node_id=?1").map_err(internal)?;
+            let rows = st.query_map([id], |r| r.get(0)).map_err(internal)?;
+            rows.collect::<Result<_, _>>().map_err(internal)?
+        };
+        for e in exits {
+            forget_exit(&tx, e).map_err(internal)?;
+        }
+        tx.execute("DELETE FROM nodes WHERE id=?1", [id]).map_err(internal)?;
+        tx.commit().map_err(internal)?;
+    }
+    app.kick(id);
+    app.live().nodes.remove(&id);
+    app.sync();
+    ok(json!({"ok": true}))
+}
+
+/// Points everything that used an exit back to the default / direct.
+fn forget_exit(conn: &Connection, exit: i64) -> rusqlite::Result<()> {
+    conn.execute("UPDATE nodes SET default_exit=0 WHERE default_exit=?1", [exit])?;
+    conn.execute("DELETE FROM entry_rules WHERE exit_id=?1", [exit])?;
+    conn.execute("DELETE FROM exits WHERE id=?1", [exit])?;
+    Ok(())
+}
+
+// ---------- exits ----------
+
+fn apply_exit_fields(conn: &Connection, id: i64, b: &Map<String, Value>) -> Result<(), Response> {
+    for (k, v) in b {
+        let (col, val): (&str, rusqlite::types::Value) = match k.as_str() {
+            "name" => {
+                let s = str_field(v, 40)?;
+                if s.is_empty() {
+                    return Err(bad("名称不能为空"));
+                }
+                ("name", s.into())
+            }
+            "port" => ("port", port_field(v)?.into()),
+            "quota_bytes" => ("quota_bytes", int_field(v, 0, i64::MAX / 2)?.into()),
+            "reset_day" => ("reset_day", int_field(v, 1, 31)?.into()),
+            "udp_over_tcp" => ("udp_over_tcp", (bool_field(v)? as i64).into()),
+            "node_id" => continue,
+            _ => return Err(bad(format!("不能改 {k}"))),
+        };
+        conn.execute(&format!("UPDATE exits SET {col}=?1 WHERE id=?2"), params![val, id]).map_err(internal)?;
+    }
+    Ok(())
+}
+
+pub async fn create_exit(State(app): State<Arc<App>>, Json(b): Json<Map<String, Value>>) -> ApiResult {
+    let id = {
+        let mut conn = app.db();
+        let tx = conn.transaction().map_err(internal)?;
+        let node = b.get("node_id").and_then(Value::as_i64).ok_or_else(|| bad("缺少节点"))?;
+        let role: String = tx.query_row("SELECT role FROM nodes WHERE id=?1", [node], |r| r.get(0)).map_err(|_| bad("没有这个节点"))?;
+        if role != "exit" {
+            return Err(bad("只有出口节点能加 SS 端口"));
+        }
+        let (count, max_port): (i64, i64) = tx
+            .query_row("SELECT COUNT(*), COALESCE(MAX(port),20729) FROM exits WHERE node_id=?1", [node], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(internal)?;
+        tx.execute(
+            "INSERT INTO exits(node_id,name,port,psk,reset_day,sort) VALUES(?1,?2,?3,?4,1,?5)",
+            params![node, format!("出口 {}", count + 1), (max_port + 1).min(65535), random_b64(16), count],
+        )
+        .map_err(internal)?;
+        let id = tx.last_insert_rowid();
+        apply_exit_fields(&tx, id, &b)?;
+        tx.commit().map_err(internal)?;
+        id
+    };
+    app.sync();
+    ok(json!({"id": id}))
+}
+
+pub async fn update_exit(State(app): State<Arc<App>>, Path(id): Path<i64>, Json(b): Json<Map<String, Value>>) -> ApiResult {
+    {
+        let conn = app.db();
+        if !exists(&conn, "exits", id) {
+            return Err(bad("没有这个出口"));
+        }
+        apply_exit_fields(&conn, id, &b)?;
+    }
+    app.sync();
+    ok(json!({"ok": true}))
+}
+
+pub async fn delete_exit(State(app): State<Arc<App>>, Path(id): Path<i64>) -> ApiResult {
+    {
+        let mut conn = app.db();
+        let tx = conn.transaction().map_err(internal)?;
+        forget_exit(&tx, id).map_err(internal)?;
+        tx.commit().map_err(internal)?;
+    }
+    app.sync();
+    ok(json!({"ok": true}))
+}
+
+// ---------- users ----------
+
+fn apply_user_fields(conn: &Connection, id: i64, b: &Map<String, Value>, tz: i64) -> Result<(), Response> {
+    for (k, v) in b {
+        let (col, val): (&str, rusqlite::types::Value) = match k.as_str() {
+            "name" => {
+                let s = str_field(v, 40)?;
+                if s.is_empty() {
+                    return Err(bad("名称不能为空"));
+                }
+                ("name", s.into())
+            }
+            "plan" => ("plan", str_field(v, 20)?.into()),
+            "quota_bytes" => ("quota_bytes", int_field(v, 0, i64::MAX / 2)?.into()),
+            "reset_day" => ("reset_day", int_field(v, 1, 31)?.into()),
+            "enabled" => ("enabled", (bool_field(v)? as i64).into()),
+            "expire_date" => {
+                let s = str_field(v, 10)?;
+                let ts = parse_date_end(&s, tz).ok_or_else(|| bad("到期日期格式应为 2027-03-01，留空为不限"))?;
+                ("expire_at", ts.into())
+            }
+            "entries" => {
+                let ids: Vec<i64> = v
+                    .as_array()
+                    .ok_or_else(|| bad("入口应为列表"))?
+                    .iter()
+                    .filter_map(Value::as_i64)
+                    .collect();
+                conn.execute("DELETE FROM user_entries WHERE user_id=?1", [id]).map_err(internal)?;
+                for n in ids {
+                    conn.execute(
+                        "INSERT OR IGNORE INTO user_entries(user_id,node_id) SELECT ?1, id FROM nodes WHERE id=?2 AND role='entry'",
+                        params![id, n],
+                    )
+                    .map_err(internal)?;
+                }
+                continue;
+            }
+            _ => return Err(bad(format!("不能改 {k}"))),
+        };
+        conn.execute(&format!("UPDATE users SET {col}=?1 WHERE id=?2"), params![val, id]).map_err(internal)?;
+    }
+    Ok(())
+}
+
+fn tz_of(conn: &Connection) -> i64 {
+    db::get_setting(conn, "tz_offset").ok().flatten().and_then(|v| v.parse().ok()).unwrap_or(480)
+}
+
+pub async fn create_user(State(app): State<Arc<App>>, Json(b): Json<Map<String, Value>>) -> ApiResult {
+    let name = b.get("name").map(|v| str_field(v, 40)).transpose()?.unwrap_or_default();
+    if name.is_empty() {
+        return Err(bad("请填用户名"));
+    }
+    let id = {
+        let mut conn = app.db();
+        let tz = tz_of(&conn);
+        let tx = conn.transaction().map_err(internal)?;
+        let id = db::insert_user(&tx, &name, now()).map_err(internal)?;
+        apply_user_fields(&tx, id, &b, tz)?;
+        tx.commit().map_err(internal)?;
+        id
+    };
+    app.sync();
+    ok(json!({"id": id}))
+}
+
+pub async fn update_user(State(app): State<Arc<App>>, Path(id): Path<i64>, Json(b): Json<Map<String, Value>>) -> ApiResult {
+    {
+        let mut conn = app.db();
+        let tz = tz_of(&conn);
+        let tx = conn.transaction().map_err(internal)?;
+        if !exists(&tx, "users", id) {
+            return Err(bad("没有这个用户"));
+        }
+        apply_user_fields(&tx, id, &b, tz)?;
+        tx.commit().map_err(internal)?;
+    }
+    app.sync();
+    ok(json!({"ok": true}))
+}
+
+/// Starts the user's counters from zero now: a new period label makes every
+/// node drop its count, and the master's sums only look at the new label.
+pub async fn reset_user(State(app): State<Arc<App>>, Path(id): Path<i64>) -> ApiResult {
+    {
+        let conn = app.db();
+        let w = db::load_world(&conn).map_err(internal)?;
+        let u = w.users.iter().find(|u| u.id == id).ok_or_else(|| bad("没有这个用户"))?;
+        let base = crate::period::period_label(now(), w.tz, u.reset_day as u32, 0);
+        let seq = if u.reset_period == base { u.reset_seq + 1 } else { 1 };
+        conn.execute("UPDATE users SET reset_period=?1, reset_seq=?2 WHERE id=?3", params![base, seq, id]).map_err(internal)?;
+    }
+    app.sync();
+    ok(json!({"ok": true}))
+}
+
+pub async fn rotate_sub(State(app): State<Arc<App>>, Path(id): Path<i64>) -> ApiResult {
+    let n = app.db().execute("UPDATE users SET sub_token=?1 WHERE id=?2", params![random_hex(16), id]).map_err(internal)?;
+    if n == 0 {
+        return Err(bad("没有这个用户"));
+    }
+    ok(json!({"ok": true}))
+}
+
+pub async fn delete_user(State(app): State<Arc<App>>, Path(id): Path<i64>) -> ApiResult {
+    app.db().execute("DELETE FROM users WHERE id=?1", [id]).map_err(internal)?;
+    app.sync();
+    ok(json!({"ok": true}))
+}
+
+// ---------- settings ----------
+
+pub async fn update_settings(State(app): State<Arc<App>>, Json(b): Json<Map<String, Value>>) -> ApiResult {
+    {
+        let conn = app.db();
+        if let Some(pw) = b.get("password") {
+            let pw = pw.as_str().unwrap_or("");
+            let current = b.get("current_password").and_then(Value::as_str).unwrap_or("");
+            if !verify_password(&conn, current) {
+                return Err(bad("当前密码不对"));
+            }
+            if pw.chars().count() < 8 {
+                return Err(bad("新密码至少 8 位"));
+            }
+            db::set_setting(&conn, "admin_hash", &hash_password(pw)).map_err(internal)?;
+        }
+        if let Some(v) = b.get("panel_url") {
+            let u = str_field(v, 255)?;
+            if !u.is_empty() && !u.starts_with("https://") && !u.starts_with("http://") {
+                return Err(bad("面板地址应以 https:// 开头"));
+            }
+            db::set_setting(&conn, "panel_url", u.trim_end_matches('/')).map_err(internal)?;
+        }
+        if let Some(v) = b.get("tz_offset") {
+            db::set_setting(&conn, "tz_offset", &int_field(v, -720, 840)?.to_string()).map_err(internal)?;
+        }
+        if let Some(v) = b.get("probe_targets") {
+            let targets: Vec<ProbeTarget> = serde_json::from_value(v.clone()).map_err(|_| bad("测速目标格式不对"))?;
+            for t in &targets {
+                if !t.host.is_empty() && !t.host.contains(':') {
+                    return Err(bad(format!("{} 的地址要带端口，比如 1.2.3.4:80", t.label)));
+                }
+            }
+            db::set_setting(&conn, "probe_targets", &serde_json::to_string(&targets).unwrap_or_default()).map_err(internal)?;
+        }
+    }
+    app.sync();
+    ok(json!({"ok": true}))
+}
