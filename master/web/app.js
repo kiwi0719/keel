@@ -541,6 +541,20 @@ function addressField(n) {
     </div>`;
 }
 
+// What the node last said about its AnyTLS certificate.
+function certLine(n) {
+  if (!n.anytls_acme) return '';
+  const c = (n.certs || []).find(x => x.domain === n.anytls_sni);
+  const day = t => new Date(t * 1000).toISOString().slice(0, 10);
+  let text;
+  if (!n.anytls_sni) text = `<span style="color:${C.danger}">先填域名</span>`;
+  else if (!c) text = '<span class="muted">等节点上报</span>';
+  else if (c.issuer === 'acme' && !c.error) text = `已签发，${day(c.not_after)} 到期，会自动续期`;
+  else text = `<span style="color:${C.danger}">还没签下来：${esc(c.error || '申请中')}</span>${c.next_try ? `<span class="muted">，${day(c.next_try)} ${new Date(c.next_try * 1000).toTimeString().slice(0, 5)} 重试</span>` : ''}`;
+  const how = S.data.settings.cf_token_tail ? 'Cloudflare DNS 验证' : ((n.anytls_pub || n.anytls_port) === 443 ? 'TLS-ALPN 验证（对外 443）' : 'HTTP 验证（要能从外面访问 80 端口）');
+  return `<div class="full small" style="margin:-4px 0 4px">${text} <span class="muted">· ${how}</span></div>`;
+}
+
 function nodeDrawer(d) {
   const n = node(d.id);
   if (!n) return null;
@@ -563,11 +577,13 @@ function nodeDrawer(d) {
     const fp = n.reality_fp || 'chrome';
     body += `<section class="sec" style="gap:0">
         <h3 style="margin-bottom:4px">协议</h3>
-        ${proto('anytls_on', 'AnyTLS', ownCert ? '自有证书，客户端校验' : '自签证书，客户端跳过校验', 'anytls_port', n.anytls_port)}
+        ${proto('anytls_on', 'AnyTLS', n.anytls_acme ? '自动申请证书' : ownCert ? '自有证书，客户端校验' : '自签证书，客户端跳过校验', 'anytls_port', n.anytls_port)}
         <div class="fields two proto-opts">
+          <div class="toggle-row full"><span style="font-size:14px">自动申请证书 <span class="small muted">（Let's Encrypt，要先填域名并解析到这台）</span></span>${sw('anytls_acme', n.anytls_acme, '自动申请证书')}</div>
+          ${certLine(n)}
           ${field('域名 · SNI', 'anytls_sni', n.anytls_sni, { placeholder: '比如 jp.example.com，留空不带 SNI' })}
           ${field('对外端口（NAT 映射才改）', 'anytls_pub', n.anytls_pub || n.anytls_port, { inputmode: 'numeric' })}
-          ${field('证书文件（服务器上的路径）', 'anytls_cert', n.anytls_cert, { placeholder: '留空用自签' })}
+          ${field('证书文件（服务器上的路径）', 'anytls_cert', n.anytls_cert, { placeholder: n.anytls_acme ? '自动申请时不用填' : '留空用自签' })}
           ${field('私钥文件', 'anytls_key', n.anytls_key, { placeholder: '留空用自签' })}
         </div>
         ${proto('vless_on', 'VLESS Reality', 'Vision · 伪装 ' + esc(sni0), 'vless_port', n.vless_port)}
@@ -765,6 +781,12 @@ function settingsDrawer() {
       <section class="sec"><h3>三网测速目标</h3><div class="fields">${targets}</div>
         <p class="small muted" style="margin:0">默认是上海三网（Zstatic 公开的 TCPing 节点，地址由对方自动更新）。换省份就把 sh 改成对应代号。节点每 30 秒对每个目标 TCP 连 10 次，算延迟、波动和重传。留空就不测。</p></section>
       ${st.fingerprint ? `<section class="sec"><h3>主控证书指纹</h3><div class="mono small" style="word-break:break-all">${esc(st.fingerprint)}</div></section>` : ''}
+      <section class="sec"><h3>证书自动申请</h3><div class="fields two">
+        ${field('邮箱（证书到期提醒，可不填）', 'acme_email', st.acme_email || '')}
+        ${field('Cloudflare API Token', 'cf_token', '', { type: 'password', placeholder: st.cf_token_tail ? '已设置 …' + st.cf_token_tail + '，留空不改' : '不填就用 HTTP / TLS 验证' })}
+      </div>
+      <p class="small muted" style="margin:0">填了 Token（权限：Zone → DNS → Edit）就用 DNS 验证，不用开端口，NAT 机也能签。所有节点共用，只存在主控里，不会再显示出来。${st.cf_token_tail ? '<button type="button" class="text-btn" data-act="cf-clear">清除 Token</button>' : ''}</p>
+      </section>
       <section class="sec"><h3>登录</h3><div class="fields two">
         ${field('用户名', 'username', st.username, { full: true })}
         ${field('当前密码', 'current_password', '', { type: 'password' })}
@@ -909,6 +931,7 @@ const actions = {
       Object.assign(patch, {
         anytls_on: f.anytls_on === '1', vless_on: f.vless_on === '1',
         anytls_port: int(f.anytls_port), vless_port: int(f.vless_port),
+        anytls_acme: f.anytls_acme === '1',
         anytls_sni: f.anytls_sni.trim(), anytls_cert: f.anytls_cert.trim(), anytls_key: f.anytls_key.trim(),
         reality_sni: f.reality_sni.trim(), reality_dest: f.reality_dest.trim(), reality_short_id: f.reality_short_id.trim(), reality_fp: f.reality_fp,
         direct_list: f.direct_list
@@ -917,6 +940,7 @@ const actions = {
       const oldSni = (n.reality_sni || '').split(',')[0];
       if (patch.reality_sni !== n.reality_sni && patch.reality_dest === oldSni + ':443') patch.reality_dest = '';
       if (!patch.anytls_cert !== !patch.anytls_key) return drawerError('证书和私钥要一起填，或者都留空用自签');
+      if (patch.anytls_acme && !patch.anytls_sni) return drawerError('自动申请证书要先填域名');
       if (patch.anytls_port !== null && patch.anytls_port === patch.vless_port) return drawerError('两个协议不能用同一个端口');
       patch.anytls_pub = pubPort(f.anytls_pub, patch.anytls_port, n.anytls_pub, n.anytls_port);
       patch.vless_pub = pubPort(f.vless_pub, patch.vless_port, n.vless_pub, n.vless_port);
@@ -1023,9 +1047,16 @@ const actions = {
       tz_offset: int(f.tz_offset),
       probe_targets: st.probe_targets.map(t => ({ name: t.name, label: t.label, host: (f['probe_' + t.name] || '').trim() }))
     };
+    body.acme_email = (f.acme_email || '').trim();
+    if (f.cf_token) body.cf_token = f.cf_token.trim();
     body.username = f.username.trim(); body.current_password = f.current_password;
     if (f.password) body.password = f.password;
     try { await api('PATCH', '/api/settings', body); flash('设置已保存。'); closeDrawer(); await refresh(); render(); }
+    catch (e) { drawerError(e.message); }
+  },
+  async 'cf-clear'() {
+    if (!confirm('清除 Cloudflare Token？之后改用 HTTP / TLS 验证。')) return;
+    try { await api('PATCH', '/api/settings', { cf_token: '-' }); flash('Token 已清除。'); await refresh(); renderDrawer(); }
     catch (e) { drawerError(e.message); }
   },
   async logout() {

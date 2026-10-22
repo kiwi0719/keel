@@ -31,7 +31,8 @@ enum Kind {
     Reality { uuid: String, sni: String, public_key: String, short_id: String, fp: String },
 }
 
-fn proxies(user: &User, entries: &[&Node]) -> Vec<Proxy> {
+/// `trusted`: entries whose AnyTLS currently serves a CA-issued certificate.
+fn proxies(user: &User, entries: &[&Node], trusted: &[i64]) -> Vec<Proxy> {
     let mut list = Vec::new();
     for n in entries {
         let server = n.address().to_string();
@@ -59,7 +60,7 @@ fn proxies(user: &User, entries: &[&Node]) -> Vec<Proxy> {
                 kind: Kind::AnyTls {
                     password: user.anytls_password.clone(),
                     sni: n.anytls_sni.clone(),
-                    verify: !n.anytls_cert.is_empty() && !n.anytls_key.is_empty(),
+                    verify: if n.anytls_acme { trusted.contains(&n.id) } else { !n.anytls_cert.is_empty() && !n.anytls_key.is_empty() },
                 },
                 server: server.clone(),
                 port: if n.anytls_pub > 0 { n.anytls_pub } else { n.anytls_port },
@@ -147,7 +148,20 @@ pub async fn subscription(
     drop(conn);
     let allowed = world.user_entries.get(&user.id).cloned().unwrap_or_default();
     let entries: Vec<&Node> = world.nodes.iter().filter(|n| n.is_entry() && allowed.contains(&n.id)).collect();
-    let list = if user.enabled { proxies(&user, &entries) } else { Vec::new() };
+    // An ACME cert counts only once the node reports it issued, so clients
+    // do not start verifying against the interim self-signed one.
+    let trusted: Vec<i64> = {
+        let live = app.live();
+        entries
+            .iter()
+            .filter(|n| n.anytls_acme)
+            .filter(|n| {
+                live.nodes.get(&n.id).is_some_and(|l| l.certs.iter().any(|c| c.domain == n.anytls_sni && c.issuer == "acme" && c.not_after > now()))
+            })
+            .map(|n| n.id)
+            .collect()
+    };
+    let list = if user.enabled { proxies(&user, &entries, &trusted) } else { Vec::new() };
 
     let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("").to_lowercase();
     let format = query.format.unwrap_or_else(|| {

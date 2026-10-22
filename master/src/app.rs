@@ -135,6 +135,7 @@ impl App {
         l.last_seen = ts;
         l.conns = report.users.iter().map(|u| (u.name.clone(), u.conns)).collect();
         l.outbounds = report.outbounds.iter().map(|o| (o.tag.clone(), o.clone())).collect();
+        l.certs = report.certs.clone();
         l.record_probes(&report, ts);
         if report.config_rev > 0 {
             l.applied_rev = report.config_rev;
