@@ -611,7 +611,7 @@ function nodeDrawer(d) {
         <div class="fields two proto-opts">
           <div class="toggle-row full"><span style="font-size:14px">自动申请证书 <span class="small muted">（Let's Encrypt，要先填域名并解析到这台）</span></span>${sw('anytls_acme', n.anytls_acme, '自动申请证书')}</div>
           ${certLine(n)}
-          ${field('域名 · SNI', 'anytls_sni', n.anytls_sni, { placeholder: '比如 jp.example.com，留空不带 SNI' })}
+          ${field('域名 · SNI', 'anytls_sni', n.anytls_sni, { placeholder: '留空不带 SNI' })}
           ${field('对外端口（NAT 映射才改）', 'anytls_pub', n.anytls_pub || n.anytls_port, { inputmode: 'numeric' })}
           ${field('证书文件（服务器上的路径）', 'anytls_cert', n.anytls_cert, { placeholder: n.anytls_acme ? '自动申请时不用填' : '留空用自签' })}
           ${field('私钥文件', 'anytls_key', n.anytls_key, { placeholder: '留空用自签' })}
@@ -619,8 +619,8 @@ function nodeDrawer(d) {
         ${proto('vless_on', 'VLESS Reality', 'Vision · 伪装 ' + esc(sni0), 'vless_port', n.vless_port)}
         <div class="fields two proto-opts">
           ${field('SNI（多个用逗号隔开，第一个给订阅）', 'reality_sni', n.reality_sni, { full: true })}
-          ${field('目标 dest', 'reality_dest', n.reality_dest, { placeholder: '留空为 ' + (sni0 || 'SNI') + ':443' })}
-          ${field('Short ID', 'reality_short_id', n.reality_short_id, { placeholder: '十六进制，多个用逗号' })}
+          ${field('目标 dest', 'reality_dest', n.reality_dest, { placeholder: '留空自动' })}
+          ${field('Short ID', 'reality_short_id', n.reality_short_id, { placeholder: '十六进制，逗号分隔' })}
           ${field('对外端口（NAT 映射才改）', 'vless_pub', n.vless_pub || n.vless_port, { inputmode: 'numeric' })}
           <div class="field full">客户端指纹
             <div class="chips" role="group" aria-label="客户端指纹" style="margin-top:6px">${['chrome', 'firefox', 'safari', 'ios', 'android', 'edge', 'random'].map(v => `<button type="button" class="chip small-chip" data-act="fp" data-v="${v}" aria-pressed="${v === fp}">${v}</button>`).join('')}</div>
@@ -813,7 +813,7 @@ function settingsDrawer() {
       ${st.fingerprint ? `<section class="sec"><h3>主控证书指纹</h3><div class="mono small" style="word-break:break-all">${esc(st.fingerprint)}</div></section>` : ''}
       <section class="sec"><h3>证书自动申请</h3><div class="fields two">
         ${field('邮箱（证书到期提醒，可不填）', 'acme_email', st.acme_email || '')}
-        ${field('Cloudflare API Token', 'cf_token', '', { type: 'password', placeholder: st.cf_token_tail ? '已设置 …' + st.cf_token_tail + '，留空不改' : '不填就用 HTTP / TLS 验证' })}
+        ${field('Cloudflare API Token', 'cf_token', '', { type: 'password', placeholder: st.cf_token_tail ? '已设置 …' + st.cf_token_tail : '可不填' })}
       </div>
       <p class="small muted" style="margin:0">填了 Token（权限：Zone → DNS → Edit）就用 DNS 验证，不用开端口，NAT 机也能签。所有节点共用，只存在主控里，不会再显示出来。${st.cf_token_tail ? '<button type="button" class="text-btn" data-act="cf-clear">清除 Token</button>' : ''}</p>
       </section>
