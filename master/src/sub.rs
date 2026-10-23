@@ -1,8 +1,9 @@
 //! Subscription links: one per user, listing every entry and protocol the
 //! user may use, as a full config with split routing for the client asking.
 //!
-//! Every format carries the same plan: three selectable groups (PROXY, 流媒体,
-//! AI), streaming and AI rule sets sent to their groups, LAN and mainland
+//! Every format carries the same plan: selectable groups (PROXY, 流媒体, AI and
+//! one per Telegram DC location), each listing the entries; streaming, AI and
+//! Telegram traffic sent to their groups, LAN and mainland
 //! China direct, everything else PROXY. The format comes from `?format=` or
 //! the User-Agent:
 //!
@@ -104,11 +105,30 @@ const PROXY: &str = "PROXY";
 const MEDIA: &str = "流媒体";
 const AI: &str = "AI";
 
+/// Telegram data centers by location, so each can pick its own entry: DC1
+/// and DC3 in Miami, DC2 and DC4 in Amsterdam, DC5 in Singapore. Clients
+/// dial these addresses directly, so plain IP rules catch them.
+const TG: [(&str, &[&str]); 3] = [
+    ("TG DC1/3", &["149.154.172.0/22", "91.108.12.0/22", "2001:b28:f23d::/48"]),
+    ("TG DC2/4", &["149.154.160.0/21", "149.154.168.0/22", "91.108.4.0/22", "91.108.8.0/22", "2001:67c:4e8::/48", "2001:b28:f23c::/48"]),
+    ("TG DC5", &["91.108.56.0/22", "91.108.16.0/22", "2001:b28:f23f::/48"]),
+];
+
+/// Clash / Surge rule for one CIDR, without a DNS lookup.
+fn cidr_rule(c: &str, group: &str) -> String {
+    format!("{},{c},{group},no-resolve", if c.contains(':') { "IP-CIDR6" } else { "IP-CIDR" })
+}
+
 const BM: &str = "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule";
 const META: &str = "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat";
 
 const PRIVATE_V4: [&str; 6] = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "100.64.0.0/10", "169.254.0.0/16"];
 const PRIVATE_V6: [&str; 3] = ["::1/128", "fc00::/7", "fe80::/10"];
+
+/// Selectable groups, each listing every entry and nothing else.
+fn groups() -> impl Iterator<Item = &'static str> {
+    [PROXY, MEDIA, AI].into_iter().chain(TG.iter().map(|(g, _)| *g))
+}
 
 // ---------- Clash family (mihomo, Stash) ----------
 
@@ -181,11 +201,10 @@ fn clash(plan: &Plan, stash: bool) -> String {
     }
     let names: Vec<String> = plan.proxies.iter().map(|p| q(&p.name)).collect();
     let all = if names.is_empty() { "DIRECT".to_string() } else { names.join(", ") };
-    let _ = write!(
-        y,
-        "proxy-groups:\n  - {{name: {PROXY}, type: select, proxies: [{all}]}}\n  - {{name: {}, type: select, proxies: [{PROXY}, {all}]}}\n  - {{name: {AI}, type: select, proxies: [{PROXY}, {all}]}}\n",
-        q(MEDIA)
-    );
+    y.push_str("proxy-groups:\n");
+    for g in groups() {
+        let _ = writeln!(y, "  - {{name: {}, type: select, proxies: [{all}]}}", q(g));
+    }
     y.push_str("rule-providers:\n");
     for (name, path) in CLASH_SETS {
         let url = if path.is_empty() { format!("{META}/meta/geo/geosite/classical/category-ai-%21cn.list") } else { format!("{BM}/{path}") };
@@ -197,6 +216,11 @@ fn clash(plan: &Plan, stash: bool) -> String {
         }
     }
     y.push_str("rules:\n");
+    for (group, cidrs) in TG {
+        for c in cidrs {
+            let _ = writeln!(y, "  - {}", q(&cidr_rule(c, group)));
+        }
+    }
     let _ = write!(y, "  - RULE-SET,GlobalMedia,{MEDIA}\n  - RULE-SET,YouTube,{MEDIA}\n  - RULE-SET,AI,{AI}\n");
     for c in PRIVATE_V4 {
         let _ = writeln!(y, "  - IP-CIDR,{c},DIRECT,no-resolve");
@@ -237,10 +261,9 @@ fn singbox(plan: &Plan) -> String {
     if names.is_empty() {
         names.push("direct".into());
     }
-    let with_proxy: Vec<String> = std::iter::once(PROXY.to_string()).chain(names.iter().cloned()).collect();
-    outbounds.push(json!({"type": "selector", "tag": PROXY, "outbounds": names}));
-    outbounds.push(json!({"type": "selector", "tag": MEDIA, "outbounds": with_proxy}));
-    outbounds.push(json!({"type": "selector", "tag": AI, "outbounds": with_proxy}));
+    for g in groups() {
+        outbounds.push(json!({"type": "selector", "tag": g, "outbounds": names}));
+    }
     outbounds.push(json!({"type": "direct", "tag": "direct"}));
 
     let set = |tag: &str, path: &str| {
@@ -251,6 +274,9 @@ fn singbox(plan: &Plan) -> String {
         json!({"protocol": "dns", "action": "hijack-dns"}),
         json!({"ip_is_private": true, "outbound": "direct"}),
     ];
+    for (group, cidrs) in TG {
+        rules.push(json!({"ip_cidr": cidrs, "outbound": group}));
+    }
     rules.push(json!({"rule_set": ["youtube", "media"], "outbound": MEDIA}));
     rules.push(json!({"rule_set": ["ai"], "outbound": AI}));
     rules.push(json!({"rule_set": ["cn", "cn-ip"], "outbound": "direct"}));
@@ -318,7 +344,16 @@ fn surge(plan: &Plan) -> String {
         }
     }
     let all = if names.is_empty() { "DIRECT".to_string() } else { names.join(", ") };
-    let _ = write!(s, "\n[Proxy Group]\n{PROXY} = select, {all}\n{MEDIA} = select, {PROXY}, {all}\n{AI} = select, {PROXY}, {all}\n\n[Rule]\n");
+    s.push_str("\n[Proxy Group]\n");
+    for g in groups() {
+        let _ = writeln!(s, "{g} = select, {all}");
+    }
+    s.push_str("\n[Rule]\n");
+    for (group, cidrs) in TG {
+        for c in cidrs {
+            let _ = writeln!(s, "{}", cidr_rule(c, group));
+        }
+    }
     let _ = writeln!(s, "RULE-SET,{BM}/Surge/GlobalMedia/GlobalMedia_All_No_Resolve.list,{MEDIA}");
     let _ = writeln!(s, "RULE-SET,{BM}/Surge/YouTube/YouTube.list,{MEDIA}");
     for set in ["OpenAI", "Claude", "Gemini", "Copilot"] {
