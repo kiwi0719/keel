@@ -53,6 +53,7 @@ main { max-width: 1180px; margin: 0 auto; padding: 32px 20px 80px; }
 .spark { display: block; width: 100%; margin-top: 16px; }
 
 .grid { display: grid; gap: 16px; }
+.probe-head { margin-top: 40px; }
 .grid.probe { grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr)); align-items: start; }
 .grid.entries { grid-template-columns: repeat(auto-fill, minmax(min(100%, 420px), 1fr)); margin-bottom: 48px; }
 .grid.exits { grid-template-columns: repeat(auto-fill, minmax(min(100%, 260px), 1fr)); }

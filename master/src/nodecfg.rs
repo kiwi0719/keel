@@ -119,7 +119,9 @@ pub fn build(w: &World, node: &Node, secret: &str, probes: &[ProbeTarget], now: 
         .filter(|p| !p.host.is_empty())
         .map(|p| json!({"name": p.name, "host": p.host}))
         .collect();
-    if !probes.is_empty() {
+    // Three-network latency is about how users reach an entry; exits are
+    // judged by the entries' health checks instead.
+    if node.is_entry() && !probes.is_empty() {
         config["probes"] = Value::Array(probes);
     }
     config

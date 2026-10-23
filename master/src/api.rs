@@ -256,7 +256,7 @@ pub async fn state(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult
 /// without logging in.
 pub async fn public_state(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult {
     let full = state_value(&app, &headers)?;
-    const KEEP: &[&str] = &["id", "name", "role", "online", "last_seen", "month_rx", "month_tx", "probes"];
+    const KEEP: &[&str] = &["id", "name", "role", "online", "last_seen", "month_rx", "month_tx", "probes", "checks"];
     const SYSTEM: &[&str] = &["cpu_pct", "mem_total", "mem_used", "disk_total", "disk_used", "rx_rate", "tx_rate", "uptime_s", "tcp_retrans_pct"];
     let pick = |v: &Value, keys: &[&str]| -> Value {
         let mut o = Map::new();
@@ -354,7 +354,24 @@ fn state_value(app: &Arc<App>, headers: &HeaderMap) -> Result<Value, Response> {
                         }))
                     })
                     .collect();
-                o.insert("probes".into(), json!(probes));
+                if n.is_entry() {
+                    o.insert("probes".into(), json!(probes));
+                }
+            }
+            // Exits are not probed; they are judged by how the entries reach them.
+            if !n.is_entry() {
+                let checks: Vec<Value> = w
+                    .nodes
+                    .iter()
+                    .filter(|en| en.is_entry())
+                    .filter_map(|en| {
+                        let l = live.nodes.get(&en.id)?;
+                        let h = w.exits.iter().filter(|x| x.node_id == n.id).find_map(|x| l.outbounds.get(&format!("x{}", x.id)))?;
+                        let name = if en.name.is_empty() { &en.code } else { &en.name };
+                        Some(json!({"name": name, "alive": h.alive, "latency_ms": h.latency_ms}))
+                    })
+                    .collect();
+                o.insert("checks".into(), json!(checks));
             }
             v
         })
