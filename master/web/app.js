@@ -225,7 +225,9 @@ function probePage() {
     return hero + `<div class="empty">还没有节点。去「线路」页点「添加节点」，在服务器上运行给出的那一行命令。</div>`;
   }
   const ext = d.exits ? d.exits.filter(isExternal) : [];
-  return hero + `<div class="grid probe">${nodes.map(probeCard).join('')}${ext.map(extCard).join('')}</div>`;
+  const ins = nodes.filter(n => n.role === 'entry'), outs = nodes.filter(n => n.role !== 'entry');
+  const group = (title, cards) => cards.length ? `<div class="section-head probe-head"><h2>${title}</h2></div><div class="grid probe">${cards.join('')}</div>` : '';
+  return hero + group('入口', ins.map(probeCard)) + group('出口', outs.map(probeCard).concat(ext.map(extCard)));
 }
 
 function probeCard(n) {
@@ -241,9 +243,14 @@ function probeCard(n) {
       return `<span class="isp-cell">${shape({ color: col, shape: 'circle' }, 7)}<span class="muted">${esc(p.label || p.name)}</span><b>${p.latency > 0 ? Math.round(p.latency) : '—'}</b><span class="muted">ms</span></span>`;
     }).join('') + `<span class="isp-more" aria-hidden="true">${FLIP_ICON}</span>`
     : `<span class="small muted">${off ? '失联中' : '没有三网数据'}</span>`;
+  // Exits are not probed: show how each entry reaches them instead.
+  const cs = n.checks || [];
+  const exitStrip = cs.length
+    ? cs.map(c => `<span class="isp-cell">${shape({ color: c.alive ? C.ink : C.danger, shape: 'circle' }, 7)}<span class="muted">${esc(c.name)}</span><b style="${c.alive ? '' : 'color:' + C.danger}">${c.alive && c.latency_ms > 0 ? Math.round(c.latency_ms) : c.alive ? '通' : '不通'}</b>${c.alive && c.latency_ms > 0 ? '<span class="muted">ms</span>' : ''}</span>`).join('')
+    : '<span class="small muted">还没有入口检测过</span>';
   const head = `<div class="row">
         <span class="code" style="flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(nm(n))}</span>
-        <span class="muted" style="font-size:14px;flex:1 1 auto">${n.role === 'entry' ? '入口' : '出口'}</span>
+        <span style="flex:1 1 auto"></span>
         ${statusMark(st.kind)}
         <span style="font-size:13px;color:${off ? C.danger : C.muted}">${esc(st.text)}</span>
       </div>
@@ -257,8 +264,8 @@ function probeCard(n) {
         <div><div class="small muted">本月</div>${bytes(n.month_rx + n.month_tx)}</div>
         <div><div class="small muted">开机</div>${off ? '—' : duration(s.uptime_s)}</div>
       </div>
-      <div class="isp-strip">${strip}</div>`;
-  if (!probes.length) return `<div class="card ${off ? 'off' : ''}"><div class="probe-btn">${head}</div></div>`;
+      <div class="isp-strip">${n.role === 'entry' ? strip : exitStrip}</div>`;
+  if (n.role !== 'entry' || !probes.length) return `<div class="card ${off ? 'off' : ''}"><div class="probe-btn">${head}</div></div>`;
   const flipped = S.flipped.has(n.id);
   return `<div class="card flip ${flipped ? 'flipped' : ''}">
     <div class="flip-inner">
@@ -332,16 +339,19 @@ function checkLine(e) {
   return cs.map(c => `${esc(nm(c.n))} <b style="font-weight:500;${c.h.alive ? '' : 'color:' + C.danger}">${checkText(c.h)}</b>`).join(' · ');
 }
 function extCard(e) {
-  const cs = exitChecks(e), dead = cs.length && cs.every(c => !c.h.alive), some = cs.some(c => !c.h.alive);
-  const kind = !cs.length ? 'off' : dead ? 'bad' : some ? 'warn' : 'ok';
-  return `<div class="card ${dead ? 'off' : ''}" style="padding:20px;display:flex;flex-direction:column;gap:12px">
+  return checkCard(e.name, '外部出口 · ' + extProto(e), exitChecks(e).map(c => ({ name: nm(c.n), alive: c.h.alive, latency_ms: c.h.latency_ms })), '');
+}
+function checkCard(title, sub, cs, foot, off) {
+  const dead = cs.length && cs.every(c => !c.alive), some = cs.some(c => !c.alive);
+  const kind = off || !cs.length ? 'off' : dead ? 'bad' : some ? 'warn' : 'ok';
+  return `<div class="card ${off || dead ? 'off' : ''}" style="padding:20px;display:flex;flex-direction:column;gap:12px">
     <div class="row">
-      <span class="code" style="flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(e.name)}</span>
-      <span class="muted" style="font-size:14px;flex:1 1 auto">外部出口 · ${esc(extProto(e))}</span>
-      ${cs.length ? statusMark(kind) : ''}
+      <span class="code" style="flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(title)}</span>
+      <span class="muted" style="font-size:14px;flex:1 1 auto">${esc(sub)}</span>
+      ${off || cs.length ? statusMark(kind) : ''}
     </div>
-    <div class="checks">${cs.length ? cs.map(c => `<div><span class="muted">${esc(nm(c.n))}</span><b style="${c.h.alive ? '' : 'color:' + C.danger}">${checkText(c.h)}</b></div>`).join('') : '<span class="small muted">还没有入口检测过</span>'}</div>
-    <div class="small muted">由各入口每 15 秒检测一次</div>
+    <div class="checks">${cs.length ? cs.map(c => `<div><span class="muted">${esc(c.name)}</span><b style="${c.alive ? '' : 'color:' + C.danger}">${checkText(c)}</b></div>`).join('') : '<span class="small muted">还没有入口检测过</span>'}</div>
+    <div class="small muted">${foot ? esc(foot) + ' · ' : ''}由各入口每 15 秒检测</div>
   </div>`;
 }
 
