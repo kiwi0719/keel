@@ -6,6 +6,7 @@
 mod api;
 mod app;
 mod db;
+mod dns;
 mod link;
 mod live;
 mod nodecfg;

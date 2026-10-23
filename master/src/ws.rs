@@ -84,6 +84,7 @@ async fn serve(app: Arc<App>, node_id: i64, ip: String, socket: WebSocket) {
         id
     };
     app.on_hello(node_id, hello, &ip);
+    crate::dns::spawn_sync(app.clone());
 
     let writer = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
