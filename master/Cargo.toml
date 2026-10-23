@@ -8,7 +8,9 @@ description = "keel master: web panel, SQLite store and control channel for keel
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "fs"] }
-hyper = { version = "1", features = ["server", "http1"] }
+hyper = { version = "1", features = ["server", "client", "http1"] }
+http-body-util = "0.1"
+webpki-roots = "0.26"
 hyper-util = { version = "0.1", features = ["tokio", "server", "http1", "service"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

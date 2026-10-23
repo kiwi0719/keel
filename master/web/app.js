@@ -612,6 +612,7 @@ function nodeDrawer(d) {
           <div class="toggle-row full"><span style="font-size:14px">自动申请证书 <span class="small muted">（Let's Encrypt，要先填域名并解析到这台）</span></span>${sw('anytls_acme', n.anytls_acme, '自动申请证书')}</div>
           ${certLine(n)}
           ${field('域名 · SNI', 'anytls_sni', n.anytls_sni, { placeholder: '留空不带 SNI' })}
+          ${dnsLine(n)}
           ${field('对外端口（NAT 映射才改）', 'anytls_pub', n.anytls_pub || n.anytls_port, { inputmode: 'numeric' })}
           ${field('证书文件（服务器上的路径）', 'anytls_cert', n.anytls_cert, { placeholder: n.anytls_acme ? '自动申请时不用填' : '留空用自签' })}
           ${field('私钥文件', 'anytls_key', n.anytls_key, { placeholder: '留空用自签' })}
@@ -679,6 +680,14 @@ function nodeDrawer(d) {
   };
 }
 
+// Whether the master pointed the AnyTLS domain at this node in Cloudflare.
+function dnsLine(n) {
+  if (!n.dns) return '';
+  return n.dns.ok
+    ? `<p class="small muted full" style="margin:0">Cloudflare 已把 ${esc(n.dns.name)} 解析到本机（不走代理）</p>`
+    : `<p class="err full" style="margin:0">Cloudflare 解析没成功：${esc(n.dns.error)}</p>`;
+}
+
 function newNodeDrawer(d) {
   const role = d.role || 'entry';
   if (d.install) {
@@ -699,9 +708,22 @@ function newNodeDrawer(d) {
         <div class="fields two">
           ${field('名称', 'name', d.name || '', { placeholder: role === 'entry' ? '日本' : '英国' })}
         </div>
+        ${role === 'entry' ? newEntryProtos(d) : ''}
       </section>`,
     foot: `<button class="btn solid" data-act="create-node">创建并生成安装命令</button>`
   };
+}
+
+// Protocol chips and their SNI fields for a new entry; AnyTLS is on by default.
+function newEntryProtos(d) {
+  const on = d.protos || ['anytls'];
+  const chip = (v, label) => `<button type="button" class="chip" data-act="new-proto" data-v="${v}" aria-pressed="${on.includes(v)}">${label}</button>`;
+  return `<div><div class="sublabel">协议</div><div class="chips" role="group" aria-label="协议">${chip('anytls', 'AnyTLS')}${chip('vless', 'VLESS Reality')}</div></div>
+        <div class="fields two">
+          ${on.includes('anytls') ? field('AnyTLS 域名 · SNI', 'anytls_sni', d.anytls_sni || '', { placeholder: '留空不带 SNI' }) : ''}
+          ${on.includes('vless') ? field('Reality 伪装 SNI', 'reality_sni', d.reality_sni || '', { placeholder: 'www.apple.com' }) : ''}
+        </div>
+        <p class="small muted" style="margin:0">端口随机生成，证书、Short ID 等创建后点开节点再改。</p>`;
 }
 
 const EXT_HELP = `<p class="small muted" style="margin:0">一行一条：<b>vless://</b>（明文 TCP，不带 TLS / Reality）、<b>ss://</b>（SS-2022 或 aes-gcm / chacha20，不带插件）。也可以粘贴 3x-ui / Xray 的出站 JSON，或整份 Xray 配置，会取出里面的 vless 和 shadowsocks 出站。名称取链接 # 后面的备注。</p>`;
@@ -815,7 +837,7 @@ function settingsDrawer() {
         ${field('邮箱（证书到期提醒，可不填）', 'acme_email', st.acme_email || '')}
         ${field('Cloudflare API Token', 'cf_token', '', { type: 'password', placeholder: st.cf_token_tail ? '已设置 …' + st.cf_token_tail : '可不填' })}
       </div>
-      <p class="small muted" style="margin:0">填了 Token（权限：Zone → DNS → Edit）就用 DNS 验证，不用开端口，NAT 机也能签。所有节点共用，只存在主控里，不会再显示出来。${st.cf_token_tail ? '<button type="button" class="text-btn" data-act="cf-clear">清除 Token</button>' : ''}</p>
+      <p class="small muted" style="margin:0">填了 Token（权限：Zone → DNS → Edit 和 Zone → Zone → Read）后，入口填的 AnyTLS 域名会自动解析到节点 IP（不开小黄云）；自动申请证书也改用 DNS 验证，不用开端口，NAT 机也能签。所有节点共用，只存在主控里，不会再显示出来。${st.cf_token_tail ? '<button type="button" class="text-btn" data-act="cf-clear">清除 Token</button>' : ''}</p>
       </section>
       <section class="sec"><h3>登录</h3><div class="fields two">
         ${field('用户名', 'username', st.username, { full: true })}
@@ -857,6 +879,10 @@ function quotaBytes(v) {
 function quotaGB(b) { return b ? String(+(b / GB).toFixed(2)) : ''; }
 
 // Keeps typed values when the drawer re-renders for a button press.
+function keepNewNode() {
+  const f = form();
+  for (const k of ['name', 'anytls_sni', 'reality_sni']) if (k in f) S.drawer[k] = f[k].trim();
+}
 function keepUserDraft() {
   if (!S.draft) return;
   const f = form();
@@ -928,11 +954,27 @@ const actions = {
   },
   node(el) { openDrawer({ kind: 'node', id: +el.dataset.id }); },
   'new-node'() { openDrawer({ kind: 'new-node', role: 'entry' }); },
-  role(el) { const f = form(); Object.assign(S.drawer, { role: el.dataset.role, name: f.name }); renderDrawer(); },
+  role(el) { keepNewNode(); S.drawer.role = el.dataset.role; renderDrawer(); },
+  'new-proto'(el) {
+    keepNewNode();
+    const on = S.drawer.protos || ['anytls'], v = el.dataset.v;
+    S.drawer.protos = on.includes(v) ? on.filter(x => x !== v) : [...on, v];
+    renderDrawer();
+  },
   async 'create-node'() {
-    const f = form();
+    keepNewNode();
+    const d = S.drawer, role = d.role || 'entry', protos = d.protos || ['anytls'];
+    if (role === 'entry' && !protos.length) return drawerError('至少选一个协议');
     try {
-      const r = await api('POST', '/api/nodes', { role: S.drawer.role || 'entry', name: f.name });
+      const r = await api('POST', '/api/nodes', { role, name: d.name || '' });
+      if (role === 'entry') {
+        const patch = { anytls_on: protos.includes('anytls'), vless_on: protos.includes('vless') };
+        if (patch.anytls_on && d.anytls_sni) patch.anytls_sni = d.anytls_sni;
+        // An empty dest follows the first SNI.
+        if (patch.vless_on && d.reality_sni) Object.assign(patch, { reality_sni: d.reality_sni, reality_dest: '' });
+        try { await api('PATCH', `/api/nodes/${r.id}`, patch); }
+        catch (e) { S.drawer.install = r.install; await refresh(); return drawerError('节点已创建，但协议设置没存上：' + e.message + '。点开节点再改。'); }
+      }
       S.drawer.install = r.install; S.drawerErr = '';
       await refresh(); renderDrawer();
     } catch (e) { drawerError(e.message); }

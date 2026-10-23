@@ -310,6 +310,9 @@ fn state_value(app: &Arc<App>, headers: &HeaderMap) -> Result<Value, Response> {
             o.insert("month_tx".into(), json!(mtx));
             o.insert("token_tail".into(), json!(tail(&n.token, 4)));
             o.insert("address".into(), json!(n.address()));
+            if let Some(d) = crate::dns::status(n.id) {
+                o.insert("dns".into(), json!(d));
+            }
             o.insert(
                 "rules".into(),
                 json!(w
@@ -552,6 +555,7 @@ pub async fn update_node(State(app): State<Arc<App>>, Path(id): Path<i64>, Json(
         }
     }
     app.sync();
+    crate::dns::spawn_sync(app.clone());
     ok(json!({"ok": true}))
 }
 
@@ -992,5 +996,6 @@ pub async fn update_settings(State(app): State<Arc<App>>, headers: HeaderMap, Js
         }
     }
     app.sync();
+    crate::dns::spawn_sync(app.clone());
     ok(json!({"ok": true}))
 }
