@@ -43,6 +43,13 @@ func agentMain(args []string) int {
 	if len(rest) > 0 {
 		cmd, rest = rest[0], rest[1:]
 	}
+	switch cmd {
+	case "restart", "start", "stop", "update":
+		if os.Geteuid() != 0 {
+			fmt.Fprintln(os.Stderr, "错误: 需要 root，请用 sudo agent "+cmd)
+			return 1
+		}
+	}
 	var err error
 	switch cmd {
 	case "status":
@@ -169,6 +176,10 @@ func agentStatus(path string) error {
 	s, err := readStatus(path)
 	fresh := err == nil && time.Since(time.Unix(s.Updated, 0)) < 3*statusInterval && processAlive(s.PID)
 	fmt.Printf("%s  %s %s\n", bold("keel-node"), version, dim(buildDate(buildTime())))
+	if errors.Is(err, os.ErrPermission) {
+		// /etc/keel is root-only because it holds the node's token.
+		return errors.New("没有权限读 " + path + "，请用 sudo agent")
+	}
 	switch {
 	case fresh:
 		line := fmt.Sprintf("%s · 已运行 %s · 内存 %s", green("运行中"), humanDuration(time.Since(time.Unix(s.Started, 0))), humanBytes(s.RSS))
