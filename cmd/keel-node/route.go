@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	M "github.com/sagernet/sing/common/metadata"
@@ -28,13 +29,19 @@ type ruleList struct {
 	path   string
 	inline []string
 
-	mu       sync.Mutex
+	// Matching reads the current set without locking (UDP matches every
+	// packet); mu is only held to reload it.
+	mu      sync.Mutex
+	set     atomic.Pointer[ruleSet]
+	checked atomic.Int64 // unix nanoseconds of the last look at the file
+}
+
+type ruleSet struct {
 	suffix   map[string]bool
 	exact    map[string]bool
 	keywords []string
 	prefixes []netip.Prefix
 	modTime  time.Time
-	checked  time.Time
 }
 
 const ruleListRecheck = time.Minute
@@ -48,7 +55,7 @@ func newRuleList(path string, inline []string) *ruleList {
 }
 
 func (l *ruleList) reloadLocked(force bool) {
-	l.checked = time.Now()
+	l.checked.Store(time.Now().UnixNano())
 	var file io.Reader
 	var modTime time.Time
 	if l.path != "" {
@@ -59,7 +66,7 @@ func (l *ruleList) reloadLocked(force bool) {
 			}
 			return
 		}
-		if !force && info.ModTime().Equal(l.modTime) {
+		if old := l.set.Load(); !force && old != nil && info.ModTime().Equal(old.modTime) {
 			return
 		}
 		f, err := os.Open(l.path)
@@ -107,7 +114,7 @@ func (l *ruleList) reloadLocked(force bool) {
 			add(scanner.Text())
 		}
 	}
-	l.suffix, l.exact, l.keywords, l.prefixes, l.modTime = suffix, exact, keywords, prefixes, modTime
+	l.set.Store(&ruleSet{suffix: suffix, exact: exact, keywords: keywords, prefixes: prefixes, modTime: modTime})
 	if l.path != "" {
 		log.Printf("rule list: loaded %d suffix + %d exact + %d keyword + %d ip entries from %s", len(suffix), len(exact), len(keywords), len(prefixes), l.path)
 	}
@@ -116,14 +123,17 @@ func (l *ruleList) reloadLocked(force bool) {
 // match reports whether destination is on the list. Domain entries match
 // domain destinations, IP entries match IP destinations.
 func (l *ruleList) match(destination M.Socksaddr) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.path != "" && time.Since(l.checked) > ruleListRecheck {
-		l.reloadLocked(false)
+	if l.path != "" && time.Since(time.Unix(0, l.checked.Load())) > ruleListRecheck && l.mu.TryLock() {
+		l.reloadLocked(false) // others keep matching the current set meanwhile
+		l.mu.Unlock()
+	}
+	set := l.set.Load()
+	if set == nil {
+		return false
 	}
 	if !destination.IsFqdn() {
 		addr := destination.Addr.Unmap()
-		for _, prefix := range l.prefixes {
+		for _, prefix := range set.prefixes {
 			if prefix.Contains(addr) {
 				return true
 			}
@@ -131,16 +141,16 @@ func (l *ruleList) match(destination M.Socksaddr) bool {
 		return false
 	}
 	name := strings.ToLower(strings.TrimSuffix(destination.Fqdn, "."))
-	if l.exact[name] {
+	if set.exact[name] {
 		return true
 	}
-	for _, k := range l.keywords {
+	for _, k := range set.keywords {
 		if strings.Contains(name, k) {
 			return true
 		}
 	}
 	for d := name; d != ""; {
-		if l.suffix[d] {
+		if set.suffix[d] {
 			return true
 		}
 		i := strings.IndexByte(d, '.')
