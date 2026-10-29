@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"log"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -74,8 +76,7 @@ func (s *sysSampler) sample() SystemStats {
 	}
 	s.rx, s.tx = st.NetRx, st.NetTx
 
-	st.TCPConns = countLines("/proc/net/tcp") + countLines("/proc/net/tcp6")
-	st.UDPConns = countLines("/proc/net/udp") + countLines("/proc/net/udp6")
+	st.TCPConns, st.UDPConns = readSockstat()
 	if fields := readFields("/proc/uptime"); len(fields) > 0 {
 		uptime, _ := strconv.ParseFloat(fields[0], 64)
 		st.UptimeS = uint64(uptime)
@@ -172,13 +173,61 @@ func readNetDev() (rx, tx uint64) {
 	return rx, tx
 }
 
-// countLines counts socket entries in a /proc/net table (minus its header).
-func countLines(path string) int {
-	content, err := os.ReadFile(path)
-	if err != nil || len(content) == 0 {
-		return 0
+// readSockstat returns the TCP and UDP sockets in use (IPv4 and IPv6) from
+// /proc/net/sockstat{,6}. Counting the lines of /proc/net/tcp instead had
+// the kernel format every socket: about 0.1 s and 40 MB of garbage per
+// report at 40 000 sockets.
+func readSockstat() (tcp, udp int) {
+	for _, path := range []string{"/proc/net/sockstat", "/proc/net/sockstat6"} {
+		if content, err := os.ReadFile(path); err == nil {
+			t, u := parseSockstat(string(content))
+			tcp, udp = tcp+t, udp+u
+		}
 	}
-	return strings.Count(string(content), "\n") - 1
+	return tcp, udp
+}
+
+func parseSockstat(content string) (tcp, udp int) {
+	for _, line := range strings.Split(content, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 3 || fields[1] != "inuse" {
+			continue
+		}
+		n, _ := strconv.Atoi(fields[2])
+		switch fields[0] {
+		case "TCP:", "TCP6:":
+			tcp += n
+		case "UDP:", "UDP6:":
+			udp += n
+		}
+	}
+	return tcp, udp
+}
+
+// setMemoryLimit gives the garbage collector a soft limit of half the
+// machine's memory (or its cgroup's) unless GOMEMLIMIT is set. Without one,
+// memory freed after a burst of connections stayed with the process for
+// minutes; with it the heap is returned within seconds and peaks lower. It
+// is soft: when the live heap is larger, Go caps the collector's CPU rather
+// than failing.
+func setMemoryLimit() {
+	if os.Getenv("GOMEMLIMIT") != "" {
+		return
+	}
+	total := int64(readKeyValues("/proc/meminfo")["MemTotal"]) * 1024
+	for _, path := range []string{"/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"} {
+		if fields := readFields(path); len(fields) > 0 {
+			if v, err := strconv.ParseInt(fields[0], 10, 64); err == nil && v > 0 && (total == 0 || v < total) {
+				total = v
+			}
+		}
+	}
+	if total <= 0 {
+		return
+	}
+	limit := max(total/2, 64<<20)
+	debug.SetMemoryLimit(limit)
+	log.Printf("memory limit %d MiB, half of %d MiB (GOMEMLIMIT overrides)", limit>>20, total>>20)
 }
 
 // readTCPSegments returns RetransSegs and OutSegs from /proc/net/snmp.
