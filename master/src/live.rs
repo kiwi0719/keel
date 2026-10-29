@@ -91,11 +91,20 @@ pub struct Report {
     pub ts: i64,
     pub config_rev: i64,
     pub users: Vec<UserReport>,
+    /// False when `users` only lists the users whose figures changed since
+    /// the node's previous report (nodes that saw `report_delta`); older
+    /// nodes always send everyone and leave the field out.
+    #[serde(default = "full_by_default")]
+    pub full: bool,
     pub system: Option<System>,
     /// Present only in the first report after a probe round finished.
     pub probes: Vec<ProbeReport>,
     pub outbounds: Vec<OutboundHealth>,
     pub certs: Vec<CertStatus>,
+}
+
+fn full_by_default() -> bool {
+    true
 }
 
 /// A certificate the node serves, as of its last report.
@@ -167,6 +176,9 @@ pub struct NodeLive {
     pub sent_hash: String,
     pub sent_shape: String,
     pub sent_at: i64,
+    /// Each user's (used_base, used_self) as this connection last sent them,
+    /// for a node that takes usage messages.
+    pub sent_usage: HashMap<String, (i64, i64)>,
 }
 
 impl NodeLive {
@@ -217,5 +229,18 @@ impl Live {
         while self.speed.len() > SPEED_POINTS {
             self.speed.pop_front();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reports_are_full_unless_marked() {
+        let old: Report = serde_json::from_str(r#"{"type":"report","users":[{"name":"u1","up":1}]}"#).unwrap();
+        assert!(old.full, "a report from an older node lists every user");
+        let delta: Report = serde_json::from_str(r#"{"type":"report","full":false,"users":[]}"#).unwrap();
+        assert!(!delta.full);
     }
 }

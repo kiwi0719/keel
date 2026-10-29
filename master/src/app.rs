@@ -4,7 +4,7 @@
 use axum::extract::ws::Message;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -16,11 +16,19 @@ use crate::util::{hex, sha256};
 
 /// Upper bound on a reported per-user counter (1 PiB).
 const MAX_COUNTER: i64 = 1 << 50;
+/// Upper bound on a reported per-user connection count.
+const MAX_CONNS: i64 = 1 << 20;
 /// Upper bound on one report interval's interface traffic (1 TiB).
 const MAX_INTERVAL_BYTES: i64 = 1 << 40;
 
-/// A used_base-only change is pushed at most this often.
+/// For a node without usage messages, a config whose only change is in the
+/// usage figures is pushed at most this often.
 const USAGE_PUSH_INTERVAL: i64 = 60;
+
+/// The hello feature of nodes that take usage messages: when only the usage
+/// figures changed, they get the changed users' figures instead of the
+/// whole config.
+const USAGE_MSG: &str = "usage_msg";
 
 /// Sync requests: at most one run at a time; requests during a run are
 /// collected here for the next one.
@@ -30,6 +38,59 @@ struct SyncRequests {
     running: bool,
     all: bool,
     nodes: BTreeSet<i64>,
+}
+
+/// What reports are checked against: each node's allowed counter names and
+/// the timezone, read once instead of per report. Dropped whenever a sync is
+/// requested, so an edit takes effect on the next report.
+static REPORT_CONTEXT: Mutex<Option<ReportContext>> = Mutex::new(None);
+
+struct ReportContext {
+    tz: i64,
+    allowed: HashMap<i64, Arc<HashSet<String>>>,
+}
+
+fn report_context(conn: &Connection, node_id: i64) -> (Arc<HashSet<String>>, i64) {
+    let mut cache = REPORT_CONTEXT.lock().unwrap_or_else(|e| e.into_inner());
+    let ctx = cache.get_or_insert_with(|| ReportContext {
+        tz: db::get_setting(conn, "tz_offset").ok().flatten().and_then(|v| v.parse().ok()).unwrap_or(480),
+        allowed: HashMap::new(),
+    });
+    let allowed = ctx
+        .allowed
+        .entry(node_id)
+        .or_insert_with(|| Arc::new(db::node_counters(conn, node_id).unwrap_or_default()))
+        .clone();
+    (allowed, ctx.tz)
+}
+
+/// Each user's (used_base, used_self) in a node config; a figure the config
+/// leaves out is 0.
+fn usage_figures(config: &Value) -> HashMap<String, (i64, i64)> {
+    let Some(users) = config["users"].as_array() else { return HashMap::new() };
+    users
+        .iter()
+        .filter_map(|u| {
+            let figures = (u["used_base"].as_i64().unwrap_or(0), u["used_self"].as_i64().unwrap_or(0));
+            Some((u["name"].as_str()?.to_owned(), figures))
+        })
+        .collect()
+}
+
+/// The usage message for the config of rev: the users whose figures differ
+/// from what the connection was sent. None when no figure changed. Like a
+/// config, it tells the node that delta reports are welcome: after a
+/// reconnect it is often the only message a node gets.
+fn usage_message(rev: i64, figures: &HashMap<String, (i64, i64)>, sent: &HashMap<String, (i64, i64)>) -> Option<String> {
+    let changed: serde_json::Map<String, Value> = figures
+        .iter()
+        .filter(|&(name, f)| sent.get(name) != Some(f))
+        .map(|(name, &(base, own))| (name.clone(), json!([base, own])))
+        .collect();
+    if changed.is_empty() {
+        return None;
+    }
+    Some(json!({"type": "usage", "rev": rev, "report_delta": true, "users": changed}).to_string())
 }
 
 pub struct TlsInfo {
@@ -91,6 +152,9 @@ impl App {
     }
 
     fn request_sync(self: &Arc<Self>, node: Option<i64>) {
+        // Every edit asks for a sync, so this is where what reports are
+        // checked against goes stale.
+        *REPORT_CONTEXT.lock().unwrap_or_else(|e| e.into_inner()) = None;
         {
             let mut s = SYNC.lock().unwrap_or_else(|e| e.into_inner());
             match node {
@@ -144,7 +208,7 @@ impl App {
             (world, Self::probe_targets(&conn))
         };
         // The connected nodes and what they were last sent.
-        let targets: Vec<(i64, u64, Vec<String>, String, String, i64, i64)> = {
+        let targets: Vec<(i64, u64, Vec<String>, bool, String, String, i64, i64)> = {
             let live = self.live();
             world
                 .nodes
@@ -153,12 +217,13 @@ impl App {
                 .filter_map(|n| {
                     let l = live.nodes.get(&n.id)?;
                     let c = l.conn.as_ref()?;
-                    Some((n.id, c.id, l.hello.protocols.clone(), l.sent_hash.clone(), l.sent_shape.clone(), l.sent_at, l.sent_rev))
+                    let usage_msg = l.hello.features.iter().any(|f| f == USAGE_MSG);
+                    Some((n.id, c.id, l.hello.protocols.clone(), usage_msg, l.sent_hash.clone(), l.sent_shape.clone(), l.sent_at, l.sent_rev))
                 })
                 .collect()
         };
         let mut pushes = Vec::new();
-        for (node_id, conn_id, protocols, sent_hash, sent_shape, sent_at, sent_rev) in targets {
+        for (node_id, conn_id, protocols, usage_msg, sent_hash, sent_shape, sent_at, sent_rev) in targets {
             let Some(node) = world.node(node_id) else { continue };
             let mut config = nodecfg::build(&world, node, &self.secret, &probes, ts);
             nodecfg::drop_unsupported(&mut config, &protocols);
@@ -171,12 +236,15 @@ impl App {
                 continue;
             }
             let shape = hex(&sha256(serde_json::to_string(&nodecfg::shape(&config)).unwrap_or_default().as_bytes()));
-            if shape == sent_shape && ts - sent_at < USAGE_PUSH_INTERVAL {
+            let figures = usage_msg.then(|| usage_figures(&config));
+            let mut config_msg = None;
+            if shape != sent_shape || (!usage_msg && ts - sent_at >= USAGE_PUSH_INTERVAL) {
+                let rev = node.config_rev.max(sent_rev) + 1;
+                config_msg = Some((rev, format!(r#"{{"type":"config","rev":{rev},"report_delta":true,"config":{full}}}"#)));
+            } else if !usage_msg {
                 continue;
             }
-            let rev = node.config_rev.max(sent_rev) + 1;
-            let msg = format!(r#"{{"type":"config","rev":{rev},"config":{full}}}"#);
-            pushes.push((node_id, conn_id, rev, hash, shape, msg));
+            pushes.push((node_id, conn_id, hash, shape, figures, config_msg));
         }
         if pushes.is_empty() {
             return;
@@ -184,19 +252,40 @@ impl App {
         let mut sent = Vec::new();
         {
             let mut live = self.live();
-            for (node_id, conn_id, rev, hash, shape, msg) in pushes {
+            for (node_id, conn_id, hash, shape, figures, config_msg) in pushes {
                 let Some(l) = live.nodes.get_mut(&node_id) else { continue };
                 // A node that reconnected meanwhile gets its own run.
                 let Some(c) = l.conn.as_ref().filter(|c| c.id == conn_id) else { continue };
-                if !c.send(Message::Text(msg.into())) {
-                    continue;
+                if let Some((rev, msg)) = config_msg {
+                    if !c.send(Message::Text(msg.into())) {
+                        continue;
+                    }
+                    l.sent_rev = rev;
+                    l.sent_shape = shape.clone();
+                    l.sent_at = ts;
+                    sent.push((node_id, rev, hash.clone(), shape));
+                } else {
+                    // Usage figures are for the config the node runs; its
+                    // hello may have changed what that is since this run
+                    // started.
+                    if l.sent_shape != shape {
+                        continue;
+                    }
+                    let figures = figures.as_ref().expect("usage pushes carry figures");
+                    if let Some(msg) = usage_message(l.sent_rev, figures, &l.sent_usage) {
+                        if !c.send(Message::Text(msg.into())) {
+                            continue;
+                        }
+                    }
                 }
-                l.sent_rev = rev;
-                l.sent_hash = hash.clone();
-                l.sent_shape = shape.clone();
-                l.sent_at = ts;
-                sent.push((node_id, rev, hash, shape));
+                l.sent_hash = hash;
+                if let Some(figures) = figures {
+                    l.sent_usage = figures;
+                }
             }
+        }
+        if sent.is_empty() {
+            return;
         }
         let conn = self.db();
         let saved = conn.unchecked_transaction().and_then(|tx| {
@@ -238,6 +327,13 @@ impl App {
                 l.sent_shape.clear();
             }
         }
+        // Which usage figures the node holds is not known here (it keeps
+        // them across restarts): a node that takes usage messages gets every
+        // user's again on its first sync.
+        l.sent_usage.clear();
+        if hello.features.iter().any(|f| f == USAGE_MSG) {
+            l.sent_hash.clear();
+        }
         l.hello = hello;
         moved
     }
@@ -247,7 +343,7 @@ impl App {
         let conn = self.db();
         // A node may only report the counters the master gave it, with sane
         // values: anything else could block or free other nodes' users.
-        let allowed = db::node_counters(&conn, node_id).unwrap_or_default();
+        let (allowed, tz) = report_context(&conn, node_id);
         let rows: Vec<(String, String, i64, i64)> = report
             .users
             .iter()
@@ -257,11 +353,18 @@ impl App {
         if let Err(e) = db::store_usage(&conn, node_id, &rows, ts) {
             eprintln!("report: store usage: {e}");
         }
-        let tz = db::get_setting(&conn, "tz_offset").ok().flatten().and_then(|v| v.parse().ok()).unwrap_or(480);
         let mut live = self.live();
         let l = live.nodes.entry(node_id).or_default();
         l.last_seen = ts;
-        l.conns = report.users.iter().map(|u| (u.name.clone(), u.conns)).collect();
+        // Only the node's own counters: a delta report merges into what is
+        // there, so made-up names would otherwise pile up.
+        let conns = report.users.iter().filter(|u| allowed.contains(&u.name)).map(|u| (u.name.clone(), u.conns.clamp(0, MAX_CONNS)));
+        if report.full {
+            l.conns = conns.collect();
+        } else {
+            l.conns.extend(conns);
+            l.conns.retain(|name, _| allowed.contains(name));
+        }
         l.outbounds = report.outbounds.iter().map(|o| (o.tag.clone(), o.clone())).collect();
         // Bounded: the panel turns these into dates, and the node picks them.
         let latest = ts + 20 * 365 * 86_400;
@@ -324,5 +427,34 @@ impl App {
                 c.stop.notify_one();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_messages_carry_only_changed_users() {
+        let config = json!({"users": [
+            {"name": "u1", "used_base": 10, "used_self": 2},
+            {"name": "u2", "used_base": 5},
+            {"name": "u3"},
+        ]});
+        let figures = usage_figures(&config);
+        assert_eq!(figures["u2"], (5, 0));
+        assert_eq!(figures["u3"], (0, 0));
+
+        let msg: Value = serde_json::from_str(&usage_message(7, &figures, &HashMap::new()).unwrap()).unwrap();
+        assert_eq!(msg["type"], "usage");
+        assert_eq!(msg["rev"], 7);
+        assert_eq!(msg["report_delta"], true);
+        assert_eq!(msg["users"].as_object().unwrap().len(), 3, "a new connection gets every user");
+
+        let mut sent = figures.clone();
+        assert!(usage_message(7, &figures, &sent).is_none());
+        sent.insert("u1".into(), (9, 2));
+        let msg: Value = serde_json::from_str(&usage_message(7, &figures, &sent).unwrap()).unwrap();
+        assert_eq!(msg["users"], json!({"u1": [10, 2]}));
     }
 }

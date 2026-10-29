@@ -70,6 +70,7 @@ func main() {
 	default:
 		log.Fatal(err)
 	}
+	n.users.restoreUsage(config)
 	if err = n.reload(config); err != nil {
 		log.Fatal(err)
 	}
@@ -143,6 +144,16 @@ func main() {
 				mc.result <- nil
 				continue
 			}
+			if mc.usage != nil {
+				if n.users.applyUsage(n.rev(), *mc.usage) {
+					if n.users.check(time.Now()) {
+						n.pushUsers()
+					}
+					requestSave()
+				}
+				mc.result <- nil
+				continue
+			}
 			err := n.applyMaster(mc.content, mc.rev, *configPath)
 			if stat, statErr := os.Stat(*configPath); statErr == nil {
 				configStat = stat // our own write must not trigger a reload
@@ -193,6 +204,7 @@ func (n *node) applyMaster(content []byte, rev int64, path string) error {
 	if err = n.reload(config); err != nil {
 		return err
 	}
+	n.users.forgetUsage()
 	if err = writeFileAtomic(path, content, 0o600); err != nil {
 		log.Print("cache config: ", err)
 	}
@@ -308,6 +320,7 @@ func (n *node) reloadFile(path string) {
 		log.Print("reload: ", err, " (keeping current config)")
 		return
 	}
+	n.users.restoreUsage(config)
 	if err = n.reload(config); err != nil {
 		log.Print("reload: ", err, " (keeping current config)")
 		return

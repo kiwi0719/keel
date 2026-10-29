@@ -18,6 +18,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -51,7 +52,19 @@ type masterClient struct {
 	// probesSent is the newest probe round already sent; reports only carry
 	// rounds finished after it.
 	probesSent int64
+	// delta: the master on this connection takes reports that only carry
+	// the users whose figures changed (it says so with each config and
+	// usage message). sent holds what this connection last reported for
+	// each user, lastFull when every user was last sent. All three start
+	// over with each connection.
+	delta    atomic.Bool
+	sent     map[string]UserUsage
+	lastFull time.Time
 }
+
+// fullReportInterval: even when sending changes only, every user is
+// reported this often.
+const fullReportInterval = 5 * time.Minute
 
 // masterConfig hands a config from the master to the main loop, which
 // applies it and answers on result.
@@ -62,6 +75,8 @@ type masterConfig struct {
 	// revoke: the master no longer accepts this node's token (it was
 	// rotated, or the node deleted). The node stops serving.
 	revoke bool
+	// usage: new used_base/used_self figures for the running config.
+	usage *usageUpdate
 }
 
 // errRevoked is a 401 from the master: the token is no longer valid.
@@ -89,7 +104,10 @@ type reportMessage struct {
 	TS        int64       `json:"ts"`
 	ConfigRev int64       `json:"config_rev"`
 	Users     []UserUsage `json:"users"`
-	System    SystemStats `json:"system"`
+	// Full: Users lists every user; otherwise only those whose figures
+	// changed since the previous report on this connection.
+	Full   bool        `json:"full"`
+	System SystemStats `json:"system"`
 	// Outbounds is the health of every outbound but direct.
 	Outbounds []OutboundStatus `json:"outbounds,omitempty"`
 	// Certs is the state of ACME certificates.
@@ -109,8 +127,13 @@ type incomingMessage struct {
 	Type   string          `json:"type"`
 	Rev    int64           `json:"rev"`
 	Config json.RawMessage `json:"config"`
-	ID     int64           `json:"id"`    // acme_dns_done
-	Error  string          `json:"error"` // acme_dns_done
+	// ReportDelta (with a config or usage): the master accepts reports of
+	// changed users only.
+	ReportDelta bool `json:"report_delta"`
+	// usage: name -> [used_base, used_self] for the config of Rev.
+	Users map[string][2]int64 `json:"users"`
+	ID    int64               `json:"id"`    // acme_dns_done
+	Error string              `json:"error"` // acme_dns_done
 }
 
 func (m *masterClient) run(ctx context.Context) {
@@ -156,6 +179,8 @@ func (m *masterClient) run(ctx context.Context) {
 func (m *masterClient) session(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	m.delta.Store(false)
+	m.sent, m.lastFull = nil, time.Time{} // a new connection starts with a full report
 	dialCtx, dialCancel := context.WithTimeout(ctx, 15*time.Second)
 	transport := &http.Transport{Proxy: nil, TLSClientConfig: m.tlsConfig()}
 	conn, resp, err := websocket.Dial(dialCtx, m.url, &websocket.DialOptions{
@@ -194,7 +219,7 @@ func (m *masterClient) session(ctx context.Context) error {
 	if err = send(helloMessage{
 		Type: "hello", NodeVersion: version, Protocols: strings.Split(builtProtocols(), ","),
 		Hostname: hostname, OS: runtime.GOOS, Arch: runtime.GOARCH, ConfigRev: m.node.rev(),
-		Features: []string{"spki_pin"},
+		Features: []string{"spki_pin", "usage_msg"},
 	}); err != nil {
 		return err
 	}
@@ -206,6 +231,8 @@ func (m *masterClient) session(ctx context.Context) error {
 	go func() { errs <- m.reportLoop(ctx, conn, send) }()
 	err = <-errs
 	conn.Close(websocket.StatusNormalClosure, "")
+	cancel()
+	<-errs // the next session resets what the loops use
 	return err
 }
 
@@ -222,6 +249,7 @@ func (m *masterClient) readLoop(ctx context.Context, conn *websocket.Conn, send 
 		}
 		switch msg.Type {
 		case "config":
+			m.delta.Store(msg.ReportDelta)
 			result := make(chan error, 1)
 			select {
 			case m.configs <- masterConfig{content: msg.Config, rev: msg.Rev, result: result}:
@@ -236,6 +264,15 @@ func (m *masterClient) readLoop(ctx context.Context, conn *websocket.Conn, send 
 			if err = send(applied); err != nil {
 				return err
 			}
+		case "usage":
+			m.delta.Store(msg.ReportDelta)
+			result := make(chan error, 1)
+			select {
+			case m.configs <- masterConfig{usage: &usageUpdate{rev: msg.Rev, users: msg.Users}, result: result}:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			<-result
 		case "acme_dns_done":
 			masterDNS.done(msg.ID, msg.Error)
 		default:
@@ -281,16 +318,42 @@ func (m *masterClient) report() reportMessage {
 		}
 	}
 	m.probesSent = newest
+	users, full := m.reportUsers(time.Now())
 	return reportMessage{
 		Type:      "report",
 		TS:        time.Now().Unix(),
 		ConfigRev: m.node.rev(),
-		Users:     m.node.users.usage(),
+		Users:     users,
+		Full:      full,
 		System:    m.sampler.sample(),
 		Outbounds: currentRouter.Load().outboundStatus(),
 		Certs:     certStatuses(),
 		Probes:    probes,
 	}
+}
+
+// reportUsers returns the users for the next report and whether that is all
+// of them. Usage is absolute, so a user left out is one the master already
+// has right; a full report every fullReportInterval (and on each new
+// connection) puts any drift right.
+func (m *masterClient) reportUsers(now time.Time) ([]UserUsage, bool) {
+	users := m.node.users.usage()
+	if !m.delta.Load() || m.sent == nil || now.Sub(m.lastFull) >= fullReportInterval {
+		m.sent = make(map[string]UserUsage, len(users))
+		for _, u := range users {
+			m.sent[u.Name] = u
+		}
+		m.lastFull = now
+		return users, true
+	}
+	changed := users[:0]
+	for _, u := range users {
+		if m.sent[u.Name] != u {
+			m.sent[u.Name] = u
+			changed = append(changed, u)
+		}
+	}
+	return changed, false
 }
 
 func (m *masterClient) tlsConfig() *tls.Config {

@@ -140,3 +140,60 @@ func TestSaveSkipsUnchangedCounters(t *testing.T) {
 		t.Fatalf("saved after a change: %+v", s)
 	}
 }
+
+func TestUsageMessages(t *testing.T) {
+	state := filepath.Join(t.TempDir(), "usage.json")
+	cached := func(rev int64) *Config {
+		return &Config{Rev: rev, Users: []UserConfig{{Name: "a", QuotaBytes: 100, Period: "p", UsedBase: 10}}}
+	}
+	r := newRegistry(state)
+	r.apply(cached(7).Users)
+	if r.applyUsage(7, usageUpdate{rev: 6, users: map[string][2]int64{"a": {200, 0}}}) {
+		t.Fatal("took a usage message for another config")
+	}
+	if !r.applyUsage(7, usageUpdate{rev: 7, users: map[string][2]int64{"a": {95, 3}, "x": {1, 1}}}) {
+		t.Fatal("dropped a usage message for the running config")
+	}
+	a := r.lookup("a")
+	if a.up.Load()+a.down.Load() != 3 || a.used() != 98 {
+		t.Fatalf("counted %d+%d, used %d; want 3 and 98", a.up.Load(), a.down.Load(), a.used())
+	}
+	if r.applyUsage(7, usageUpdate{rev: 7, users: map[string][2]int64{"a": {97, 1}}}); a.up.Load()+a.down.Load() != 3 {
+		t.Fatal("a lower used_self took counters back")
+	}
+	if !r.check(time.Now()) || r.lookup("a") != nil {
+		t.Fatal("not blocked once used_base reached the quota")
+	}
+	if err := r.save(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A restart with the cached config keeps the newer figures; another
+	// config does not take them.
+	r2 := newRegistry(state)
+	c := cached(7)
+	r2.restoreUsage(c)
+	if c.Users[0].UsedBase != 97 {
+		t.Fatalf("restored used_base %d, want 97", c.Users[0].UsedBase)
+	}
+	r2.apply(c.Users)
+	if r2.lookup("a") != nil {
+		t.Fatal("unblocked by a restart")
+	}
+	other := cached(8)
+	r2.restoreUsage(other)
+	if other.Users[0].UsedBase != 10 {
+		t.Fatal("figures for rev 7 applied to rev 8")
+	}
+
+	// A config fresh from the master replaces them for good.
+	r2.forgetUsage()
+	if err := r2.save(); err != nil {
+		t.Fatal(err)
+	}
+	c = cached(7)
+	newRegistry(state).restoreUsage(c)
+	if c.Users[0].UsedBase != 10 {
+		t.Fatal("figures survived a config from the master")
+	}
+}

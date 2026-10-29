@@ -78,6 +78,10 @@ type registry struct {
 	statePath string
 	saveMu    sync.Mutex
 	lastSaved []byte // what the last successful save wrote
+	// Usage messages (guarded by mu): the config rev they were for, and the
+	// used_base they set per user.
+	usageRev int64
+	base     map[string]int64
 	// saved holds counters of users not configured right now: loaded from
 	// statePath, or kept when a user is removed, so taking a user off and
 	// putting them back within a period does not reset what they used.
@@ -92,6 +96,11 @@ type savedUsage struct {
 
 type usageFile struct {
 	Users map[string]savedUsage `json:"users"`
+	// The used_base figures of the master's latest usage messages, for the
+	// config of rev UsageRev: newer than the ones cached with that config,
+	// so a restart without the master keeps limiting by them.
+	UsageRev int64            `json:"usage_rev,omitempty"`
+	Base     map[string]int64 `json:"base,omitempty"`
 }
 
 func newRegistry(statePath string) *registry {
@@ -106,6 +115,7 @@ func newRegistry(statePath string) *registry {
 			if file.Users != nil {
 				r.saved = file.Users
 			}
+			r.usageRev, r.base = file.UsageRev, file.Base
 		} else if !os.IsNotExist(err) {
 			log.Print("usage state: ", err)
 		}
@@ -154,6 +164,66 @@ func (r *registry) apply(users []UserConfig) {
 		}
 	}
 	r.check(time.Now())
+}
+
+// usageUpdate is one usage message from the master: new used_base and
+// used_self figures for some users of the config of rev. The connection
+// delivers them in order, after the config they are for.
+type usageUpdate struct {
+	rev   int64
+	users map[string][2]int64 // name -> {used_base, used_self}
+}
+
+// applyUsage takes a usage message if it is for the config running now
+// (rev); one for another config is dropped. As with a config, used_self only
+// ever raises a user's counters, and users not in the config are ignored.
+func (r *registry) applyUsage(rev int64, u usageUpdate) bool {
+	if rev == 0 || u.rev != rev {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if u.rev != r.usageRev {
+		r.usageRev, r.base = u.rev, nil
+	}
+	for name, figures := range u.users {
+		user := r.users[name]
+		if user == nil {
+			continue
+		}
+		user.cfg.UsedBase, user.cfg.UsedSelf = figures[0], figures[1]
+		if lost := figures[1] - user.up.Load() - user.down.Load(); lost > 0 {
+			user.up.Add(lost)
+		}
+		if r.base == nil {
+			r.base = make(map[string]int64)
+		}
+		r.base[name] = figures[0]
+	}
+	return true
+}
+
+// restoreUsage updates a config read back from disk with the used_base
+// figures that usage messages brought for it since it was cached.
+func (r *registry) restoreUsage(config *Config) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if config.Rev == 0 || config.Rev != r.usageRev {
+		return
+	}
+	for i := range config.Users {
+		if base, ok := r.base[config.Users[i].Name]; ok {
+			config.Users[i].UsedBase = base
+		}
+	}
+}
+
+// forgetUsage drops the usage messages' figures: a config just came from the
+// master, with figures as new as any.
+func (r *registry) forgetUsage() {
+	r.mu.Lock()
+	r.usageRev, r.base = 0, nil
+	r.mu.Unlock()
 }
 
 // lookup returns the user if it exists and may still connect.
@@ -249,6 +319,13 @@ func (r *registry) save() error {
 	r.mu.RLock()
 	for name, s := range r.saved {
 		file.Users[name] = s
+	}
+	if len(r.base) > 0 {
+		file.UsageRev = r.usageRev
+		file.Base = make(map[string]int64, len(r.base))
+		for name, b := range r.base {
+			file.Base[name] = b
+		}
 	}
 	r.mu.RUnlock()
 	for _, u := range r.usage() {
