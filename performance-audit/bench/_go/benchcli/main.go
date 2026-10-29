@@ -296,8 +296,8 @@ func main() {
 			n := 0
 			for time.Now().Before(end) {
 				<-tick.C
-				b := buf.NewSize(1500)
-				b.Resize(256, 0)
+				b := buf.NewSize(2600)
+				b.Resize(1024, 0)
 				b.Write(payload)
 				if err := pc.WritePacket(b, dest); err != nil {
 					log.Print(err)
@@ -312,8 +312,8 @@ func main() {
 		var worst time.Duration
 		var lost, ok int
 		for time.Now().Before(end) {
-			b := buf.NewSize(1500)
-			b.Resize(256, 0)
+			b := buf.NewSize(2600)
+			b.Resize(1024, 0)
 			b.Write(payload)
 			t := time.Now()
 			if err := pc.WritePacket(b, dest); err != nil {
