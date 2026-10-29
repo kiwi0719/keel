@@ -152,6 +152,7 @@ func (c *clientConn) writeRequest(payload []byte) error {
 	}
 
 	err = bufferedWriter.Flush()
+	writer.Release()
 	if err != nil {
 		return err
 	}

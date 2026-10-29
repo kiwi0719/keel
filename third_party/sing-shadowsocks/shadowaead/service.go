@@ -138,6 +138,7 @@ func (c *serverConn) writeResponse(payload []byte) (n int, err error) {
 	}
 
 	err = bufferedWriter.Flush()
+	writer.Release()
 	if err != nil {
 		return
 	}

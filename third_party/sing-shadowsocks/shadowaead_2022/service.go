@@ -296,6 +296,7 @@ func (c *serverConn) writeResponse(payload []byte) (n int, err error) {
 	}
 
 	err = writer.BufferedWriter(header.Len()).Flush()
+	writer.Release()
 	if err != nil {
 		return
 	}
@@ -333,25 +334,6 @@ func (c *serverConn) Write(p []byte) (n int, err error) {
 	}
 	defer c.access.Unlock()
 	return c.writeResponse(p)
-}
-
-func (c *serverConn) WriteVectorised(buffers []*buf.Buffer) error {
-	if c.writer != nil {
-		return c.writer.WriteVectorised(buffers)
-	}
-	c.access.Lock()
-	if c.writer != nil {
-		c.access.Unlock()
-		return c.writer.WriteVectorised(buffers)
-	}
-	defer c.access.Unlock()
-	_, err := c.writeResponse(buffers[0].Bytes())
-	if err != nil {
-		buf.ReleaseMulti(buffers)
-		return err
-	}
-	buffers[0].Release()
-	return c.writer.WriteVectorised(buffers[1:])
 }
 
 func (c *serverConn) Close() error {
