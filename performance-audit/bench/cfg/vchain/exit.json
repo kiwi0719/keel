@@ -1,0 +1,28 @@
+{
+ "route": {
+  "allow_private": true
+ },
+ "inbounds": [
+  {
+   "type": "vless",
+   "listen": "127.0.0.1:20203",
+   "reality": {
+    "dest": "127.0.0.1:20443",
+    "server_names": [
+     "dest.test"
+    ],
+    "private_key": "aNMmXzNyWZbuLfHye7yaWyPIpkxNW8I_GVPYQctm3kk",
+    "short_ids": [
+     "0123456789abcdef"
+    ]
+   }
+  }
+ ],
+ "users": [
+  {
+   "name": "u1",
+   "uuid": "80cc6a3a-1514-4342-af5b-78008172e101",
+   "flow": "xtls-rprx-vision"
+  }
+ ]
+}

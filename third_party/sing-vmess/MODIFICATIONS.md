@@ -5,4 +5,5 @@
 - `vless.VisionConn.unPadding`: a 5-byte padding block header split across two reads is carried over instead of read past the end of the buffer.
 - `ServerMuxConn`: a `StatusNew` frame that reuses a live session ID closes the old stream's pipe instead of orphaning its relay.
 - `vless.VisionConn.padding` and the VMess client header: padding is written as zeros. Upstream reserved it with `Buffer.Extend` over pooled buffers that are never cleared, so a Vision server sent up to about 1.4 KB of whatever an earlier connection left in the buffer (possibly another user's data) to every client.
-- `vless/bounds_test.go`: tests for the above.
+- `vless.VisionConn`: `NeedHandshakeForRead/Write`, `ReaderReplaceable/WriterReplaceable` and `UpstreamReader/UpstreamWriter`, so that once Vision has gone direct (and the records that arrived through TLS have been handed out) sing's copy unwraps to the TCP connection, keeping its counters, and splices on Linux. Before that they point at the TLS connection, which sing also follows for headroom. Padding and filtering are unchanged. Upstream left the copy reading and writing through `VisionConn` for the whole connection.
+- `vless/bounds_test.go`, `vless/vision_direct_test.go`: tests for the above.
