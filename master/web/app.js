@@ -108,7 +108,7 @@ function statusMark(kind) {
 async function api(method, path, body) {
   const res = await fetch(path, {
     method, credentials: 'same-origin',
-    headers: body ? { 'content-type': 'application/json' } : {},
+    headers: body ? { 'content-type': 'application/json', 'x-keel': '1' } : { 'x-keel': '1' },
     body: body ? JSON.stringify(body) : undefined
   });
   let json = {};
@@ -563,10 +563,11 @@ function renderDrawer(focus) {
 
 function field(label, name, value, opts) {
   opts = opts || {};
-  return `<label class="field ${opts.full ? 'full' : ''}">${label}<input name="${name}" value="${esc(value)}" autocomplete="off" data-1p-ignore ${opts.type ? `type="${opts.type}"` : ''} ${opts.placeholder ? `placeholder="${esc(opts.placeholder)}"` : ''} ${opts.inputmode ? `inputmode="${opts.inputmode}"` : ''}></label>`;
+  const ac = { cf_token: 'off', password: 'new-password', current_password: 'current-password', username: 'username' }[name] || 'off';
+  return `<label class="field ${opts.full ? 'full' : ''}">${label}<input name="${esc(name)}" value="${esc(value)}" autocomplete="${ac}" ${name === 'cf_token' ? 'data-1p-ignore data-lpignore="true"' : 'data-1p-ignore'} ${opts.type ? `type="${opts.type}"` : ''} ${opts.placeholder ? `placeholder="${esc(opts.placeholder)}"` : ''} ${opts.inputmode ? `inputmode="${opts.inputmode}"` : ''}></label>`;
 }
 function sw(name, on, label) {
-  return `<button type="button" class="switch" data-act="switch" data-name="${name}" aria-pressed="${!!on}" aria-label="${esc(label)}"><i></i></button><input type="hidden" name="${name}" value="${on ? 1 : 0}">`;
+  return `<button type="button" class="switch" data-act="switch" data-name="${esc(name)}" aria-pressed="${!!on}" aria-label="${esc(label)}"><i></i></button><input type="hidden" name="${esc(name)}" value="${on ? 1 : 0}">`;
 }
 
 // The node's address is read-only (detected from its connection) and stays
@@ -842,6 +843,12 @@ function settingsDrawer() {
       </div></section>
       <section class="sec"><h3>三网测速目标</h3><div class="fields">${targets}</div>
         <p class="small muted" style="margin:0">默认是上海三网（Zstatic 公开的 TCPing 节点，地址由对方自动更新）。换省份就把 sh 改成对应代号。节点每 30 秒对每个目标 TCP 连 10 次，算延迟、波动和重传。留空就不测。</p></section>
+      ${st.panel_acme_available ? `<section class="sec"><h3>面板证书</h3><div class="fields"><div class="field">向 Let's Encrypt 申请面板证书${sw('panel_acme', st.panel_acme, '自动申请面板证书')}</div></div>
+        <p class="small muted" style="margin:0">要先在下面填好 https:// 开头的面板域名。有 Cloudflare 令牌就用 DNS 验证，否则要能从外面访问本机 80 端口。证书沿用主控原来的密钥，节点不用重装，但要先把每个节点升级（agent update），全部升级后才会申请。${st.panel_cert ? (st.panel_cert.error ? `<br><b>${esc(st.panel_cert.error)}</b>` : (st.panel_cert.not_after ? `<br>已签发 ${esc(st.panel_cert.domain)}，${new Date(st.panel_cert.not_after * 1000).toISOString().slice(0, 10)} 到期，自动续期。` : '')) : ''}</p></section>` : ''}
+      <section class="sec"><h3>公开探针页</h3><div class="fields"><div class="field">在 / 显示节点状态（不用登录）${sw('public_page', st.public_page, '公开探针页')}</div></div>
+        <p class="small muted" style="margin:0">打开后任何人都能看到节点名字、在线状态和流量，也能由此认出这是 keel 面板。关着时 / 返回 404。</p></section>
+      <section class="sec"><h3>面板地址</h3><div class="fields">${field('节点和订阅用的地址', 'panel_url', st.panel_url || '', { full: true, placeholder: st.base_url })}</div>
+        <p class="small muted" style="margin:0">留空就用浏览器当前访问的地址。放在反向代理后面时请填 https:// 开头的地址，否则安装命令和订阅可能变成明文 http://。${(st.panel_url || st.base_url || '').startsWith('http://') ? '<b>现在是 http://，节点令牌和用户凭据会明文传输。</b>' : ''}</p></section>
       ${st.fingerprint ? `<section class="sec"><h3>主控证书指纹</h3><div class="mono small" style="word-break:break-all">${esc(st.fingerprint)}</div></section>` : ''}
       <section class="sec"><h3>证书自动申请</h3><div class="fields two">
         ${field('邮箱（证书到期提醒，可不填）', 'acme_email', st.acme_email || '')}
@@ -994,7 +1001,7 @@ const actions = {
     catch (e) { drawerError(e.message); }
   },
   async token(el) {
-    if (!confirm('换令牌后旧令牌立即失效，节点会断开，要用新命令重装一次。继续？')) return;
+    if (!confirm('换令牌后旧令牌立即失效，节点会断开，10 分钟后停止服务，要用新命令重装一次。继续？')) return;
     try { const r = await api('POST', `/api/nodes/${el.dataset.id}/token`); await refresh(); openDrawer({ kind: 'install', id: +el.dataset.id, install: r.install, rotated: true }); }
     catch (e) { drawerError(e.message); }
   },
@@ -1056,7 +1063,7 @@ const actions = {
   },
   async 'node-del'(el) {
     const n = node(+el.dataset.id);
-    if (!confirm(`删除 ${nm(n)}？节点会断开，用它的线路改回直连。`)) return;
+    if (!confirm(`删除 ${nm(n)}？节点会断开，10 分钟后停止服务（服务器上的程序要自己卸载），用它的线路改回直连。`)) return;
     closeDrawer();
     act(() => api('DELETE', `/api/nodes/${n.id}`), `已删除 ${nm(n)}。`);
   },
@@ -1131,7 +1138,7 @@ const actions = {
     act(() => api('DELETE', `/api/users/${u.id}`), `已删除 ${u.name}。`);
   },
   async 'sub-rotate'(el) {
-    if (!confirm('重置后旧订阅链接立即失效，要把新链接重新发给这个用户。继续？')) return;
+    if (!confirm('重置后旧订阅链接和代理密码都立即失效，要把新链接重新发给这个用户，他的客户端要重新导入。继续？')) return;
     try { await api('POST', `/api/users/${el.dataset.id}/sub`); flash('订阅已重置，点复制订阅拿新链接。'); await refresh(); keepUserDraft(); renderDrawer(); }
     catch (e) { drawerError(e.message); }
   },
@@ -1142,6 +1149,9 @@ const actions = {
       probe_targets: st.probe_targets.map(t => ({ name: t.name, label: t.label, host: (f['probe_' + t.name] || '').trim() }))
     };
     body.acme_email = (f.acme_email || '').trim();
+    body.panel_url = (f.panel_url || '').trim();
+    body.public_page = f.public_page === '1';
+    if (st.panel_acme_available) body.panel_acme = f.panel_acme === '1';
     if (f.cf_token) body.cf_token = f.cf_token.trim();
     body.username = f.username.trim(); body.current_password = f.current_password;
     if (f.password) body.password = f.password;

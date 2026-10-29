@@ -4,7 +4,9 @@
 # service (systemd or OpenRC) that dials back to the master.
 set -eu
 
-MASTER="" TOKEN="" FINGERPRINT="" PIN=""
+# The token may come in KEEL_TOKEN instead of --token, which keeps it out of
+# the process list other users on this machine can read.
+MASTER="" TOKEN="${KEEL_TOKEN:-}" FINGERPRINT="" PIN=""
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--master) MASTER=$2; shift 2 ;;
@@ -39,7 +41,12 @@ fetch "$MASTER/dl/keel-node-linux-$ARCH" /usr/local/bin/keel-node.new
 chmod 755 /usr/local/bin/keel-node.new
 mv /usr/local/bin/keel-node.new /usr/local/bin/keel-node
 # `agent` shows the node's status and restarts, updates or tails it.
-ln -sf /usr/local/bin/keel-node /usr/local/bin/agent
+# Not over some other program that happens to be called agent.
+if [ ! -e /usr/local/bin/agent ] || [ "$(readlink /usr/local/bin/agent)" = /usr/local/bin/keel-node ]; then
+	ln -sf /usr/local/bin/keel-node /usr/local/bin/agent
+else
+	echo "/usr/local/bin/agent already exists and is not keel's; run 'keel-node agent' instead" >&2
+fi
 
 umask 077
 printf 'KEEL_TOKEN=%s\n' "$TOKEN" >/etc/keel/token.env
@@ -61,10 +68,12 @@ ExecStart=/usr/local/bin/keel-node $ARGS
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
-# Root for low ports and certificate files, but sandboxed: it writes only
-# /etc/keel (config cache, certificates) and /var/lib/keel (counters).
+# Root, to read certificate files wherever they are, but with no capability
+# beyond binding low ports, and a read-only system except /etc/keel (config
+# cache, certificates) and /var/lib/keel (counters).
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=yes
-ProtectSystem=full
+ProtectSystem=strict
 ReadWritePaths=/etc/keel /var/lib/keel
 ProtectHome=read-only
 PrivateTmp=yes
@@ -77,6 +86,10 @@ RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ProtectClock=yes
+ProtectHostname=yes
+SystemCallFilter=@system-service
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 SystemCallArchitectures=native
 
@@ -128,11 +141,15 @@ fi
 echo "keel-node installed; it should show up as online in the panel within a few seconds."
 echo "run 'agent' on this server to see its status ('agent help' for more)."
 # Ports to open or map at the provider (NAT boxes: public -> listen).
+# The header goes through a root-only file, not curl's arguments.
+HDR=$(mktemp)
+printf 'Authorization: Bearer %s\n' "$TOKEN" >"$HDR"
 if [ -n "$PIN" ]; then
-	PORTS=$(curl -fsSk --pinnedpubkey "sha256//$PIN" -H "Authorization: Bearer $TOKEN" "$MASTER/api/node/ports" 2>/dev/null || true)
+	PORTS=$(curl -fsSk --pinnedpubkey "sha256//$PIN" -H "@$HDR" "$MASTER/api/node/ports" 2>/dev/null || true)
 else
-	PORTS=$(curl -fsS -H "Authorization: Bearer $TOKEN" "$MASTER/api/node/ports" 2>/dev/null || true)
+	PORTS=$(curl -fsS -H "@$HDR" "$MASTER/api/node/ports" 2>/dev/null || true)
 fi
+rm -f "$HDR"
 if [ -n "$PORTS" ]; then
 	echo
 	echo "ports (open TCP+UDP; on a NAT box map public -> listen):"

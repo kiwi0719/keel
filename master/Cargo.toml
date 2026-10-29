@@ -10,6 +10,7 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "fs"] }
 hyper = { version = "1", features = ["server", "client", "http1"] }
 http-body-util = "0.1"
+bytes = "1"
 webpki-roots = "0.26"
 hyper-util = { version = "0.1", features = ["tokio", "server", "http1", "service"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
@@ -25,6 +26,7 @@ base64 = "0.22"
 rand = "0.8"
 argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
+instant-acme = { version = "0.8", default-features = false, features = ["ring", "hyper-rustls"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 
 [profile.release]

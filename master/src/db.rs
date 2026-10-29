@@ -123,6 +123,24 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     // AnyTLS certificate files on the node; empty = the node's own self-signed cert.
     ("nodes", "anytls_cert", "TEXT NOT NULL DEFAULT ''"),
     ("nodes", "anytls_key", "TEXT NOT NULL DEFAULT ''"),
+    // Self-signed AnyTLS certificate the master makes for an entry without
+    // cert files or ACME, so subscriptions can pin it. self_name records the
+    // name and year it was made for.
+    ("nodes", "anytls_self_cert", "TEXT NOT NULL DEFAULT ''"),
+    ("nodes", "anytls_self_key", "TEXT NOT NULL DEFAULT ''"),
+    ("nodes", "anytls_self_name", "TEXT NOT NULL DEFAULT ''"),
+    // Mixed into the keys this entry uses on exits; a new one (on token
+    // rotation) makes keys a leaked node config held useless.
+    ("nodes", "key_salt", "TEXT NOT NULL DEFAULT ''"),
+    // 1 once the node applied a config with master_spki: it accepts the
+    // master's key, so the panel may move to a CA certificate.
+    ("nodes", "spki_ready", "INTEGER NOT NULL DEFAULT 0"),
+    // 1: the user's AnyTLS password and UUID differ per entry (derived from
+    // the stored ones), so one entry's config does not open the others.
+    // Users from before keep one set until their subscription is reset.
+    ("users", "per_entry", "INTEGER NOT NULL DEFAULT 0"),
+    // External VLESS exit over TLS: the certificate name to verify ('' = plain TCP).
+    ("exits", "tls_sni", "TEXT NOT NULL DEFAULT ''"),
     // uTLS fingerprint clients present for Reality (subscription only).
     ("nodes", "reality_fp", "TEXT NOT NULL DEFAULT 'chrome'"),
     // Public ports for NAT boxes, where the provider maps public -> listen
@@ -255,6 +273,12 @@ pub struct Node {
     pub anytls_key: String,
     pub anytls_pub: i64,
     pub anytls_acme: bool,
+    #[serde(skip)]
+    pub anytls_self_cert: String,
+    #[serde(skip)]
+    pub anytls_self_key: String,
+    #[serde(skip)]
+    pub key_salt: String,
     pub vless_on: bool,
     pub vless_port: i64,
     pub reality_dest: String,
@@ -300,7 +324,7 @@ impl Node {
     }
 }
 
-const NODE_COLS: &str = "id,code,name,role,host,last_ip,token,sort,ipv4_only,direct_list,anytls_on,anytls_port,anytls_sni,vless_on,vless_port,reality_dest,reality_sni,reality_private,reality_public,reality_short_id,ss_on,ss_port,ss_psk,default_exit,config_rev,default_fallback,anytls_cert,anytls_key,reality_fp,anytls_pub,vless_pub,anytls_acme";
+const NODE_COLS: &str = "id,code,name,role,host,last_ip,token,sort,ipv4_only,direct_list,anytls_on,anytls_port,anytls_sni,vless_on,vless_port,reality_dest,reality_sni,reality_private,reality_public,reality_short_id,ss_on,ss_port,ss_psk,default_exit,config_rev,default_fallback,anytls_cert,anytls_key,reality_fp,anytls_pub,vless_pub,anytls_acme,anytls_self_cert,anytls_self_key,key_salt";
 
 fn node_from_row(r: &rusqlite::Row) -> rusqlite::Result<Node> {
     Ok(Node {
@@ -336,6 +360,9 @@ fn node_from_row(r: &rusqlite::Row) -> rusqlite::Result<Node> {
         anytls_pub: r.get(29)?,
         vless_pub: r.get(30)?,
         anytls_acme: r.get(31)?,
+        anytls_self_cert: r.get(32)?,
+        anytls_self_key: r.get(33)?,
+        key_salt: r.get(34)?,
     })
 }
 
@@ -362,6 +389,8 @@ pub struct Exit {
     pub uuid: String,
     /// External shadowsocks: the cipher.
     pub method: String,
+    /// External VLESS over TLS: the certificate name; empty for plain TCP.
+    pub tls_sni: String,
 }
 
 impl Exit {
@@ -415,9 +444,26 @@ pub struct User {
     pub ss_key: String,
     #[serde(skip)]
     pub sub_token: String,
+    #[serde(skip)]
+    pub per_entry: bool,
 }
 
-const USER_COLS: &str = "id,name,plan,quota_bytes,expire_at,reset_day,reset_period,reset_seq,enabled,anytls_password,uuid,ss_key,sub_token";
+impl User {
+    /// The AnyTLS password and VLESS UUID this user has on one entry.
+    pub fn credentials_for(&self, entry: i64) -> (String, String) {
+        if !self.per_entry {
+            return (self.anytls_password.clone(), self.uuid.clone());
+        }
+        let pw = crate::util::hex(&crate::util::sha256(format!("keel entry anytls\0{}\0{entry}", self.anytls_password).as_bytes()));
+        let mut u = crate::util::sha256(format!("keel entry uuid\0{}\0{entry}", self.uuid).as_bytes());
+        u[6] = (u[6] & 0x0f) | 0x40; // version 4 layout
+        u[8] = (u[8] & 0x3f) | 0x80;
+        let h = crate::util::hex(&u[..16]);
+        (pw[..32].to_string(), format!("{}-{}-{}-{}-{}", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32]))
+    }
+}
+
+const USER_COLS: &str = "id,name,plan,quota_bytes,expire_at,reset_day,reset_period,reset_seq,enabled,anytls_password,uuid,ss_key,sub_token,per_entry";
 
 fn user_from_row(r: &rusqlite::Row) -> rusqlite::Result<User> {
     Ok(User {
@@ -434,6 +480,7 @@ fn user_from_row(r: &rusqlite::Row) -> rusqlite::Result<User> {
         uuid: r.get(10)?,
         ss_key: r.get(11)?,
         sub_token: r.get(12)?,
+        per_entry: r.get(13)?,
     })
 }
 
@@ -482,7 +529,7 @@ pub fn load_world(conn: &Connection) -> rusqlite::Result<World> {
     w.cf_token = get_setting(conn, "cf_token")?.unwrap_or_default();
     let mut st = conn.prepare(&format!("SELECT {NODE_COLS} FROM nodes ORDER BY sort, id"))?;
     w.nodes = st.query_map([], node_from_row)?.collect::<Result<_, _>>()?;
-    let mut st = conn.prepare("SELECT id,COALESCE(node_id,0),name,port,psk,quota_bytes,reset_day,udp_over_tcp,sort,kind,server,uuid,method,pub_port FROM exits ORDER BY sort, id")?;
+    let mut st = conn.prepare("SELECT id,COALESCE(node_id,0),name,port,psk,quota_bytes,reset_day,udp_over_tcp,sort,kind,server,uuid,method,pub_port,tls_sni FROM exits ORDER BY sort, id")?;
     w.exits = st
         .query_map([], |r| {
             Ok(Exit {
@@ -499,6 +546,7 @@ pub fn load_world(conn: &Connection) -> rusqlite::Result<World> {
                 server: r.get(10)?,
                 uuid: r.get(11)?,
                 method: r.get(12)?,
+                tls_sni: r.get(14)?,
                 pub_port: r.get(13)?,
             })
         })?
@@ -525,10 +573,14 @@ pub fn load_world(conn: &Connection) -> rusqlite::Result<World> {
     }
     // Periods are at most a month long; older rows only matter for history.
     let since = crate::period::now() - 70 * 86_400;
-    let mut st = conn.prepare("SELECT node_id,name,period,up+down FROM usage WHERE updated >= ?1")?;
-    for row in st.query_map([since], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?)))? {
-        let (n, name, period, v) = row?;
-        w.usage.insert((n, name, period), v);
+    // Summed here rather than in SQL: an overflowing up+down turns into a
+    // REAL there, and one unreadable row must not take the whole world down.
+    let mut st = conn.prepare("SELECT node_id,name,period,up,down FROM usage WHERE updated >= ?1")?;
+    let rows = st.query_map([since], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?))
+    })?;
+    for (n, name, period, up, down) in rows.flatten() {
+        w.usage.insert((n, name, period), up.max(0).saturating_add(down.max(0)));
     }
     Ok(w)
 }
@@ -547,12 +599,16 @@ pub fn insert_node(conn: &Connection, role: &str, code: &str, name: &str, now: i
     let id = fresh_id(conn, "nodes")?;
     if role == "entry" {
         let (private, public) = crate::util::reality_keypair();
+        // Different entries borrow different sites, so the same camouflage
+        // does not mark every keel entry. All serve TLS 1.3 with X25519.
+        const DESTS: &[&str] = &["www.apple.com", "www.microsoft.com", "www.amazon.com", "www.cloudflare.com", "www.samsung.com", "www.nvidia.com"];
+        let dest = DESTS[crate::util::random_bytes(1)[0] as usize % DESTS.len()];
         let anytls_port = crate::util::random_port(&[]);
         let vless_port = crate::util::random_port(&[anytls_port]);
         conn.execute(
             "INSERT INTO nodes(code,name,role,token,sort,anytls_on,anytls_port,vless_on,vless_port,reality_dest,reality_sni,reality_private,reality_public,reality_short_id,ss_port,ss_psk,created_at,id)
-             VALUES(?1,?2,'entry',?3,?4,1,?10,0,?11,'www.apple.com:443','www.apple.com',?5,?6,?7,0,?8,?9,?12)",
-            params![code, name, token, sort, private, public, random_hex(8), random_b64(16), now, anytls_port, vless_port, id],
+             VALUES(?1,?2,'entry',?3,?4,1,?10,0,?11,?13,?14,?5,?6,?7,0,?8,?9,?12)",
+            params![code, name, token, sort, private, public, random_hex(8), random_b64(16), now, anytls_port, vless_port, id, format!("{dest}:443"), dest],
         )?;
     } else {
         conn.execute(
@@ -563,19 +619,34 @@ pub fn insert_node(conn: &Connection, role: &str, code: &str, name: &str, now: i
     Ok(id)
 }
 
+/// A new user never gets a deleted user's id: usage is stored by the
+/// counter name u<id>, which would carry over.
 pub fn insert_user(conn: &Connection, name: &str, now: i64) -> rusqlite::Result<i64> {
+    let id = fresh_id(conn, "users")?;
     conn.execute(
-        "INSERT INTO users(name,anytls_password,uuid,ss_key,sub_token,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
-        params![name, random_hex(16), random_uuid(), random_b64(16), random_hex(16), now],
+        "INSERT INTO users(id,name,anytls_password,uuid,ss_key,sub_token,created_at,per_entry) VALUES(?7,?1,?2,?3,?4,?5,?6,1)",
+        params![name, random_hex(16), random_uuid(), random_b64(16), random_hex(16), now, id],
     )?;
-    Ok(conn.last_insert_rowid())
+    Ok(id)
 }
 
-/// Stores the absolute counters from a node report.
+/// Counter names a node may report: the users the master gives an entry,
+/// or the per-entry counters of an exit node's own ports.
+pub fn node_counters(conn: &Connection, node: i64) -> rusqlite::Result<std::collections::HashSet<String>> {
+    let mut st = conn.prepare(
+        "SELECT 'u' || user_id FROM user_entries WHERE node_id=?1
+         UNION SELECT 'n' || n.id || 'x' || e.id FROM exits e, nodes n WHERE e.node_id=?1 AND n.role='entry'",
+    )?;
+    let rows = st.query_map([node], |r| r.get::<_, String>(0))?;
+    rows.collect()
+}
+
+/// Stores the absolute counters from a node report. Within a period they only
+/// grow: a node that crashed before saving reports less than it had.
 pub fn store_usage(conn: &Connection, node: i64, rows: &[(String, String, i64, i64)], now: i64) -> rusqlite::Result<()> {
     let mut st = conn.prepare_cached(
         "INSERT INTO usage(node_id,name,period,up,down,updated) VALUES(?1,?2,?3,?4,?5,?6)
-         ON CONFLICT(node_id,name,period) DO UPDATE SET up=excluded.up, down=excluded.down, updated=excluded.updated",
+         ON CONFLICT(node_id,name,period) DO UPDATE SET up=MAX(up,excluded.up), down=MAX(down,excluded.down), updated=excluded.updated",
     )?;
     for (name, period, up, down) in rows {
         st.execute(params![node, name, period, up, down, now])?;
@@ -593,7 +664,10 @@ pub fn add_node_month(conn: &Connection, node: i64, month: &str, rx: i64, tx: i6
 }
 
 pub fn node_months(conn: &Connection, month: &str) -> rusqlite::Result<HashMap<i64, (i64, i64)>> {
-    let mut st = conn.prepare("SELECT node_id,rx,tx FROM node_month WHERE month=?1")?;
+    // Totals that once overflowed into REAL are read back clamped.
+    let mut st = conn.prepare(
+        "SELECT node_id,CAST(MAX(0,MIN(rx,9e18)) AS INTEGER),CAST(MAX(0,MIN(tx,9e18)) AS INTEGER) FROM node_month WHERE month=?1",
+    )?;
     let rows = st.query_map([month], |r| Ok((r.get::<_, i64>(0)?, (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))))?;
     rows.collect()
 }
@@ -602,4 +676,59 @@ pub fn prune(conn: &Connection, now: i64) -> rusqlite::Result<()> {
     conn.execute("DELETE FROM usage WHERE updated < ?1", [now - 400 * 86_400])?;
     conn.execute("DELETE FROM sessions WHERE expires < ?1", [now])?;
     Ok(())
+}
+
+impl Node {
+    /// The name clients check the AnyTLS certificate against.
+    pub fn anytls_name(&self) -> &str {
+        if self.anytls_sni.is_empty() {
+            self.address()
+        } else {
+            &self.anytls_sni
+        }
+    }
+
+    /// Whether the entry serves the master-made self-signed certificate.
+    pub fn anytls_self_signed(&self) -> bool {
+        !self.anytls_acme && (self.anytls_cert.is_empty() || self.anytls_key.is_empty()) && !self.anytls_self_cert.is_empty()
+    }
+}
+
+/// Makes or renews the self-signed AnyTLS certificate of every entry that
+/// needs one: a neutral subject for the name clients use, valid for a year
+/// or two, renewed each new year and whenever that name changes.
+pub fn ensure_self_certs(conn: &Connection) -> rusqlite::Result<()> {
+    let year = 1970 + (crate::period::now() / 31_556_952) as i32;
+    let mut st = conn.prepare(&format!("SELECT {NODE_COLS}, anytls_self_name FROM nodes WHERE role='entry' AND anytls_on=1"))?;
+    let rows: Vec<(Node, String)> = st.query_map([], |r| Ok((node_from_row(r)?, r.get(35)?)))?.collect::<Result<_, _>>()?;
+    for (n, made) in rows {
+        let wanted = format!("{}|{year}", n.anytls_name());
+        let uses_own = !n.anytls_acme && (n.anytls_cert.is_empty() || n.anytls_key.is_empty());
+        if !uses_own || n.anytls_name().is_empty() || made == wanted {
+            continue;
+        }
+        let Ok((cert, key)) = self_signed(n.anytls_name(), year) else { continue };
+        conn.execute(
+            "UPDATE nodes SET anytls_self_cert=?1, anytls_self_key=?2, anytls_self_name=?3 WHERE id=?4",
+            params![cert, key, wanted, n.id],
+        )?;
+    }
+    Ok(())
+}
+
+fn self_signed(name: &str, year: i32) -> Result<(String, String), rcgen::Error> {
+    let key = rcgen::KeyPair::generate()?;
+    let mut params = rcgen::CertificateParams::new(vec![name.to_string()])?;
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params.distinguished_name.push(rcgen::DnType::CommonName, name);
+    params.not_before = rcgen::date_time_ymd(year, 1, 1);
+    params.not_after = rcgen::date_time_ymd(year + 2, 1, 1);
+    let cert = params.self_signed(&key)?;
+    Ok((cert.pem(), key.serialize_pem()))
+}
+
+/// SHA-256 of a PEM certificate's DER, as lowercase hex.
+pub fn cert_sha256(pem: &str) -> Option<String> {
+    let der = rustls_pemfile::certs(&mut pem.as_bytes()).next()?.ok()?;
+    Some(crate::util::hex(&crate::util::sha256(der.as_ref())))
 }
