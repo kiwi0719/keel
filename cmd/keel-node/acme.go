@@ -39,7 +39,7 @@ type ACMEConfig struct {
 	// "" to choose: dns when a token is set, else tls-alpn when the inbound
 	// listens on 443, else http.
 	Challenge   string `json:"challenge,omitempty"`
-	DNSProvider string `json:"dns_provider,omitempty"` // "cloudflare"
+	DNSProvider string `json:"dns_provider,omitempty"` // "cloudflare", or "master": the master sets the record
 	DNSToken    string `json:"dns_token,omitempty"`    // API token allowed to edit the zone's DNS
 	CA          string `json:"ca,omitempty"`           // ACME directory URL
 }
@@ -63,7 +63,9 @@ var (
 	// dnsCheckServer is asked whether a DNS-01 record is visible before the
 	// CA is told to look; empty skips the check.
 	dnsCheckServer = "1.1.1.1:53"
-	acmeHTTPClient *http.Client // nil: http.DefaultClient
+	// acmeHTTPClient talks to the CA and Cloudflare. Like the master
+	// connection it ignores HTTP(S)_PROXY. Tests replace it.
+	acmeHTTPClient = &http.Client{Transport: &http.Transport{Proxy: nil, TLSHandshakeTimeout: 10 * time.Second}, Timeout: time.Minute}
 )
 
 // certManager keeps one inbound's certificate: it serves the stored one,
@@ -119,10 +121,11 @@ func newCertManager(domain, listen string, config ACMEConfig) (*certManager, err
 		return nil, fmt.Errorf("acme: unknown challenge %q", config.Challenge)
 	}
 	if config.Challenge == "dns" || config.DNSToken != "" {
-		if config.DNSProvider != "cloudflare" {
-			return nil, fmt.Errorf("acme: dns_provider must be \"cloudflare\", got %q", config.DNSProvider)
-		}
-		if config.DNSToken == "" {
+		switch {
+		case config.DNSProvider == "master":
+		case config.DNSProvider != "cloudflare":
+			return nil, fmt.Errorf("acme: dns_provider must be \"cloudflare\" or \"master\", got %q", config.DNSProvider)
+		case config.DNSToken == "":
 			return nil, errors.New("acme: dns challenge needs dns_token")
 		}
 	}
@@ -162,13 +165,18 @@ func (m *certManager) tlsConfig() *tls.Config {
 			return m.cert.Load(), nil
 		},
 	}
+	if m.challenge() != "tls-alpn" {
+		return base
+	}
+	// Outside a pending challenge an acme-tls/1 offer gets the normal
+	// certificate, like any other client: an alert would mark the server.
 	base.GetConfigForClient = func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
 		if !slices.Contains(hello.SupportedProtos, acmeTLSALPN) {
 			return nil, nil
 		}
 		answer := m.alpn.Load()
 		if answer == nil {
-			return nil, errors.New("no tls-alpn-01 challenge pending")
+			return nil, nil
 		}
 		return &tls.Config{Certificates: []tls.Certificate{*answer}, NextProtos: []string{acmeTLSALPN}}, nil
 	}
@@ -201,6 +209,9 @@ func (m *certManager) load() (*tls.Certificate, error) {
 	return &cert, nil
 }
 
+// acmeMinGap is the least time between two certificate orders.
+const acmeMinGap = 12 * time.Hour
+
 func (m *certManager) run(ctx context.Context) {
 	retry := acmeRetryMin
 	for {
@@ -222,6 +233,14 @@ func (m *certManager) run(ctx context.Context) {
 		}
 		if err == nil {
 			retry = acmeRetryMin
+			// A certificate that is already due again (a CA issuing short
+			// lifetimes, or a clock far ahead) must not be re-ordered in a
+			// loop: the CA would rate-limit or ban the account.
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(acmeMinGap):
+			}
 			continue
 		}
 		log.Printf("acme %s: %v (retrying in %s)", m.domain, err, retry)
@@ -296,6 +315,16 @@ func (m *certManager) obtain(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return err
+	}
+	if err = leaf.VerifyHostname(m.domain); err != nil {
+		return fmt.Errorf("issued certificate: %w", err)
+	}
+	if now := time.Now(); leaf.NotAfter.Before(now) || leaf.NotBefore.After(now.Add(time.Hour)) {
+		return fmt.Errorf("issued certificate is not valid now (%s to %s)", leaf.NotBefore.UTC(), leaf.NotAfter.UTC())
+	}
 	certPath, keyPath := m.paths()
 	if err = writeFileAtomic(keyPath, keyPEM, 0o600); err != nil {
 		return err
@@ -322,7 +351,11 @@ func (m *certManager) client(ctx context.Context) (*acme.Client, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", keyPath, err)
 		}
-		key = parsed.(crypto.Signer)
+		signer, ok := parsed.(crypto.Signer)
+		if !ok {
+			return nil, fmt.Errorf("%s: not a signing key", keyPath)
+		}
+		key = signer
 	} else {
 		generated, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 		if err != nil {
@@ -416,6 +449,23 @@ func (m *certManager) prepare(ctx context.Context, client *acme.Client, chal *ac
 			return nil, err
 		}
 		name := "_acme-challenge." + m.domain
+		if m.config.DNSProvider == "master" {
+			if err := masterDNS.call(ctx, "set", m.domain, value); err != nil {
+				return nil, err
+			}
+			cleanup := func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				if err := masterDNS.call(ctx, "clear", m.domain, ""); err != nil {
+					log.Printf("acme %s: remove TXT record: %v", m.domain, err)
+				}
+			}
+			if err = waitTXT(ctx, name, value); err != nil {
+				cleanup()
+				return nil, err
+			}
+			return cleanup, nil
+		}
 		cf := cloudflare{token: m.config.DNSToken}
 		zone, id, err := cf.addTXT(ctx, m.domain, name, value)
 		if err != nil {
@@ -481,7 +531,7 @@ func (c cloudflare) call(ctx context.Context, method, path string, body any, res
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := acmeHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}

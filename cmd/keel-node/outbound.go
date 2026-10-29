@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -45,6 +46,16 @@ type router struct {
 	// reload when the outbound's settings did not change.
 	health      map[string]*outboundHealth
 	healthCheck healthCheck
+	// allowPrivate mirrors route.allow_private; without it an IP literal
+	// that is not public is refused whichever outbound would carry it.
+	allowPrivate bool
+}
+
+// refused reports a destination no outbound may carry: the direct dialer
+// checks resolved names itself, but socks, vless and third-party servers
+// would otherwise take a private IP literal straight to their own LAN.
+func (r *router) refused(destination M.Socksaddr) bool {
+	return !r.allowPrivate && destination.IsIP() && !isPublic(destination.Addr)
 }
 
 type routeRule struct {
@@ -58,10 +69,11 @@ var currentRouter atomic.Pointer[router]
 func newRouter(c *Config, previous *router) (*router, error) {
 	direct := &directOutbound{ipv4Only: c.Route.IPv4Only, allowPrivate: c.Route.AllowPrivate}
 	r := &router{
-		final:       c.Route.Final,
-		outbound:    map[string]outbound{"direct": direct},
-		health:      make(map[string]*outboundHealth),
-		healthCheck: newHealthCheck(c.Route.HealthCheck),
+		final:        c.Route.Final,
+		outbound:     map[string]outbound{"direct": direct},
+		health:       make(map[string]*outboundHealth),
+		healthCheck:  newHealthCheck(c.Route.HealthCheck),
+		allowPrivate: c.Route.AllowPrivate,
 	}
 	if len(r.final) == 0 {
 		r.final = []string{"direct"}
@@ -74,7 +86,7 @@ func newRouter(c *Config, previous *router) (*router, error) {
 		}
 		switch o.Type {
 		case "socks":
-			r.outbound[o.Tag] = &socksOutbound{socks.NewClient(direct, M.ParseSocksaddr(o.Server), socks.Version5, "", "")}
+			r.outbound[o.Tag] = &socksOutbound{socks.NewClient(socksDialer{direct}, M.ParseSocksaddr(o.Server), socks.Version5, "", "")}
 		case "ss2022":
 			method := o.Method
 			if method == "" {
@@ -154,6 +166,10 @@ func (r *router) dialFailed(tag string) {
 }
 
 func (r *router) relayTCP(ctx context.Context, user string, conn net.Conn, destination M.Socksaddr) {
+	if r.refused(destination) {
+		N.ReportHandshakeFailure(conn, errPrivateDestination)
+		return
+	}
 	out, tag, label := r.pick(destination)
 	if verbose {
 		log.Print("[", user, "] tcp ", destination, " via ", label)
@@ -177,6 +193,12 @@ func (r *router) relayTCP(ctx context.Context, user string, conn net.Conn, desti
 // UDP-over-TCP (to report the handshake result), or nil. The session is
 // routed by its first destination.
 func (r *router) relayUDP(ctx context.Context, user string, packetConn N.PacketConn, stream net.Conn, destination M.Socksaddr) {
+	if r.refused(destination) {
+		if stream != nil {
+			N.ReportHandshakeFailure(stream, errPrivateDestination)
+		}
+		return
+	}
 	out, tag, label := r.pick(destination)
 	if verbose {
 		log.Print("[", user, "] udp ", destination, " via ", label)
@@ -200,7 +222,110 @@ func (r *router) relayUDP(ctx context.Context, user string, packetConn N.PacketC
 		}
 		return
 	}
-	bufio.CopyPacketConn(ctx, packetConn, remote)
+	(&udpSession{r: r, user: user, client: packetConn, remotes: map[string]N.PacketConn{tag: remote}}).run(ctx, tag, remote)
+}
+
+// udpSession routes each packet of one UDP session by its own destination:
+// a later packet to a host the rules send elsewhere (or one that is
+// private) must not ride the outbound the first packet picked.
+type udpSession struct {
+	r       *router
+	user    string
+	client  N.PacketConn
+	writeMu sync.Mutex // packets back to the client come from several remotes
+	mu      sync.Mutex
+	remotes map[string]N.PacketConn // by outbound tag, opened on first use
+	wg      sync.WaitGroup
+}
+
+func (s *udpSession) run(ctx context.Context, firstTag string, first N.PacketConn) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	s.wg.Add(1)
+	go s.back(cancel, firstTag, first)
+	defer func() {
+		s.mu.Lock()
+		for _, remote := range s.remotes {
+			remote.Close()
+		}
+		s.mu.Unlock()
+		s.client.Close()
+		s.wg.Wait()
+	}()
+	for {
+		buffer := buf.NewPacket()
+		destination, err := s.client.ReadPacket(buffer)
+		if err != nil {
+			buffer.Release()
+			return
+		}
+		destination = destination.Unwrap()
+		if s.r.refused(destination) {
+			buffer.Release()
+			continue
+		}
+		out, tag, label := s.r.pick(destination)
+		s.mu.Lock()
+		remote := s.remotes[tag]
+		s.mu.Unlock()
+		if remote == nil {
+			if verbose {
+				log.Print("[", s.user, "] udp ", destination, " via ", label)
+			}
+			dialCtx, dialCancel := context.WithTimeout(ctx, dialTimeout)
+			remote, err = out.listenUDP(dialCtx, destination)
+			dialCancel()
+			if err != nil {
+				s.r.dialFailed(tag)
+				buffer.Release()
+				continue
+			}
+			s.mu.Lock()
+			s.remotes[tag] = remote
+			s.mu.Unlock()
+			s.wg.Add(1)
+			go s.back(cancel, tag, remote)
+		}
+		if err = remote.WritePacket(buffer, destination); err != nil && verbose {
+			log.Print("[", s.user, "] udp ", destination, ": ", err)
+		}
+	}
+}
+
+// back copies one remote's packets to the client until the remote idles out
+// or fails. The session ends when the client side fails, or when its last
+// remote is gone (nothing has moved for the UDP timeout).
+func (s *udpSession) back(cancel context.CancelFunc, tag string, remote N.PacketConn) {
+	defer s.wg.Done()
+	defer func() {
+		remote.Close()
+		s.mu.Lock()
+		if s.remotes[tag] == remote {
+			delete(s.remotes, tag)
+		}
+		idle := len(s.remotes) == 0
+		s.mu.Unlock()
+		if idle {
+			cancel()
+			s.client.Close()
+		}
+	}()
+	for {
+		buffer := buf.NewPacket()
+		from, err := remote.ReadPacket(buffer)
+		if err != nil {
+			buffer.Release()
+			return
+		}
+		s.writeMu.Lock()
+		err = s.client.WritePacket(buffer, from)
+		s.writeMu.Unlock()
+		if err != nil {
+			cancel()
+			s.client.Close()
+			return
+		}
+	}
 }
 
 // directOutbound dials from this machine. It also implements N.Dialer so the
@@ -215,19 +340,111 @@ type directOutbound struct {
 	allowPrivate bool
 }
 
+// maxResolved caps the names one direct UDP session keeps resolved.
+const maxResolved = 256
+
 var errPrivateDestination = errors.New("destination is a private or local address")
 
-// cgnat is 100.64.0.0/10, shared address space (carrier NAT, Tailscale).
-var cgnat = netip.MustParsePrefix("100.64.0.0/10")
+// notGlobal lists IANA special-purpose ranges that are not reachable on the
+// public internet but that netip still calls global unicast, plus platform
+// endpoints that sit in public space (Azure WireServer, which its agent's
+// firewall opens only to root, as keel-node runs).
+var notGlobal = func() []netip.Prefix {
+	var list []netip.Prefix
+	for _, s := range []string{
+		"0.0.0.0/8", "100.64.0.0/10", "192.0.0.0/24", "192.0.2.0/24", "192.88.99.0/24",
+		"198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "240.0.0.0/4",
+		"168.63.129.16/32",
+		"::/96", "64:ff9b:1::/48", "100::/64", "2001::/23", "2001:db8::/32", "2002::/16",
+		"3fff::/20", "5f00::/16", "fec0::/10",
+	} {
+		list = append(list, netip.MustParsePrefix(s))
+	}
+	return list
+}()
+
+var (
+	nat64      = netip.MustParsePrefix("64:ff9b::/96")
+	sixToFour  = netip.MustParsePrefix("2002::/16")
+	siitMapped = netip.MustParsePrefix("::ffff:0:0:0/96")
+	ipv4Compat = netip.MustParsePrefix("::/96")
+)
+
+// embeddedIPv4 returns the IPv4 address an IPv6 translation prefix carries.
+func embeddedIPv4(a netip.Addr) (netip.Addr, bool) {
+	b := a.As16()
+	switch {
+	case nat64.Contains(a), siitMapped.Contains(a), ipv4Compat.Contains(a):
+		return netip.AddrFrom4([4]byte(b[12:16])), true
+	case sixToFour.Contains(a):
+		return netip.AddrFrom4([4]byte(b[2:6])), true
+	}
+	return netip.Addr{}, false
+}
 
 // isPublic reports whether proxied traffic may go to a.
 func isPublic(a netip.Addr) bool {
-	a = a.Unmap()
-	if !a.IsGlobalUnicast() || a.IsPrivate() || cgnat.Contains(a) {
+	a = a.Unmap().WithZone("")
+	if v4, ok := embeddedIPv4(a); ok && !isPublic(v4) {
 		return false
 	}
-	// 0.0.0.0/8 means "this network".
-	return !a.Is4() || a.As4()[0] != 0
+	if !a.IsGlobalUnicast() || a.IsPrivate() {
+		return false
+	}
+	for _, p := range notGlobal {
+		if p.Contains(a) {
+			return false
+		}
+	}
+	return !isLocal(a)
+}
+
+// The node's own addresses count as private: Linux delivers a connection to
+// them over lo, past firewalls that only filter the outside interface.
+var local struct {
+	sync.Mutex
+	at    time.Time
+	addrs map[netip.Addr]bool
+}
+
+func isLocal(a netip.Addr) bool {
+	local.Lock()
+	defer local.Unlock()
+	if time.Since(local.at) > 10*time.Second {
+		local.at = time.Now()
+		local.addrs = localAddrs()
+	}
+	return local.addrs[a]
+}
+
+// localAddrs lists the interface addresses and each IPv4 network's
+// directed broadcast address.
+func localAddrs() map[netip.Addr]bool {
+	m := map[netip.Addr]bool{}
+	ifaddrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return m
+	}
+	for _, ia := range ifaddrs {
+		n, ok := ia.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		a, ok := netip.AddrFromSlice(n.IP)
+		if !ok {
+			continue
+		}
+		a = a.Unmap()
+		m[a] = true
+		if ones, bits := n.Mask.Size(); a.Is4() && bits == 32 && ones < 31 {
+			b := a.As4()
+			for i := range b {
+				b[i] |= ^n.Mask[len(n.Mask)-4+i]
+			}
+			m[netip.AddrFrom4(b)] = true
+		}
+	}
+	return m
 }
 
 func (d *directOutbound) userDialer() *net.Dialer {
@@ -289,15 +506,71 @@ type socksOutbound struct {
 }
 
 func (s *socksOutbound) dialTCP(ctx context.Context, destination M.Socksaddr) (net.Conn, error) {
-	return s.client.DialContext(ctx, N.NetworkTCP, destination)
+	return socksHandshake(ctx, func(ctx context.Context) (net.Conn, error) {
+		return s.client.DialContext(ctx, N.NetworkTCP, destination)
+	})
 }
 
 func (s *socksOutbound) listenUDP(ctx context.Context, destination M.Socksaddr) (N.PacketConn, error) {
-	conn, err := s.client.ListenPacket(ctx, destination)
+	conn, err := socksHandshake(ctx, func(ctx context.Context) (net.PacketConn, error) {
+		return s.client.ListenPacket(ctx, destination)
+	})
 	if err != nil {
 		return nil, err
 	}
 	return conn.(N.PacketConn), nil
+}
+
+// The SOCKS client ignores the context once connected, so a server that
+// never answers would hold the relay forever. socksDialer hands the raw
+// connection to socksHandshake, which closes it if the context ends first.
+type socksDialer struct{ N.Dialer }
+
+type socksConnKey struct{}
+
+type socksConnSlot struct {
+	mu     sync.Mutex
+	conn   net.Conn
+	closed bool
+}
+
+func (d socksDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	conn, err := d.Dialer.DialContext(ctx, network, destination)
+	if slot, ok := ctx.Value(socksConnKey{}).(*socksConnSlot); ok && err == nil {
+		slot.mu.Lock()
+		slot.conn = conn
+		if slot.closed {
+			conn.Close()
+		}
+		slot.mu.Unlock()
+	}
+	return conn, err
+}
+
+func socksHandshake[T any](ctx context.Context, handshake func(context.Context) (T, error)) (T, error) {
+	slot := &socksConnSlot{}
+	type result struct {
+		v   T
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		v, err := handshake(context.WithValue(ctx, socksConnKey{}, slot))
+		done <- result{v, err}
+	}()
+	select {
+	case r := <-done:
+		return r.v, r.err
+	case <-ctx.Done():
+		slot.mu.Lock()
+		slot.closed = true
+		if slot.conn != nil {
+			slot.conn.Close()
+		}
+		slot.mu.Unlock()
+		var zero T
+		return zero, ctx.Err()
+	}
 }
 
 // ssOutbound is a Shadowsocks client: SS 2022 to reach keel exits, or a
@@ -394,7 +667,12 @@ func (c *udpOutbound) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) e
 			if c.ipv4Only {
 				network = "ip4"
 			}
-			ips, err := net.DefaultResolver.LookupNetIP(context.Background(), network, destination.Fqdn)
+			if len(c.resolved) >= maxResolved {
+				clear(c.resolved) // bounded: a session may name endless hosts
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			ips, err := net.DefaultResolver.LookupNetIP(ctx, network, destination.Fqdn)
+			cancel()
 			if err != nil || len(ips) == 0 {
 				return nil // drop packet, keep session alive
 			}

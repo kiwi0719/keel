@@ -66,6 +66,7 @@ func newAnyTLSInbound(config InboundConfig, h *handler) (inbound, error) {
 }
 
 func (in *anytlsInbound) serve(conn net.Conn) {
+	defer recoverConn("anytls", conn)
 	source := M.SocksaddrFromNet(conn.RemoteAddr()).Unwrap()
 	tlsConn := tls.Server(conn, in.tlsConfig)
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
@@ -82,9 +83,15 @@ func (in *anytlsInbound) serve(conn net.Conn) {
 		tlsConn.Close() // the CA's tls-alpn-01 check is done with the handshake
 		return
 	}
-	if err = in.service.NewConnection(context.Background(), tlsConn, source, nil); err != nil {
+	ctx, sess := withSession(withHandshakeDeadline(context.Background(), conn), tlsConn)
+	defer sess.end()
+	if err = in.service.NewConnection(ctx, tlsConn, source, nil); err != nil {
 		tlsConn.Close()
-		log.Print("anytls: connection from ", source, ": ", err)
+		// Anyone can fail authentication: logging each one by default
+		// would let them fill the disk.
+		if verbose {
+			log.Print("anytls: connection from ", source, ": ", err)
+		}
 	}
 }
 

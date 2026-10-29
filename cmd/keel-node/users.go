@@ -2,10 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"os"
-	"path/filepath"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -30,6 +30,12 @@ func (u *userState) used() int64 {
 	return u.cfg.UsedBase + u.up.Load() + u.down.Load()
 }
 
+// maxUserConns caps one user's open connections, streams and UDP sessions
+// on this node, so a single user cannot use up its memory or descriptors.
+var maxUserConns = 2048
+
+var errTooManyConns = errors.New("too many open connections for this user")
+
 // track registers an open connection so it can be closed when the user is
 // removed or runs out of quota. The returned func unregisters it.
 func (u *userState) track(conn io.Closer) func() {
@@ -41,6 +47,13 @@ func (u *userState) track(conn io.Closer) func() {
 		delete(u.conns, conn)
 		u.connMu.Unlock()
 	}
+}
+
+// full reports whether the user may not open another connection.
+func (u *userState) full() bool {
+	u.connMu.Lock()
+	defer u.connMu.Unlock()
+	return len(u.conns) >= maxUserConns
 }
 
 func (u *userState) closeAll() int {
@@ -62,7 +75,10 @@ type registry struct {
 	users map[string]*userState
 
 	statePath string
-	saved     map[string]savedUsage // loaded from statePath, consumed by apply
+	// saved holds counters of users not configured right now: loaded from
+	// statePath, or kept when a user is removed, so taking a user off and
+	// putting them back within a period does not reset what they used.
+	saved map[string]savedUsage
 }
 
 type savedUsage struct {
@@ -76,7 +92,7 @@ type usageFile struct {
 }
 
 func newRegistry(statePath string) *registry {
-	r := &registry{users: make(map[string]*userState), statePath: statePath}
+	r := &registry{users: make(map[string]*userState), statePath: statePath, saved: make(map[string]savedUsage)}
 	if statePath != "" {
 		content, err := os.ReadFile(statePath)
 		if err == nil {
@@ -84,7 +100,9 @@ func newRegistry(statePath string) *registry {
 			if err = json.Unmarshal(content, &file); err != nil {
 				log.Print("usage state: ", err)
 			}
-			r.saved = file.Users
+			if file.Users != nil {
+				r.saved = file.Users
+			}
 		} else if !os.IsNotExist(err) {
 			log.Print("usage state: ", err)
 		}
@@ -105,9 +123,15 @@ func (r *registry) apply(users []UserConfig) {
 				u.up.Store(s.Up)
 				u.down.Store(s.Down)
 			}
+			delete(r.saved, cfg.Name)
 		} else if u.cfg.Period != cfg.Period {
 			u.up.Store(0)
 			u.down.Store(0)
+		}
+		// Never count less than the master already has from this node: a
+		// crash before the last save must not hand the user free traffic.
+		if lost := cfg.UsedSelf - u.up.Load() - u.down.Load(); lost > 0 {
+			u.up.Add(lost)
 		}
 		u.cfg = cfg
 		next[cfg.Name] = u
@@ -116,10 +140,10 @@ func (r *registry) apply(users []UserConfig) {
 	for name, u := range r.users {
 		if _, ok := next[name]; !ok {
 			removed = append(removed, u)
+			r.saved[name] = savedUsage{Period: u.cfg.Period, Up: u.up.Load(), Down: u.down.Load()}
 		}
 	}
 	r.users = next
-	r.saved = nil
 	r.mu.Unlock()
 	for _, u := range removed {
 		if n := u.closeAll(); n > 0 {
@@ -219,6 +243,11 @@ func (r *registry) save() error {
 		return nil
 	}
 	file := usageFile{Users: make(map[string]savedUsage)}
+	r.mu.RLock()
+	for name, s := range r.saved {
+		file.Users[name] = s
+	}
+	r.mu.RUnlock()
 	for _, u := range r.usage() {
 		file.Users[u.Name] = savedUsage{Period: u.Period, Up: u.Up, Down: u.Down}
 	}
@@ -226,12 +255,5 @@ func (r *registry) save() error {
 	if err != nil {
 		return err
 	}
-	if err = os.MkdirAll(filepath.Dir(r.statePath), 0o700); err != nil {
-		return err
-	}
-	tmp := r.statePath + ".tmp"
-	if err = os.WriteFile(tmp, content, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, r.statePath)
+	return writeFileAtomic(r.statePath, content, 0o600)
 }

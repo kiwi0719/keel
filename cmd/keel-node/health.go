@@ -2,12 +2,13 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"net/url"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -37,7 +38,11 @@ func newHealthCheck(c HealthCheckConfig) healthCheck {
 	if raw == "" {
 		raw = defaultHealthURL
 	}
-	h.url, _ = url.Parse(raw) // validated with the config
+	if parsed, err := url.Parse(raw); err == nil && parsed.Host != "" { // validated with the config
+		h.url = parsed
+	} else {
+		h.url, _ = url.Parse(defaultHealthURL)
+	}
 	return h
 }
 
@@ -96,6 +101,9 @@ func (h *outboundHealth) record(tag string, ok bool, latency time.Duration, err 
 		h.lastError = ""
 	} else {
 		h.lastError = err.Error()
+		if len(h.lastError) > 200 {
+			h.lastError = h.lastError[:200]
+		}
 	}
 	if ok == h.alive {
 		h.streak = 0
@@ -178,15 +186,17 @@ func checkOutbound(ctx context.Context, out outbound, target *url.URL) (time.Dur
 	deadline, _ := ctx.Deadline()
 	conn.SetDeadline(deadline)
 	path := target.RequestURI()
-	if _, err = fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: keel-node\r\nConnection: close\r\n\r\n", path, target.Host); err != nil {
+	if _, err = fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n", path, target.Host); err != nil {
 		return 0, err
 	}
-	line, err := bufio.NewReader(conn).ReadString('\n')
-	if err != nil {
-		return 0, fmt.Errorf("no response: %w", err)
-	}
-	if !strings.HasPrefix(line, "HTTP/1.") {
-		return 0, fmt.Errorf("unexpected response %q", strings.TrimSpace(line))
+	// The far end of the outbound picks what comes back: read at most a
+	// short status line, and quote at most a little of it.
+	line, err := bufio.NewReaderSize(io.LimitReader(conn, 256), 256).ReadSlice('\n')
+	if !bytes.HasPrefix(line, []byte("HTTP/1.")) {
+		if len(line) == 0 && err != nil {
+			return 0, fmt.Errorf("no response: %w", err)
+		}
+		return 0, fmt.Errorf("unexpected response %q", bytes.TrimSpace(line[:min(len(line), 64)]))
 	}
 	return time.Since(start), nil
 }

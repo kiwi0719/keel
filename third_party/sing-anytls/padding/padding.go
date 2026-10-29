@@ -14,10 +14,15 @@ import (
 
 const CheckMark = -1
 
-var DefaultPaddingScheme = []byte(`stop=3
-0=48-72
-1=100-540
-2=80-360,c,420-1120`)
+var DefaultPaddingScheme = []byte(`stop=8
+0=30-30
+1=100-400
+2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000
+3=9-9,500-1000
+4=500-1000
+5=500-1000
+6=500-1000
+7=500-1000`)
 
 type PaddingFactory struct {
 	scheme    util.StringMap

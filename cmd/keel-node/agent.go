@@ -15,6 +15,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
 )
 
 // agentMain is the `agent` command: keel-node run as "agent" (install.sh
@@ -147,11 +148,42 @@ func readStatus(path string) (*NodeStatus, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Names, addresses and errors in the status can come from third-party
+	// share links or remote servers; drop control and direction-changing
+	// characters before they reach a root terminal.
+	var raw any
+	if err = json.Unmarshal(content, &raw); err != nil {
+		return nil, err
+	}
+	if content, err = json.Marshal(printable(raw)); err != nil {
+		return nil, err
+	}
 	var s NodeStatus
 	if err = json.Unmarshal(content, &s); err != nil {
 		return nil, err
 	}
 	return &s, nil
+}
+
+func printable(v any) any {
+	switch v := v.(type) {
+	case string:
+		return strings.Map(func(r rune) rune {
+			if unicode.IsControl(r) || unicode.Is(unicode.Bidi_Control, r) || r == '\u200b' || r == '\ufeff' {
+				return -1
+			}
+			return r
+		}, v)
+	case []any:
+		for i := range v {
+			v[i] = printable(v[i])
+		}
+	case map[string]any:
+		for k := range v {
+			v[k] = printable(v[k])
+		}
+	}
+	return v
 }
 
 var useColor = func() bool {

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -58,7 +59,18 @@ type masterConfig struct {
 	content []byte
 	rev     int64
 	result  chan error
+	// revoke: the master no longer accepts this node's token (it was
+	// rotated, or the node deleted). The node stops serving.
+	revoke bool
 }
+
+// errRevoked is a 401 from the master: the token is no longer valid.
+var errRevoked = errors.New("the master rejected this node's token (rotated or node deleted)")
+
+// revokeAfter is how long the master must keep rejecting the token before
+// the node stops serving, so a master briefly restored from an old backup
+// does not take every node down.
+var revokeAfter = 10 * time.Minute
 
 type helloMessage struct {
 	Type        string   `json:"type"`
@@ -68,6 +80,8 @@ type helloMessage struct {
 	OS          string   `json:"os"`
 	Arch        string   `json:"arch"`
 	ConfigRev   int64    `json:"config_rev"`
+	// Features this node understands; "spki_pin": it accepts master_spki.
+	Features []string `json:"features"`
 }
 
 type reportMessage struct {
@@ -95,15 +109,34 @@ type incomingMessage struct {
 	Type   string          `json:"type"`
 	Rev    int64           `json:"rev"`
 	Config json.RawMessage `json:"config"`
+	ID     int64           `json:"id"`    // acme_dns_done
+	Error  string          `json:"error"` // acme_dns_done
 }
 
 func (m *masterClient) run(ctx context.Context) {
 	wait := time.Second
+	var rejectedSince time.Time
+	revoked := false
 	for {
 		start := time.Now()
 		err := m.session(ctx)
 		if ctx.Err() != nil {
 			return
+		}
+		if !errors.Is(err, errRevoked) {
+			rejectedSince = time.Time{}
+			revoked = false
+		} else if rejectedSince.IsZero() {
+			rejectedSince = time.Now()
+		} else if !revoked && time.Since(rejectedSince) >= revokeAfter {
+			revoked = true
+			result := make(chan error, 1)
+			select {
+			case m.configs <- masterConfig{revoke: true, result: result}:
+				<-result
+			case <-ctx.Done():
+				return
+			}
 		}
 		log.Print("master: ", err)
 		m.node.masterState.Store(&MasterState{URL: m.url, Error: err.Error(), Since: time.Now().Unix()})
@@ -124,15 +157,19 @@ func (m *masterClient) session(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	dialCtx, dialCancel := context.WithTimeout(ctx, 15*time.Second)
-	conn, _, err := websocket.Dial(dialCtx, m.url, &websocket.DialOptions{
-		HTTPClient: &http.Client{Transport: &http.Transport{
-			Proxy:           nil,
-			TLSClientConfig: m.tlsConfig(),
-		}},
+	transport := &http.Transport{Proxy: nil, TLSClientConfig: m.tlsConfig()}
+	conn, resp, err := websocket.Dial(dialCtx, m.url, &websocket.DialOptions{
+		HTTPClient: &http.Client{Transport: transport},
 		HTTPHeader: http.Header{"Authorization": {"Bearer " + m.token}},
 	})
 	dialCancel()
 	if err != nil {
+		// A failed handshake leaves its connection idle in this transport;
+		// close it, or every retry would keep one open on both ends.
+		transport.CloseIdleConnections()
+		if resp != nil && resp.StatusCode == http.StatusUnauthorized {
+			return errRevoked
+		}
 		return fmt.Errorf("connect %s: %w", m.url, err)
 	}
 	defer conn.CloseNow()
@@ -157,10 +194,13 @@ func (m *masterClient) session(ctx context.Context) error {
 	if err = send(helloMessage{
 		Type: "hello", NodeVersion: version, Protocols: strings.Split(builtProtocols(), ","),
 		Hostname: hostname, OS: runtime.GOOS, Arch: runtime.GOARCH, ConfigRev: m.node.rev(),
+		Features: []string{"spki_pin"},
 	}); err != nil {
 		return err
 	}
 
+	masterDNS.attach(send)
+	defer masterDNS.detach()
 	errs := make(chan error, 2)
 	go func() { errs <- m.readLoop(ctx, conn, send) }()
 	go func() { errs <- m.reportLoop(ctx, conn, send) }()
@@ -196,6 +236,8 @@ func (m *masterClient) readLoop(ctx context.Context, conn *websocket.Conn, send 
 			if err = send(applied); err != nil {
 				return err
 			}
+		case "acme_dns_done":
+			masterDNS.done(msg.ID, msg.Error)
 		default:
 			if verbose {
 				log.Print("master: ignoring message type ", msg.Type)
@@ -263,11 +305,18 @@ func (m *masterClient) tlsConfig() *tls.Config {
 		if len(state.PeerCertificates) == 0 {
 			return errors.New("master sent no certificate")
 		}
-		sum := sha256.Sum256(state.PeerCertificates[0].Raw)
-		if !bytes.Equal(sum[:], m.pin) {
-			return fmt.Errorf("master certificate fingerprint %s does not match -fingerprint", hex.EncodeToString(sum[:]))
+		// The pin may be the whole certificate's hash (older installs) or its
+		// public key's; the master may also have pushed its key's hash.
+		leaf := state.PeerCertificates[0]
+		sum := sha256.Sum256(leaf.Raw)
+		key := sha256.Sum256(leaf.RawSubjectPublicKeyInfo)
+		if bytes.Equal(sum[:], m.pin) || bytes.Equal(key[:], m.pin) {
+			return nil
 		}
-		return nil
+		if c := m.node.config.Load(); c != nil && c.MasterSPKI != "" && strings.EqualFold(c.MasterSPKI, hex.EncodeToString(key[:])) {
+			return nil
+		}
+		return fmt.Errorf("master certificate fingerprint %s does not match -fingerprint", hex.EncodeToString(sum[:]))
 	}
 	return config
 }
@@ -296,6 +345,11 @@ func masterWebSocketURL(master string) (string, error) {
 	case "https", "wss":
 		u.Scheme = "wss"
 	case "http", "ws":
+		// Plain text would send the token and receive every user's
+		// credentials in the clear; only allowed on this machine.
+		if ip := net.ParseIP(u.Hostname()); u.Hostname() != "localhost" && (ip == nil || !ip.IsLoopback()) {
+			return "", fmt.Errorf("-master %q is plain http; use https (http only works for a master on this machine)", master)
+		}
 		u.Scheme = "ws"
 	default:
 		return "", fmt.Errorf("-master must look like https://host:port, got %q", master)
