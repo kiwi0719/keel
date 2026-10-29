@@ -14,8 +14,8 @@
 | 协议 | 库 |
 | --- | --- |
 | AnyTLS | `third_party/sing-anytls`（改过的 sing-anytls，改动见其 MODIFICATIONS.md） |
-| VLESS + Vision | sing-vmess/vless |
-| Reality 服务端 | metacubex/utls（和 sing-box 用的是同一个） |
+| VLESS + Vision | `third_party/sing-vmess`（改过的 sing-vmess，修了几处会让进程崩溃的解析问题） |
+| Reality 服务端 | `third_party/utls`（改过的 metacubex/utls：回落连接转发关闭、补上 Go 的 KeyUpdate 修复） |
 | SS 2022 多用户服务端和客户端 | `third_party/sing-shadowsocks`（修了多用户表的并发问题） |
 
 ### 构建
@@ -123,7 +123,8 @@ keel-master -data /var/lib/keel-master -listen 0.0.0.0:8443
 ```
 
 - 面板用用户名 + 密码登录。第一次启动会在日志里打印 `admin` 和一个随机密码，进去后在「设置」里改；也可以在服务器上 `keel-master -data ... -user 用户名 -password -`（密码从标准输入读，不留在命令历史里）。改完所有已登录的会话都会失效。
-- 不给证书时会在 `数据目录/tls/` 生成自签证书，节点按指纹认它（安装命令里自动带上），浏览器会提示不安全。有域名证书就用 `-cert fullchain.pem -key key.pem`；放在 Caddy / nginx 后面就用 `-no-tls -listen 127.0.0.1:8080`（反代要转发 WebSocket）。
+- 不给证书时会在 `数据目录/tls/` 生成自签证书，节点按指纹认它（安装命令里自动带上），浏览器会提示不安全。这时第一次登录前请在浏览器的证书详情里核对 SHA-256 指纹，和启动日志里 `certificate SHA-256` 那一行一致才输入密码：自签证书挡不住路上的中间人，点过警告就等于把密码交给对方。长期使用建议换成受信任的证书：有域名证书就用 `-cert fullchain.pem -key key.pem`；放在 Caddy / nginx 后面就用 `-no-tls -listen 127.0.0.1:8080`（反代要转发 WebSocket，并设置 `X-Forwarded-Proto`，或者在「设置」里填面板地址）；也可以只让面板监听 127.0.0.1，用 `ssh -L` 隧道访问。
+- 用 systemd 跑主控可以参考 [master/keel-master.service](master/keel-master.service)：主控遇到任何 panic 都会直接退出，一定要有 `Restart=always` 这样的守护。
 - 数据库是 `数据目录/keel.db`（WAL 模式，备份时连 `-wal`、`-shm` 一起拷，或者先停服务）。
 - 节点安装脚本从主控下载 keel-node：把 `make node-linux` 编出来的文件改名放进 `数据目录/dist/`，叫 `keel-node-linux-amd64`、`keel-node-linux-arm64`。
 
@@ -143,4 +144,4 @@ keel-master -data /var/lib/keel-master -listen 0.0.0.0:8443
 
 ## 许可
 
-GPL-3.0，和所依赖的 sing 系列库一致。`third_party/` 下是改过的 sing-anytls 和 sing-shadowsocks，改动各见其 MODIFICATIONS.md。
+GPL-3.0，和所依赖的 sing 系列库一致。`third_party/` 下是改过的 sing-anytls、sing-shadowsocks、sing-vmess 和 utls，改动各见其 MODIFICATIONS.md。
