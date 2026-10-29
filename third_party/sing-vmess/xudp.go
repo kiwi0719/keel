@@ -1,6 +1,7 @@
 package vmess
 
 import (
+	std_bufio "bufio"
 	"encoding/binary"
 	"io"
 	"net"
@@ -17,6 +18,9 @@ var _ N.EarlyWriter = (*XUDPConn)(nil)
 
 type XUDPConn struct {
 	net.Conn
+	// Each packet is read in three parts (header, address, payload): through
+	// a buffer, not one read of the connection each.
+	reader         *std_bufio.Reader
 	writer         N.ExtendedWriter
 	destination    M.Socksaddr
 	requestWritten bool
@@ -25,6 +29,7 @@ type XUDPConn struct {
 func NewXUDPConn(conn net.Conn, destination M.Socksaddr) *XUDPConn {
 	return &XUDPConn{
 		Conn:        conn,
+		reader:      std_bufio.NewReaderSize(conn, 4096),
 		writer:      bufio.NewExtendedWriter(conn),
 		destination: destination,
 	}
@@ -57,15 +62,15 @@ func (c *XUDPConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 
 func (c *XUDPConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr, err error) {
 	start := buffer.Start()
-	_, err = buffer.ReadFullFrom(c.Conn, 6)
+	_, err = buffer.ReadFullFrom(c.reader, 6)
 	if err != nil {
 		return
 	}
-	var length uint16
-	err = binary.Read(buffer, binary.BigEndian, &length)
+	lengthBytes, err := buffer.ReadBytes(2)
 	if err != nil {
 		return
 	}
+	length := binary.BigEndian.Uint16(lengthBytes)
 	header, err := buffer.ReadBytes(4)
 	if err != nil {
 		return
@@ -75,7 +80,7 @@ func (c *XUDPConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr, err 
 		return M.Socksaddr{}, E.New("unexpected frame new")
 	case StatusKeep:
 		if length != 4 {
-			_, err = buffer.ReadFullFrom(c.Conn, int(length)-2)
+			_, err = buffer.ReadFullFrom(c.reader, int(length)-2)
 			if err != nil {
 				return
 			}
@@ -86,7 +91,7 @@ func (c *XUDPConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr, err 
 			}
 			destination = destination.Unwrap()
 		} else {
-			_, err = buffer.ReadFullFrom(c.Conn, 2)
+			_, err = buffer.ReadFullFrom(c.reader, 2)
 			if err != nil {
 				return
 			}
@@ -107,12 +112,13 @@ func (c *XUDPConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr, err 
 		buffer.Resize(start, 0)
 		return c.ReadPacket(buffer)
 	} else {
-		err = binary.Read(buffer, binary.BigEndian, &length)
+		lengthBytes, err = buffer.ReadBytes(2)
 		if err != nil {
 			return
 		}
+		length = binary.BigEndian.Uint16(lengthBytes)
 		buffer.Resize(start, 0)
-		_, err = buffer.ReadFullFrom(c.Conn, int(length))
+		_, err = buffer.ReadFullFrom(c.reader, int(length))
 		return
 	}
 }
