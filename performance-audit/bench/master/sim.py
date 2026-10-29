@@ -2,7 +2,7 @@
 """Simulates keel-node control connections (docs/node-protocol.md).
 
 sim.py --port 18444 --db large/keel.db [--roles entry,exit] [--limit N] [--duration 120]
-       [--traffic 0.2] [--interval 5] [--stats out.json]
+       [--traffic 0.2] [--interval 5] [--stats out.json] [--node old|new]
 
 Each simulated node: dials wss://127.0.0.1:PORT/api/node/ws with its token,
 sends hello (config_rev 0), answers every config with applied, and sends a
@@ -10,6 +10,12 @@ report every --interval seconds listing every user/counter of its config
 (as keel-node does), with up/down growing for a --traffic fraction of them,
 system stats, outbound health for each outbound in its config, and a probe
 round every 6th report on entries.
+
+--node new acts as a current keel-node: its hello offers usage_msg, and once
+a config or usage message carries report_delta it reports only the users
+that changed, with a full report first on each connection and every 5
+minutes. --node old (the
+default) reports every user every time and ignores usage messages.
 """
 import argparse, asyncio, json, random, sqlite3, ssl, statistics, sys, time
 from websockets.asyncio.client import connect
@@ -24,6 +30,7 @@ ap.add_argument("--traffic", type=float, default=0.2)
 ap.add_argument("--interval", type=float, default=5)
 ap.add_argument("--stats", default="")
 ap.add_argument("--quiet", action="store_true")
+ap.add_argument("--node", choices=["old", "new"], default="old")
 a = ap.parse_args()
 
 roles = a.roles.split(",")
@@ -42,7 +49,8 @@ stats = {}
 
 
 async def node(nid, role, token):
-    st = stats[nid] = {"role": role, "configs": [], "first_config_s": None, "open_s": None, "reports": 0, "report_bytes": 0, "errors": []}
+    st = stats[nid] = {"role": role, "configs": [], "first_config_s": None, "open_s": None, "reports": 0, "report_bytes": 0,
+                       "usage_msgs": 0, "usage_bytes": 0, "report_users": 0, "full_reports": 0, "errors": []}
     t_start = time.monotonic()
     try:
         async with connect(f"wss://127.0.0.1:{a.port}/api/node/ws", additional_headers={"Authorization": f"Bearer {token}"},
@@ -50,8 +58,9 @@ async def node(nid, role, token):
             st["open_s"] = time.monotonic() - t_start
             t_hello = time.monotonic()
             await ws.send(json.dumps({"type": "hello", "node_version": "sim", "protocols": ["anytls", "vless", "ss2022"],
-                                      "hostname": f"sim{nid}", "os": "linux", "arch": "amd64", "config_rev": 0}))
-            state = {"users": [], "rev": 0, "outbounds": [], "counters": {}}
+                                      "hostname": f"sim{nid}", "os": "linux", "arch": "amd64", "config_rev": 0,
+                                      "features": ["spki_pin", "usage_msg"] if a.node == "new" else []}))
+            state = {"users": [], "rev": 0, "outbounds": [], "counters": {}, "delta": False}
             got_config = asyncio.Event()
 
             async def reader():
@@ -72,14 +81,20 @@ async def node(nid, role, token):
                         state["users"] = users
                         state["rev"] = v["rev"]
                         state["outbounds"] = [o["tag"] for o in cfg.get("outbounds", [])]
+                        state["delta"] = a.node == "new" and bool(v.get("report_delta"))
                         got_config.set()
                         await ws.send(json.dumps({"type": "applied", "rev": v["rev"]}))
+                    elif v.get("type") == "usage" and a.node == "new":
+                        st["usage_msgs"] += 1
+                        st["usage_bytes"] += len(msg)
+                        state["delta"] = bool(v.get("report_delta"))
 
             async def reporter():
                 await got_config.wait()
                 await asyncio.sleep(random.uniform(0, a.interval))
                 n = 0
                 net = [random.randint(1 << 30, 1 << 40), random.randint(1 << 30, 1 << 40)]
+                sent, last_full = {}, -1e9
                 while True:
                     n += 1
                     users = []
@@ -91,9 +106,18 @@ async def node(nid, role, token):
                             c[1] += random.randint(1, 10 << 20)
                         users.append({"name": name, "period": period, "up": c[0], "down": c[1],
                                       "conns": random.randint(1, 4) if active else 0, "blocked": False})
+                    full = not state["delta"] or time.monotonic() - last_full >= 300
+                    if full:
+                        last_full = time.monotonic()
+                        sent = {u["name"]: u for u in users}
+                    else:
+                        changed = [u for u in users if sent.get(u["name"]) != u]
+                        for u in changed:
+                            sent[u["name"]] = u
+                        users = changed
                     net[0] += random.randint(0, 50 << 20)
                     net[1] += random.randint(0, 50 << 20)
-                    rep = {"type": "report", "ts": int(time.time()), "config_rev": state["rev"], "users": users,
+                    rep = {"type": "report", "ts": int(time.time()), "config_rev": state["rev"], "full": full, "users": users,
                            "system": {"cpu_pct": random.uniform(1, 30), "load1": 0.3, "mem_total": 1 << 30, "mem_used": 300 << 20,
                                       "swap_total": 0, "swap_used": 0, "disk_total": 20 << 30, "disk_used": 5 << 30,
                                       "net_rx": net[0], "net_tx": net[1], "rx_rate": random.uniform(1e5, 1e7), "tx_rate": random.uniform(1e5, 1e7),
@@ -105,6 +129,8 @@ async def node(nid, role, token):
                                           "loss_pct": 0, "samples": 10, "at": at} for p in ("ct", "cu", "cm")]
                     body = json.dumps(rep)
                     await ws.send(body)
+                    st["report_users"] += len(users)
+                    st["full_reports"] += full
                     st["reports"] += 1
                     st["report_bytes"] += len(body)
                     await asyncio.sleep(a.interval)
@@ -135,7 +161,12 @@ rb = sum(s["report_bytes"] for s in stats.values())
 errs = [(nid, s["errors"]) for nid, s in stats.items() if s["errors"]]
 sizes = sorted(c[1] for s in stats.values() for c in s["configs"])
 print(f"nodes={len(rows)} elapsed={el:.1f}s first_config: n={len(fc)} min={min(fc) if fc else 0:.3f}s median={statistics.median(fc) if fc else 0:.3f}s max={max(fc) if fc else 0:.3f}s")
+um = sum(s["usage_msgs"] for s in stats.values())
+ub = sum(s["usage_bytes"] for s in stats.values())
 print(f"configs_received={nconf} bytes={bconf/1048576:.2f}MB size_min={sizes[0] if sizes else 0} size_max={sizes[-1] if sizes else 0} reports_sent={rep} report_bytes={rb/1048576:.2f}MB errors={len(errs)}")
+ru = sum(s["report_users"] for s in stats.values())
+fr = sum(s["full_reports"] for s in stats.values())
+print(f"usage_msgs={um} usage_bytes={ub/1048576:.3f}MB users_per_report={ru / max(rep, 1):.1f} full_reports={fr}")
 if errs and not a.quiet:
     print("errors:", errs[:5])
 if a.stats:

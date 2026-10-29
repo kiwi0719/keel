@@ -106,6 +106,10 @@ CREATE TABLE IF NOT EXISTS usage(
   updated INTEGER NOT NULL,
   PRIMARY KEY(node_id, name, period)
 );
+-- load_world reads the last 70 days of a table kept for 400.
+CREATE INDEX IF NOT EXISTS usage_updated ON usage(updated);
+-- node_counters looks entries up by node.
+CREATE INDEX IF NOT EXISTS user_entries_node ON user_entries(node_id);
 CREATE TABLE IF NOT EXISTS node_month(
   node_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
   month TEXT NOT NULL,
@@ -872,6 +876,25 @@ mod tests {
         assert_eq!(read(&conn), (11, 25, 400));
         store_usage(&conn, 1, &row(1, 1), 500).unwrap(); // both lower: nothing changes
         assert_eq!(read(&conn), (11, 25, 400));
+        drop(conn);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[test]
+    fn a_report_leaving_a_user_out_keeps_their_counters() {
+        // Delta reports only list the users that changed: one left out keeps
+        // what is stored, it never counts as zero.
+        let path = std::env::temp_dir().join(format!("keel-db-test-{}-{}.db", std::process::id(), random_hex(4)));
+        let conn = open(&path).unwrap();
+        let ts = crate::period::now();
+        let rows = |list: &[(&str, i64)]| list.iter().map(|&(name, down)| (name.to_string(), "p".to_string(), 0, down)).collect::<Vec<_>>();
+        store_usage(&conn, 1, &rows(&[("u1", 10), ("u2", 20)]), ts).unwrap();
+        store_usage(&conn, 1, &rows(&[("u1", 15)]), ts + 5).unwrap();
+        let w = load_world(&conn).unwrap();
+        assert_eq!(w.used("u1", "p", None), 15);
+        assert_eq!(w.used("u2", "p", None), 20);
         drop(conn);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));

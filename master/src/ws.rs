@@ -135,8 +135,9 @@ async fn serve(app: Arc<App>, node_id: i64, token: String, ip: String, socket: W
                 match msg {
                     Message::Text(text) => {
                         let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
-                        match v["type"].as_str() {
-                            Some("report") => {
+                        let kind = v["type"].as_str().unwrap_or("").to_owned();
+                        match kind.as_str() {
+                            "report" => {
                                 // Only the node's current connection may report.
                                 let current = app.live().nodes.get(&node_id).and_then(|l| l.conn.as_ref()).is_some_and(|c| c.id == conn_id);
                                 if !current {
@@ -144,8 +145,8 @@ async fn serve(app: Arc<App>, node_id: i64, token: String, ip: String, socket: W
                                 }
                                 // A malformed system/probe/health section must not
                                 // drop the usage counters in the same report.
-                                let parsed = serde_json::from_value::<Report>(v.clone()).or_else(|_| {
-                                    let mut v = v;
+                                let parsed = serde_json::from_value::<Report>(v).or_else(|_| {
+                                    let mut v: Value = serde_json::from_str(&text).unwrap_or_default();
                                     if let Some(o) = v.as_object_mut() {
                                         for k in ["system", "probes", "outbounds", "certs"] {
                                             o.remove(k);
@@ -157,8 +158,8 @@ async fn serve(app: Arc<App>, node_id: i64, token: String, ip: String, socket: W
                                     app.on_report(node_id, r);
                                 }
                             }
-                            Some("applied") => app.on_applied(node_id, &v),
-                            Some("acme_dns") => {
+                            "applied" => app.on_applied(node_id, &v),
+                            "acme_dns" => {
                                 let app = app.clone();
                                 tokio::spawn(async move {
                                     let res = crate::dns::acme_challenge(

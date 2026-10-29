@@ -360,3 +360,29 @@ func TestMasterPinBySPKI(t *testing.T) {
 		t.Error("a wrong pin was accepted")
 	}
 }
+
+func TestReportUsersOnlyChangedWhenDelta(t *testing.T) {
+	n := &node{users: newRegistry("")}
+	n.users.apply([]UserConfig{{Name: "a", Period: "p"}, {Name: "b", Period: "p"}})
+	m := &masterClient{node: n}
+	now := time.Now()
+	if users, full := m.reportUsers(now); !full || len(users) != 2 {
+		t.Fatalf("without report_delta: full=%v users=%d", full, len(users))
+	}
+	m.delta.Store(true)
+	m.sent = nil // a new connection
+	if users, full := m.reportUsers(now); !full || len(users) != 2 {
+		t.Fatalf("first report on a connection: full=%v users=%d", full, len(users))
+	}
+	if users, full := m.reportUsers(now.Add(5 * time.Second)); full || len(users) != 0 {
+		t.Fatalf("nothing changed: full=%v users=%d", full, len(users))
+	}
+	n.users.lookup("b").down.Add(10)
+	users, full := m.reportUsers(now.Add(10 * time.Second))
+	if full || len(users) != 1 || users[0].Name != "b" || users[0].Down != 10 {
+		t.Fatalf("one user changed: full=%v %+v", full, users)
+	}
+	if users, full := m.reportUsers(now.Add(fullReportInterval + time.Second)); !full || len(users) != 2 {
+		t.Fatalf("after fullReportInterval: full=%v users=%d", full, len(users))
+	}
+}
