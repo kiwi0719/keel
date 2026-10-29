@@ -4,12 +4,16 @@
 use axum::extract::ws::Message;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
-use tokio::sync::mpsc::UnboundedSender;
+use std::sync::Arc;
+use tokio::sync::mpsc::Sender;
+use tokio::sync::Notify;
 
 /// Speed history on the probe page: one point every 5 s.
 pub const SPEED_POINTS: usize = 36;
 /// Latency history per ISP: one point per probe round (30 s) for an hour.
 pub const PROBE_POINTS: usize = 120;
+/// Probe targets kept per node (the panel configures three).
+const MAX_PROBES: usize = 8;
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
@@ -20,6 +24,7 @@ pub struct Hello {
     pub os: String,
     pub arch: String,
     pub config_rev: i64,
+    pub features: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -121,7 +126,23 @@ pub struct ProbePoint {
 
 pub struct Conn {
     pub id: u64,
-    pub tx: UnboundedSender<Message>,
+    pub tx: Sender<Message>,
+    /// Ends the connection's serve task (token rotated, node deleted, or
+    /// replaced by a newer connection).
+    pub stop: Arc<Notify>,
+}
+
+impl Conn {
+    /// Queues a message. A node too slow to take it is cut off rather than
+    /// let the queue grow: it gets the latest config when it reconnects.
+    pub fn send(&self, msg: Message) -> bool {
+        if self.tx.try_send(msg).is_ok() {
+            true
+        } else {
+            self.stop.notify_one();
+            false
+        }
+    }
 }
 
 #[derive(Default)]
@@ -161,6 +182,10 @@ impl NodeLive {
         }
         self.last_probe_ts = ts;
         for p in &report.probes {
+            // Names come from the node: keep a handful of short ones only.
+            if p.name.len() > 16 || (!self.probes.contains_key(&p.name) && self.probes.len() >= MAX_PROBES) {
+                continue;
+            }
             let h = self.probes.entry(p.name.clone()).or_default();
             let latency = if p.samples > 0 { p.latency_ms } else { 0.0 };
             h.push_back(ProbePoint { ts, latency, jitter: p.jitter_ms, loss: p.loss_pct });

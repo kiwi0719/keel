@@ -89,7 +89,7 @@ async fn sync_all(app: &App) {
     }
 }
 
-fn public_ip(ip: &IpAddr) -> bool {
+pub fn public_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v) => !(v.is_private() || v.is_loopback() || v.is_link_local() || v.is_unspecified() || (v.octets()[0] == 100 && (v.octets()[1] & 0xc0) == 64)),
         IpAddr::V6(v) => !(v.is_loopback() || v.is_unspecified() || (v.segments()[0] & 0xfe00) == 0xfc00 || (v.segments()[0] & 0xffc0) == 0xfe80),
@@ -162,4 +162,77 @@ async fn request(token: &str, method: &str, path: &str, body: Option<Value>) -> 
     let bytes = resp.into_body().collect().await.map_err(|e| e.to_string())?.to_bytes();
     let v = serde_json::from_slice(&bytes).map_err(|_| format!("Cloudflare 返回了看不懂的内容（HTTP {status}）"))?;
     Ok((status, v))
+}
+
+/// TXT records the master made for nodes' DNS-01 challenges: (zone, record id).
+static CHALLENGES: Mutex<Option<HashMap<i64, Vec<(String, String)>>>> = Mutex::new(None);
+/// A node may have this many challenge records at once.
+const MAX_CHALLENGES: usize = 4;
+
+/// Sets or clears the DNS-01 record for a node's ACME certificate. The name
+/// comes from the node's own settings, never from the request, so a node can
+/// only prove the domain the admin gave it.
+pub async fn acme_challenge(app: &App, node_id: i64, op: &str, domain: &str, value: &str) -> Result<(), String> {
+    // One request per node at a time, so a node cannot flood the Cloudflare API.
+    struct Busy(i64);
+    impl Drop for Busy {
+        fn drop(&mut self) {
+            BUSY.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).remove(&self.0);
+        }
+    }
+    static BUSY: Mutex<Option<std::collections::HashSet<i64>>> = Mutex::new(None);
+    if !BUSY.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(node_id) {
+        return Err("上一个请求还没处理完".into());
+    }
+    let _busy = Busy(node_id);
+    let (token, sni, acme) = {
+        let conn = app.db();
+        let token = db::get_setting(&conn, "cf_token").ok().flatten().unwrap_or_default();
+        let node = db::load_world(&conn).ok().and_then(|w| w.node(node_id).cloned()).ok_or("节点不存在")?;
+        (token, node.anytls_sni, node.anytls_acme)
+    };
+    if token.is_empty() {
+        return Err("主控没有设置 Cloudflare 令牌".into());
+    }
+    if !acme || sni.is_empty() || !domain.eq_ignore_ascii_case(&sni) {
+        return Err(format!("这个节点不能为 {domain} 申请证书"));
+    }
+    let name = format!("_acme-challenge.{sni}");
+    match op {
+        "set" => {
+            if value.is_empty() || value.len() > 64 || !value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+                return Err("challenge 值格式不对".into());
+            }
+            if CHALLENGES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).get(&node_id).is_some_and(|v| v.len() >= MAX_CHALLENGES) {
+                return Err("未清理的 challenge 记录太多".into());
+            }
+            let zone = find_zone(&token, &sni).await?;
+            let record = json!({"type": "TXT", "name": name, "content": value, "ttl": 60, "comment": "keel acme"});
+            let v = call(&token, "POST", &format!("/zones/{zone}/dns_records"), Some(record)).await?;
+            let id = v["result"]["id"].as_str().unwrap_or_default().to_string();
+            CHALLENGES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).entry(node_id).or_default().push((zone, id));
+            Ok(())
+        }
+        "clear" => {
+            let records = CHALLENGES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).remove(&node_id).unwrap_or_default();
+            for (zone, id) in records {
+                call(&token, "DELETE", &format!("/zones/{zone}/dns_records/{id}"), None).await?;
+            }
+            Ok(())
+        }
+        _ => Err("未知操作".into()),
+    }
+}
+
+/// Creates a TXT record and returns (zone, record id) for delete_record.
+pub async fn set_txt(token: &str, name: &str, value: &str) -> Result<(String, String), String> {
+    let base = name.trim_start_matches("_acme-challenge.");
+    let zone = find_zone(token, base).await?;
+    let record = json!({"type": "TXT", "name": name, "content": value, "ttl": 60, "comment": "keel acme"});
+    let v = call(token, "POST", &format!("/zones/{zone}/dns_records"), Some(record)).await?;
+    Ok((zone, v["result"]["id"].as_str().unwrap_or_default().to_string()))
+}
+
+pub async fn delete_record(token: &str, zone: &str, id: &str) -> Result<(), String> {
+    call(token, "DELETE", &format!("/zones/{zone}/dns_records/{id}"), None).await.map(|_| ())
 }

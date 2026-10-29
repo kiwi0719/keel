@@ -18,6 +18,9 @@ pub struct Imported {
     pub uuid: String,
     pub method: String,
     pub password: String,
+    /// VLESS over TLS: the name the server's certificate must carry; empty
+    /// for plain TCP.
+    pub tls_sni: String,
 }
 
 pub const SS_METHODS: &[&str] = &[
@@ -45,7 +48,7 @@ pub fn parse_all(text: &str) -> Result<Vec<Imported>, String> {
         let out: Vec<Imported> = items
             .iter()
             .filter(|o| matches!(o["protocol"].as_str(), Some("vless" | "shadowsocks")))
-            .map(parse_outbound)
+            .map(|o| parse_outbound(o).and_then(checked))
             .collect::<Result<_, _>>()?;
         if out.is_empty() {
             return Err("JSON 里没有 vless 或 shadowsocks 出站".into());
@@ -60,13 +63,43 @@ pub fn parse_all(text: &str) -> Result<Vec<Imported>, String> {
 }
 
 pub fn parse_link(link: &str) -> Result<Imported, String> {
-    if let Some(rest) = link.strip_prefix("vless://") {
+    let i = if let Some(rest) = link.strip_prefix("vless://") {
         parse_vless(rest)
     } else if let Some(rest) = link.strip_prefix("ss://") {
         parse_ss(rest)
     } else {
         Err(format!("只支持 vless:// 和 ss:// 链接：{}", short(link)))
+    }?;
+    checked(i)
+}
+
+/// Checks what a third party wrote before it reaches nodes, subscriptions,
+/// the panel and the node's terminal: no control or direction-changing
+/// characters, no server on a loopback, private or link-local address
+/// (entries would send users' traffic to their own LAN), and SS-2022 keys of
+/// the right size (a bad one makes every entry routed to it reject configs).
+fn checked(mut i: Imported) -> Result<Imported, String> {
+    let hidden = |c: char| c.is_control() || matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}');
+    i.name = i.name.chars().filter(|c| !hidden(*c)).take(40).collect::<String>().trim().to_string();
+    if i.server.chars().any(hidden) {
+        return Err(format!("地址里有控制字符：{}", short(&i.server.escape_debug().to_string())));
     }
+    let host = i.server.rsplit_once(':').map_or(i.server.as_str(), |(h, _)| h).trim_matches(|c| c == '[' || c == ']');
+    let local = host.eq_ignore_ascii_case("localhost")
+        || host.to_ascii_lowercase().ends_with(".localhost")
+        || host.parse::<std::net::IpAddr>().is_ok_and(|ip| !crate::dns::public_ip(&ip.to_canonical()));
+    if local {
+        return Err(format!("出口地址不能是本机或内网地址：{}", short(&i.server)));
+    }
+    if let Some(bits) = i.method.strip_prefix("2022-blake3-") {
+        let size = if bits.starts_with("aes-128") { 16 } else { 32 };
+        let ok = !i.password.is_empty()
+            && i.password.split(':').all(|k| base64::engine::general_purpose::STANDARD.decode(k).is_ok_and(|b| b.len() == size));
+        if !ok {
+            return Err(format!("{} 的密钥应是 {size} 字节的 base64", i.method));
+        }
+    }
+    Ok(i)
 }
 
 /// Splits "body?query#remark" into its parts, the remark percent-decoded.
@@ -99,22 +132,31 @@ fn parse_vless(rest: &str) -> Result<Imported, String> {
     let (uuid, hostport) = body.rsplit_once('@').ok_or("vless 链接缺少 uuid@地址")?;
     let server = host_port(hostport, 443)?;
     check_plain_vless(param(&q, "type"), param(&q, "security"), param(&q, "flow"), param(&q, "encryption"), param(&q, "headerType"))?;
+    if matches!(param(&q, "allowInsecure"), "1" | "true") || matches!(param(&q, "insecure"), "1" | "true") {
+        return Err("不接受跳过证书校验的 VLESS（allowInsecure）".into());
+    }
+    let tls_sni = if param(&q, "security") == "tls" {
+        let sni = param(&q, "sni");
+        if sni.is_empty() { server_host(&server) } else { sni.to_string() }
+    } else {
+        String::new()
+    };
     let uuid = unescape(uuid);
     if uuid.is_empty() {
         return Err("vless 链接缺少 uuid".into());
     }
-    Ok(Imported { name, kind: "vless", server, uuid, method: String::new(), password: String::new() })
+    Ok(Imported { name, kind: "vless", server, uuid, method: String::new(), password: String::new(), tls_sni })
 }
 
 fn check_plain_vless(network: &str, security: &str, flow: &str, encryption: &str, header: &str) -> Result<(), String> {
     if !matches!(network, "" | "tcp" | "raw") {
         return Err(format!("VLESS 暂时只支持 TCP，这条是 {network}"));
     }
-    if !matches!(security, "" | "none") {
-        return Err(format!("VLESS 暂时只支持不加密的明文 TCP（security=none），这条是 {security}"));
+    if !matches!(security, "" | "none" | "tls") {
+        return Err(format!("VLESS 只支持 TCP 明文或 TLS（security=none/tls），这条是 {security}"));
     }
     if !flow.is_empty() {
-        return Err(format!("明文 TCP 的 VLESS 不能带 flow（{flow}）"));
+        return Err(format!("VLESS 出站不能带 flow（{flow}）"));
     }
     if !matches!(encryption, "" | "none") {
         return Err(format!("不支持 VLESS encryption={encryption}"));
@@ -149,7 +191,7 @@ fn parse_ss(rest: &str) -> Result<Imported, String> {
     if password.is_empty() {
         return Err("SS 链接缺少密码".into());
     }
-    Ok(Imported { name, kind: "shadowsocks", server: host_port(&hostport, 0)?, uuid: String::new(), method, password })
+    Ok(Imported { name, kind: "shadowsocks", server: host_port(&hostport, 0)?, uuid: String::new(), method, password, tls_sni: String::new() })
 }
 
 /// SIP002 userinfo is base64(method:password); SIP022 allows it
@@ -192,7 +234,17 @@ fn parse_outbound(o: &Value) -> Result<Imported, String> {
             if uuid.is_empty() {
                 return Err("vless 出站缺少 id".into());
             }
-            Ok(Imported { name, kind: "vless", server: address_port(srv)?, uuid, method: String::new(), password: String::new() })
+            let tls = &stream["tlsSettings"];
+            if tls["allowInsecure"].as_bool() == Some(true) {
+                return Err("不接受跳过证书校验的 VLESS（allowInsecure）".into());
+            }
+            let server = address_port(srv)?;
+            let tls_sni = if stream["security"].as_str() == Some("tls") {
+                tls["serverName"].as_str().filter(|s| !s.is_empty()).map(str::to_string).unwrap_or_else(|| server_host(&server))
+            } else {
+                String::new()
+            };
+            Ok(Imported { name, kind: "vless", server, uuid, method: String::new(), password: String::new(), tls_sni })
         }
         _ => {
             let srv = s["servers"].get(0).unwrap_or(s);
@@ -207,7 +259,7 @@ fn parse_outbound(o: &Value) -> Result<Imported, String> {
             if password.is_empty() {
                 return Err("SS 出站缺少密码".into());
             }
-            Ok(Imported { name, kind: "shadowsocks", server: address_port(srv)?, uuid: String::new(), method, password })
+            Ok(Imported { name, kind: "shadowsocks", server: address_port(srv)?, uuid: String::new(), method, password, tls_sni: String::new() })
         }
     }
 }
@@ -233,6 +285,11 @@ fn host_port(s: &str, default_port: u16) -> Result<String, String> {
         port.parse().ok().filter(|p| *p > 0).ok_or_else(|| format!("端口不对：{}", short(s)))?
     };
     Ok(format!("{}:{port}", bracket(host)))
+}
+
+/// The host part of host:port, without IPv6 brackets.
+fn server_host(server: &str) -> String {
+    server.rsplit_once(':').map_or(server, |(h, _)| h).trim_matches(|c| c == '[' || c == ']').to_string()
 }
 
 fn bracket(host: &str) -> String {
@@ -287,6 +344,12 @@ mod tests {
         assert_eq!(i.uuid, "0f8b7a52-1111-4222-8333-444455556666");
         assert_eq!(i.name, "🇯🇵GLBB");
         assert!(parse_link("vless://u@h:1?security=reality&flow=xtls-rprx-vision").is_err());
+        // VLESS over TLS keeps the certificate name; skipping verification is refused
+        let i = parse_link("vless://abc@192.0.2.9:443?security=tls&sni=v.example.com&type=tcp#t").unwrap();
+        assert_eq!(i.tls_sni, "v.example.com");
+        assert_eq!(parse_link("vless://abc@v.example.net:443?security=tls").unwrap().tls_sni, "v.example.net");
+        assert!(parse_link("vless://abc@192.0.2.9:443?security=tls&allowInsecure=1").is_err());
+        assert_eq!(parse_link("vless://abc@192.0.2.9:443?security=none").unwrap().tls_sni, "");
         assert!(parse_link("vless://u@h:1?type=ws").is_err());
         assert_eq!(parse_link("vless://u@[2001:db8::1]:8443").unwrap().server, "[2001:db8::1]:8443");
     }
@@ -298,8 +361,15 @@ mod tests {
         let i = parse_link(&format!("ss://{u}@192.0.2.1:8388#A%20B")).unwrap();
         assert_eq!((i.kind, i.method.as_str(), i.password.as_str(), i.server.as_str(), i.name.as_str()), ("shadowsocks", "aes-256-gcm", "pa+ss", "192.0.2.1:8388", "A B"));
         // SIP022 clear userinfo with a '+' in the key
-        let i = parse_link("ss://2022-blake3-aes-128-gcm:AbC+dEf/gHi%3D@192.0.2.1:20731#x").unwrap();
-        assert_eq!(i.password, "AbC+dEf/gHi=");
+        let i = parse_link("ss://2022-blake3-aes-128-gcm:AAAAAAAAAAAAAAAAAAAA+w%3D%3D@192.0.2.1:20731#x").unwrap();
+        assert_eq!(i.password, "AAAAAAAAAAAAAAAAAAAA+w==");
+        // a key of the wrong size, a private server, control characters
+        assert!(parse_link("ss://2022-blake3-aes-128-gcm:AbC+dEf/gHi%3D@192.0.2.1:20731#x").is_err());
+        assert!(parse_link("ss://2022-blake3-aes-128-gcm:AAAAAAAAAAAAAAAAAAAA+w%3D%3D@127.0.0.1:20731").is_err());
+        assert!(parse_link("ss://2022-blake3-aes-128-gcm:AAAAAAAAAAAAAAAAAAAA+w%3D%3D@169.254.169.254:80").is_err());
+        assert!(parse_link("ss://2022-blake3-aes-128-gcm:AAAAAAAAAAAAAAAAAAAA+w%3D%3D@[::ffff:10.0.0.1]:80").is_err());
+        let i = parse_link("ss://2022-blake3-aes-128-gcm:AAAAAAAAAAAAAAAAAAAA+w%3D%3D@192.0.2.1:1#a%1B%5B2Jb%E2%80%AEc").unwrap();
+        assert_eq!(i.name, "a[2Jbc");
         // legacy all-base64
         let all = URL_SAFE_NO_PAD.encode("chacha20-ietf-poly1305:pw@192.0.2.2:443");
         let i = parse_link(&format!("ss://{all}#old")).unwrap();
@@ -313,11 +383,11 @@ mod tests {
         let j = r#"{"outbounds":[
           {"tag":"direct","protocol":"freedom"},
           {"tag":"K","protocol":"vless","settings":{"vnext":[{"address":"192.0.2.3","port":18888,"users":[{"id":"abc","encryption":"none","flow":""}]}]},"streamSettings":{"network":"tcp","security":"none"}},
-          {"tag":"S","protocol":"shadowsocks","settings":{"servers":[{"address":"192.0.2.4","port":1,"method":"2022-blake3-aes-128-gcm","password":"k"}]}}]}"#;
+          {"tag":"S","protocol":"shadowsocks","settings":{"servers":[{"address":"192.0.2.4","port":1,"method":"2022-blake3-aes-128-gcm","password":"AAAAAAAAAAAAAAAAAAAAAA=="}]}}]}"#;
         let v = parse_all(j).unwrap();
         assert_eq!(v.len(), 2);
         assert_eq!((v[0].name.as_str(), v[0].server.as_str(), v[0].uuid.as_str()), ("K", "192.0.2.3:18888", "abc"));
-        assert_eq!((v[1].kind, v[1].password.as_str()), ("shadowsocks", "k"));
-        assert_eq!(parse_all("vless://a@h:1\n\nss://2022-blake3-aes-128-gcm:k@h:2").unwrap().len(), 2);
+        assert_eq!((v[1].kind, v[1].password.as_str()), ("shadowsocks", "AAAAAAAAAAAAAAAAAAAAAA=="));
+        assert_eq!(parse_all("vless://a@h:1\n\nss://2022-blake3-aes-128-gcm:AAAAAAAAAAAAAAAAAAAAAA%3D%3D@h:2").unwrap().len(), 2);
     }
 }

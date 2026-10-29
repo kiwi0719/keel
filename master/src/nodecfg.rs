@@ -82,13 +82,14 @@ fn lines(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// How the node proves the domain: Cloudflare DNS when a token is set (works
-/// behind NAT), else TLS-ALPN on the AnyTLS listener when clients reach it on
-/// 443, else a temporary HTTP listener on :80.
+/// How the node proves the domain: DNS-01 through the master when a Cloudflare
+/// token is set (works behind NAT; the token itself never leaves the master),
+/// else TLS-ALPN on the AnyTLS listener when clients reach it on 443, else a
+/// temporary HTTP listener on :80.
 fn acme(w: &World, node: &Node) -> Value {
     let public = if node.anytls_pub > 0 { node.anytls_pub } else { node.anytls_port };
     let mut a = if !w.cf_token.is_empty() {
-        json!({"challenge": "dns", "dns_provider": "cloudflare", "dns_token": w.cf_token})
+        json!({"challenge": "dns", "dns_provider": "master"})
     } else if public == 443 {
         json!({"challenge": "tls-alpn"})
     } else {
@@ -185,7 +186,13 @@ fn entry(w: &World, node: &Node, secret: &str, now: i64) -> Value {
         .filter_map(|id| {
             let e = w.exit(*id)?;
             match e.kind.as_str() {
-                "vless" => return Some(json!({"tag": format!("x{id}"), "type": "vless", "server": e.server, "uuid": e.uuid})),
+                "vless" => {
+                    let mut o = json!({"tag": format!("x{id}"), "type": "vless", "server": e.server, "uuid": e.uuid});
+                    if !e.tls_sni.is_empty() {
+                        o["tls"] = json!({"server_name": e.tls_sni});
+                    }
+                    return Some(o);
+                }
                 "shadowsocks" => {
                     return Some(json!({"tag": format!("x{id}"), "type": "ss2022", "server": e.server, "method": e.method, "password": e.psk}))
                 }
@@ -195,9 +202,9 @@ fn entry(w: &World, node: &Node, secret: &str, now: i64) -> Value {
             let mut o = json!({
                 "tag": format!("x{id}"),
                 "type": "ss2022",
-                "server": format!("{}:{}", n.address(), e.public_port()),
+                "server": if n.address().contains(':') { format!("[{}]:{}", n.address(), e.public_port()) } else { format!("{}:{}", n.address(), e.public_port()) },
                 "method": SS_METHOD,
-                "password": format!("{}:{}", e.psk, exit_key(secret, node.id, e.id)),
+                "password": format!("{}:{}", e.psk, exit_key(secret, &node.key_salt, node.id, e.id)),
             });
             if e.udp_over_tcp {
                 o["udp_over_tcp"] = json!(true);
@@ -215,6 +222,9 @@ fn entry(w: &World, node: &Node, secret: &str, now: i64) -> Value {
         } else if !node.anytls_cert.is_empty() && !node.anytls_key.is_empty() {
             a["cert"] = json!(node.anytls_cert);
             a["key"] = json!(node.anytls_key);
+        } else if node.anytls_self_signed() {
+            a["cert_pem"] = json!(node.anytls_self_cert);
+            a["key_pem"] = json!(node.anytls_self_key);
         }
         if !node.anytls_sni.is_empty() {
             a["server_name"] = json!(node.anytls_sni);
@@ -229,6 +239,9 @@ fn entry(w: &World, node: &Node, secret: &str, now: i64) -> Value {
                 "server_names": node.reality_names(),
                 "private_key": node.reality_private,
                 "short_ids": node.reality_short_ids(),
+                // A recorded ClientHello replayed later than this no longer
+                // passes as a client: it is relayed to dest like any probe.
+                "max_time_diff": "3m",
             }
         });
         // Empty dest follows the first server name.
@@ -246,15 +259,20 @@ fn entry(w: &World, node: &Node, secret: &str, now: i64) -> Value {
         .iter()
         .filter(|u| u.enabled && w.user_entries.get(&u.id).is_some_and(|e| e.contains(&node.id)))
         .map(|u| {
+            let (anytls_password, uuid) = u.credentials_for(node.id);
             let period = user_period(w, u, now);
             let mut v = json!({
                 "name": user_counter(u.id),
-                "anytls_password": u.anytls_password,
-                "uuid": u.uuid,
+                "anytls_password": anytls_password,
+                "uuid": uuid,
                 "flow": "xtls-rprx-vision",
                 "ss_key": u.ss_key,
                 "period": period,
             });
+            let own = w.usage.get(&(node.id, user_counter(u.id), period.clone())).copied().unwrap_or(0);
+            if own > 0 {
+                v["used_self"] = json!(own);
+            }
             if u.quota_bytes > 0 {
                 v["quota_bytes"] = json!(u.quota_bytes);
                 let base = w.used(&user_counter(u.id), &period, Some(node.id));
@@ -287,7 +305,7 @@ fn exit(w: &World, node: &Node, secret: &str, now: i64) -> Value {
         for e in &exits {
             let name = exit_counter(entry.id, e.id);
             let period = exit_period(w, e, now);
-            let mut v = json!({"name": name, "ss_key": exit_key(secret, entry.id, e.id), "period": period});
+            let mut v = json!({"name": name, "ss_key": exit_key(secret, &entry.key_salt, entry.id, e.id), "period": period});
             if e.quota_bytes > 0 {
                 // Each exit port has one monthly quota shared by all entries:
                 // every entry's counter carries what the others used.
@@ -319,14 +337,15 @@ pub fn drop_unsupported(config: &mut Value, built: &[String]) {
     }
 }
 
-/// The config with every used_base removed: a change here is pushed at once,
-/// while used_base alone only changes every minute or so.
+/// The config without the usage figures (used_base, used_self): a change here
+/// is pushed at once, while usage alone only changes every minute or so.
 pub fn shape(config: &Value) -> Value {
     let mut c = config.clone();
     if let Some(users) = c.get_mut("users").and_then(Value::as_array_mut) {
         for u in users {
             if let Some(o) = u.as_object_mut() {
                 o.remove("used_base");
+                o.remove("used_self");
             }
         }
     }
