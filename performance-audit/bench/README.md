@@ -21,6 +21,8 @@ SINGBOX=/path/to/sing-box-linux-arm64 performance-audit/bench/setup.sh /tmp/keel
 ./bench.sh keel      # 吞吐和每 GB CPU：AnyTLS / SS2022 / VLESS Reality / Vision
 ./bench.sh sb        # 同样的 AnyTLS，用 sing-box 做服务端对照
 ./bench.sh chain     # 入口 AnyTLS → ss2022 出口
+./bench.sh vision    # 只跑 Vision 的三项
+./vchain.sh          # Vision 入站 → VLESS Reality Vision 出站 → 第二个节点的 Vision 入站 → HTTPS 目标（两端都会进直连）
 ./churn.sh           # 新建连接速率、每条连接的 CPU
 ./hold.sh 1000       # 1000 条打开连接时的内存
 ./udp-hol.sh         # SS2022 UDP 队头阻塞

@@ -74,8 +74,9 @@ suite_keel() {
 case $cmd in
   up) up ;;
   keel) start_server keel; suite_keel ;;
+  vision) start_server keel; vision http 1 127.0.0.1:18080 $G ""; vision https 1 127.0.0.1:18443 $G tls; vision https 8 127.0.0.1:18443 $P tls ;;
   sb) start_server sb; anytls sing-box 1 127.0.0.1:18080 $G; anytls sing-box 8 127.0.0.1:18080 $P ;;
   chain) start_server keel; anytls "keel->exit" 1 127.0.0.2:18080 2000000000; anytls "keel->exit" 8 127.0.0.2:18080 300000000 ;;
   down) docker rm -f kp-srv kp-exit kp-cli >/dev/null 2>&1 ;;
-  *) echo "usage: $0 up|keel|sb|chain|down" >&2; exit 2 ;;
+  *) echo "usage: $0 up|keel|vision|sb|chain|down" >&2; exit 2 ;;
 esac

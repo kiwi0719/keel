@@ -10,7 +10,7 @@ WORK=${1:-$(mktemp -d)}
 ARCH=$(docker version --format '{{.Server.Arch}}')
 mkdir -p "$WORK/bin" "$WORK/run" "$WORK/src"
 cp -R "$HERE/cfg" "$WORK/"
-cp "$HERE"/bench.sh "$HERE"/churn.sh "$HERE"/hold.sh "$HERE"/prof.sh "$HERE"/udp-hol.sh "$WORK/"
+cp "$HERE"/bench.sh "$HERE"/churn.sh "$HERE"/hold.sh "$HERE"/prof.sh "$HERE"/udp-hol.sh "$HERE"/vchain.sh "$WORK/"
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -days 30 -nodes \
   -keyout "$WORK/cfg/key.pem" -out "$WORK/cfg/cert.pem" -subj /CN=bench.test -addext subjectAltName=DNS:bench.test 2>/dev/null
 rsync -a --exclude master/target --exclude .git --exclude bin --exclude performance-audit "$REPO/" "$WORK/src/"

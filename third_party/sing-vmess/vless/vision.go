@@ -399,3 +399,42 @@ func (c *VisionConn) NeedAdditionalReadDeadline() bool {
 func (c *VisionConn) Upstream() any {
 	return c.Conn
 }
+
+// Once Vision has gone direct, the bytes on the TCP connection are the
+// inner TLS records as they are, so a copy can bypass this conn: sing's copy
+// asks NeedHandshakeForRead/Write after each transfer, and when they turn
+// false it unwraps again through ReaderReplaceable/UpstreamReader (and the
+// writer pair), keeping the counters, and can splice. Reading stays here
+// until the records that came in through TLS have been handed out.
+
+func (c *VisionConn) NeedHandshakeForRead() bool {
+	return !c.directRead || len(c.remainingBuffers) > 0
+}
+
+func (c *VisionConn) NeedHandshakeForWrite() bool {
+	return !c.directWrite
+}
+
+func (c *VisionConn) ReaderReplaceable() bool {
+	return c.directRead && len(c.remainingBuffers) == 0
+}
+
+func (c *VisionConn) WriterReplaceable() bool {
+	return c.directWrite
+}
+
+// UpstreamReader and UpstreamWriter are the TLS connection until direct mode:
+// sing also follows them to work out headroom.
+func (c *VisionConn) UpstreamReader() any {
+	if c.directRead {
+		return c.netConn
+	}
+	return c.Conn
+}
+
+func (c *VisionConn) UpstreamWriter() any {
+	if c.directWrite {
+		return c.netConn
+	}
+	return c.Conn
+}
