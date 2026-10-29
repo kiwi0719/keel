@@ -1,0 +1,8 @@
+large-panel t=  10.0s rss=   71.6MB footprint=   18.1MB cpu=   8.52s written=     0.0MB read=    1.7MB
+large-panel t=  20.0s rss=   90.0MB footprint=   23.3MB cpu=  17.06s written=     0.0MB read=    1.8MB
+large-panel t=  30.0s rss=   93.9MB footprint=   23.5MB cpu=  25.68s written=     0.0MB read=    1.9MB
+large-panel t=  40.1s rss=   94.9MB footprint=   23.6MB cpu=  34.24s written=     0.0MB read=    2.1MB
+large-panel t=  50.1s rss=   57.4MB footprint=   28.5MB cpu=  42.98s written=     0.0MB read=    2.3MB
+large-panel t=  60.1s rss=   80.7MB footprint=   25.9MB cpu=  51.70s written=     0.0MB read=    2.4MB
+large-panel t=  70.1s rss=   80.7MB footprint=   25.9MB cpu=  51.70s written=     0.0MB read=    2.4MB
+large-panel SUMMARY elapsed=70.1s cpu=51.70s (73.8% of one core) disk_written=0.0MB (0.00 MB/s) footprint_end=25.9MB rss_end=80.7MB rss_peak=94.9MB

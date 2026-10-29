@@ -1,0 +1,10 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/sagernet/sing-vmess
+cpu: Apple M4
+BenchmarkMuxServerRecv/udp/1200B/addr-each-frame(XUDP)-10         	  167520	      6610 ns/op	 181.54 MB/s	        10.00 conn-reads/frame	     236 B/op	      21 allocs/op
+BenchmarkMuxServerRecv/udp/1200B/no-addr-10                       	  222169	      5692 ns/op	 210.81 MB/s	         6.000 conn-reads/frame	     204 B/op	      16 allocs/op
+BenchmarkMuxServerRecv/tcp/16KiB-10                               	  508305	      2309 ns/op	7094.28 MB/s	         6.000 conn-reads/frame	     124 B/op	       9 allocs/op
+BenchmarkMuxServerRecv/tcp/1200B-10                               	 1000000	      1195 ns/op	1004.19 MB/s	         6.000 conn-reads/frame	     124 B/op	       9 allocs/op
+PASS
+ok  	github.com/sagernet/sing-vmess	5.297s

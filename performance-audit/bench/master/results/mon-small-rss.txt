@@ -1,0 +1,8 @@
+small-2nodes-panel t=  15.0s rss=   23.4MB footprint=   19.3MB cpu=   0.20s written=     2.1MB read=    1.1MB
+small-2nodes-panel t=  30.0s rss=   25.5MB footprint=   23.5MB cpu=   0.39s written=     3.3MB read=    5.4MB
+small-2nodes-panel t=  45.0s rss=   26.5MB footprint=   24.6MB cpu=   0.58s written=     5.4MB read=    9.6MB
+small-2nodes-panel t=  60.1s rss=   27.5MB footprint=   23.5MB cpu=   0.75s written=     7.7MB read=   11.8MB
+small-2nodes-panel t=  75.1s rss=   27.9MB footprint=   23.8MB cpu=   0.94s written=    10.8MB read=   14.3MB
+small-2nodes-panel t=  90.1s rss=   29.0MB footprint=   24.9MB cpu=   1.09s written=    12.0MB read=   16.4MB
+small-2nodes-panel t= 105.1s rss=   28.2MB footprint=   23.7MB cpu=   1.09s written=    12.0MB read=   16.4MB
+small-2nodes-panel SUMMARY elapsed=105.1s cpu=1.09s (1.0% of one core) disk_written=12.0MB (0.11 MB/s) footprint_end=23.7MB rss_end=28.2MB rss_peak=29.0MB

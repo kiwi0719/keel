@@ -1,0 +1,25 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/sagernet/sing-shadowsocks/shadowaead_2022
+cpu: Apple M4
+BenchmarkAEADWriterWrite/1400-10 	 3911792	       281.8 ns/op	4967.68 MB/s	         1.000 conn-writes/op	       0 B/op	       0 allocs/op
+BenchmarkAEADWriterWrite/32768-10         	  301472	      3975 ns/op	8244.39 MB/s	         1.000 conn-writes/op	       0 B/op	       0 allocs/op
+BenchmarkAEADWriterWrite/65535-10         	  145752	      7464 ns/op	8780.35 MB/s	         1.000 conn-writes/op	       0 B/op	       0 allocs/op
+BenchmarkAEADReaderRead/chunk=16384/read=32768/fused=false-10         	  588814	      2158 ns/op	7591.31 MB/s	         2.000 conn-reads/chunk	       0 B/op	       0 allocs/op
+BenchmarkAEADReaderRead/chunk=32768/read=32768/fused=false-10         	  269128	      4661 ns/op	7029.92 MB/s	         2.000 conn-reads/chunk	       0 B/op	       0 allocs/op
+BenchmarkAEADReaderRead/chunk=32768/read=32768/fused=true-10          	  293977	      4288 ns/op	7641.28 MB/s	         2.000 conn-reads/chunk	       0 B/op	       0 allocs/op
+BenchmarkAEADReaderRead/chunk=65535/read=65535/fused=false-10         	  120890	     11622 ns/op	5638.90 MB/s	         2.000 conn-reads/chunk	       0 B/op	       0 allocs/op
+BenchmarkAEADReaderRead/chunk=65535/read=32768/fused=false-10         	   88030	     15265 ns/op	4293.21 MB/s	         2.000 conn-reads/chunk	       0 B/op	       0 allocs/op
+BenchmarkBinaryReadUint64/binary.Read-10                              	66407187	        19.91 ns/op	       8 B/op	       1 allocs/op
+BenchmarkBinaryReadUint64/BigEndian.Uint64-10                         	445466955	         2.649 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBinaryReadUint64/binary.Write-10                             	81909630	        18.21 ns/op	       8 B/op	       1 allocs/op
+BenchmarkReplayFilterCheck/prefill=0-10                               	 3085990	       387.3 ns/op	     146 B/op	       1 allocs/op
+BenchmarkReplayFilterCheck/prefill=100000-10                          	 3086001	       371.1 ns/op	     142 B/op	       1 allocs/op
+BenchmarkAEADSeal/aes128gcm/1200-10                                   	 5131332	       218.3 ns/op	5496.70 MB/s	       0 B/op	       0 allocs/op
+BenchmarkAEADSeal/aes128gcm/16384-10                                  	  521073	      2464 ns/op	6649.63 MB/s	       0 B/op	       0 allocs/op
+BenchmarkAEADSeal/aes256gcm/1200-10                                   	 4600470	       269.5 ns/op	4452.99 MB/s	       0 B/op	       0 allocs/op
+BenchmarkAEADSeal/aes256gcm/16384-10                                  	  382506	      3193 ns/op	5131.10 MB/s	       0 B/op	       0 allocs/op
+BenchmarkAEADSeal/chacha20poly1305/1200-10                            	  640849	      1871 ns/op	 641.47 MB/s	       0 B/op	       0 allocs/op
+BenchmarkAEADSeal/chacha20poly1305/16384-10                           	   51205	     23211 ns/op	 705.86 MB/s	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/sagernet/sing-shadowsocks/shadowaead_2022	28.155s
