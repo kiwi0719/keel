@@ -312,6 +312,7 @@ func (c *clientConn) writeRequest(payload []byte) error {
 	variableLengthBuffer.Release()
 
 	err = writer.BufferedWriter(header.Len()).Flush()
+	writer.Release()
 	if err != nil {
 		return E.Cause(err, "client handshake")
 	}
@@ -422,21 +423,6 @@ func (c *clientConn) Write(p []byte) (n int, err error) {
 		return
 	}
 	return c.writer.Write(p)
-}
-
-var _ N.VectorisedWriter = (*clientConn)(nil)
-
-func (c *clientConn) WriteVectorised(buffers []*buf.Buffer) error {
-	if c.writer != nil {
-		return c.writer.WriteVectorised(buffers)
-	}
-	err := c.writeRequest(buffers[0].Bytes())
-	if err != nil {
-		buf.ReleaseMulti(buffers)
-		return err
-	}
-	buffers[0].Release()
-	return c.writer.WriteVectorised(buffers[1:])
 }
 
 func (c *clientConn) NeedHandshake() bool {
