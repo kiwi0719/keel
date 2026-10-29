@@ -55,6 +55,7 @@ func main() {
 	flag.BoolVar(&verbose, "v", false, "log every connection")
 	flag.Parse()
 	log.Print("keel-node ", version, " protocols: ", builtProtocols())
+	setMemoryLimit()
 
 	certDir = filepath.Dir(*configPath)
 	n := &node{users: newRegistry(*statePath), running: make(map[string]*runningInbound), prober: newProber(), started: time.Now()}
@@ -220,6 +221,12 @@ func (n *node) revoke(path string) {
 // flushed to disk before it takes the name, so a crash leaves either the old
 // file or the new one, never a truncated one.
 func writeFileAtomic(path string, content []byte, perm os.FileMode) error {
+	return replaceFile(path, content, perm, true)
+}
+
+// replaceFile is writeFileAtomic; without durable it skips the two fsyncs,
+// for files that need not survive a crash (status.json).
+func replaceFile(path string, content []byte, perm os.FileMode, durable bool) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
@@ -231,7 +238,7 @@ func writeFileAtomic(path string, content []byte, perm os.FileMode) error {
 	tmp := f.Name()
 	defer os.Remove(tmp) // no-op once renamed
 	if err = f.Chmod(perm); err == nil {
-		if _, err = f.Write(content); err == nil {
+		if _, err = f.Write(content); err == nil && durable {
 			err = f.Sync()
 		}
 	}
@@ -243,6 +250,9 @@ func writeFileAtomic(path string, content []byte, perm os.FileMode) error {
 	}
 	if err = os.Rename(tmp, path); err != nil {
 		return err
+	}
+	if !durable {
+		return nil
 	}
 	if d, err := os.Open(dir); err == nil {
 		d.Sync()

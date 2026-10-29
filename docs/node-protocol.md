@@ -84,6 +84,7 @@ keel-node -master https://panel.example:8443 -token <节点令牌> \
 
 - `net_rx` / `net_tx` 是开机以来除 `lo` 外所有网卡的累计字节；`rx_rate` / `tx_rate` 是和上一帧相比的每秒字节数。
 - `rss` 是 keel-node 自己的内存。
+- `tcp_conns` / `udp_conns`：整机正在使用的 TCP / UDP socket 数（IPv4 加 IPv6），取自 `/proc/net/sockstat{,6}` 的 `inuse`，不含 TIME_WAIT。
 - `tcp_retrans_pct`：和上一帧相比，整机重传的 TCP 段占发出段的百分比（来自 `/proc/net/snmp`）。
 - 非 Linux 系统上大部分字段是 0。
 

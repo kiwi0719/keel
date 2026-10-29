@@ -2,6 +2,7 @@ package main
 
 import (
 	"io"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -112,3 +113,30 @@ func TestUserConnectionCap(t *testing.T) {
 type nopCloser struct{ id int }
 
 func (nopCloser) Close() error { return nil }
+
+func TestSaveSkipsUnchangedCounters(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.json")
+	r := newRegistry(path)
+	r.apply([]UserConfig{{Name: "a", Period: "p"}})
+	r.lookup("a").up.Add(100)
+	if err := r.save(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.save(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("an unchanged save rewrote the file")
+	}
+	r.lookup("a").down.Add(1)
+	if err := r.save(); err != nil {
+		t.Fatal(err)
+	}
+	reloaded := newRegistry(path)
+	if s := reloaded.saved["a"]; s.Up != 100 || s.Down != 1 {
+		t.Fatalf("saved after a change: %+v", s)
+	}
+}

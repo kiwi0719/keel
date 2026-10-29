@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -75,6 +76,8 @@ type registry struct {
 	users map[string]*userState
 
 	statePath string
+	saveMu    sync.Mutex
+	lastSaved []byte // what the last successful save wrote
 	// saved holds counters of users not configured right now: loaded from
 	// statePath, or kept when a user is removed, so taking a user off and
 	// putting them back within a period does not reset what they used.
@@ -255,5 +258,16 @@ func (r *registry) save() error {
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(r.statePath, content, 0o600)
+	// Saved every 2 s; an idle node would otherwise write and fsync the
+	// same file over and over.
+	r.saveMu.Lock()
+	defer r.saveMu.Unlock()
+	if bytes.Equal(content, r.lastSaved) {
+		return nil
+	}
+	if err = writeFileAtomic(r.statePath, content, 0o600); err != nil {
+		return err
+	}
+	r.lastSaved = content
+	return nil
 }

@@ -101,7 +101,8 @@ func (n *node) writeStatus(ctx context.Context, path, master, fingerprint string
 	defer ticker.Stop()
 	for {
 		content, _ := json.MarshalIndent(n.status(master, fingerprint), "", "  ")
-		if err := writeFileAtomic(path, content, 0o644); err != nil {
+		// Rewritten every few seconds and only read by `agent`: no fsync.
+		if err := replaceFile(path, content, 0o644, false); err != nil {
 			log.Print("status: ", err)
 		}
 		select {
