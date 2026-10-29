@@ -1,0 +1,42 @@
+{
+ "log": {
+  "level": "warn"
+ },
+ "inbounds": [
+  {
+   "type": "socks",
+   "tag": "in-anytls",
+   "listen": "127.0.0.1",
+   "listen_port": 30001
+  }
+ ],
+ "outbounds": [
+  {
+   "type": "anytls",
+   "tag": "anytls",
+   "server": "127.0.0.1",
+   "server_port": 20001,
+   "password": "pw",
+   "tls": {
+    "enabled": true,
+    "server_name": "bench.test",
+    "insecure": true
+   }
+  },
+  {
+   "type": "direct",
+   "tag": "direct"
+  }
+ ],
+ "route": {
+  "rules": [
+   {
+    "inbound": [
+     "in-anytls"
+    ],
+    "outbound": "anytls"
+   }
+  ],
+  "final": "direct"
+ }
+}

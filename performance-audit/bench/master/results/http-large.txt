@@ -1,0 +1,13 @@
+RSS before:  44528 KB
+sizes: state=740345 public=5796 sub_clash=27318 sub_stash=26347 sub_singbox=47226 sub_surge=9795 sub_links=12556
+/api/state c=1                     rps=0.50     mean=2003.444ms p50=1946  p95=2647  p99=2647  max=2647  failed=7 non2xx=0
+/api/state c=4                     rps=0.59     mean=6798.651ms p50=6922  p95=10292 p99=10292 max=10292 failed=7 non2xx=0
+/api/public c=8 (cached)           rps=1070.59  mean=7.473  ms p50=0     p95=0     p99=0     max=1776  failed=0 non2xx=0
+/api/public rebuild (cache expired): 1.900386 1.748602 1.867752 1.802871 1.779588 s
+/s/{token}?format=clash c=1        rps=15.11    mean=66.200 ms p50=64    p95=76    p99=142   max=144   failed=0 non2xx=0
+/s/{token}?format=stash c=1        rps=14.60    mean=68.474 ms p50=65    p95=80    p99=154   max=201   failed=0 non2xx=0
+/s/{token}?format=singbox c=1      rps=13.70    mean=73.019 ms p50=68    p95=99    p99=180   max=264   failed=0 non2xx=0
+/s/{token}?format=surge c=1        rps=10.09    mean=99.146 ms p50=96    p95=128   p99=244   max=259   failed=0 non2xx=0
+/s/{token}?format=links c=1        rps=12.80    mean=78.139 ms p50=73    p95=115   p99=139   max=144   failed=0 non2xx=0
+/s/{token}?format=clash c=8        rps=6.63     mean=1205.927ms p50=1128  p95=2111  p99=2888  max=3903  failed=0 non2xx=0
+RSS after: 187744 KB

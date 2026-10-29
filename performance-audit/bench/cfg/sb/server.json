@@ -1,0 +1,29 @@
+{
+ "log": {
+  "level": "warn"
+ },
+ "inbounds": [
+  {
+   "type": "anytls",
+   "listen": "127.0.0.1",
+   "listen_port": 20001,
+   "users": [
+    {
+     "name": "u1",
+     "password": "pw"
+    }
+   ],
+   "tls": {
+    "enabled": true,
+    "certificate_path": "/w/cfg/cert.pem",
+    "key_path": "/w/cfg/key.pem"
+   }
+  }
+ ],
+ "outbounds": [
+  {
+   "type": "direct",
+   "tag": "direct"
+  }
+ ]
+}

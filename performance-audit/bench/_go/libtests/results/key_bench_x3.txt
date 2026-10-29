@@ -1,0 +1,42 @@
+BenchmarkUDPServerInbound/users=1/1200B-10         	  100000	       868.2 ns/op	     212 B/op	      10 allocs/op
+BenchmarkUDPServerInbound/users=1/1200B-10         	  100000	       814.8 ns/op	     212 B/op	      10 allocs/op
+BenchmarkUDPServerInbound/users=1/1200B-10         	  100000	       851.2 ns/op	     207 B/op	      10 allocs/op
+BenchmarkUDPServerInbound/users=1000/1200B-10      	  100000	       870.7 ns/op	     192 B/op	      10 allocs/op
+BenchmarkUDPServerInbound/users=1000/1200B-10      	  100000	       909.8 ns/op	     197 B/op	      10 allocs/op
+BenchmarkUDPServerInbound/users=1000/1200B-10      	  100000	       874.6 ns/op	     196 B/op	      10 allocs/op
+BenchmarkUDPServerOutbound-10                      	  100000	       382.4 ns/op	     216 B/op	       9 allocs/op
+--- BENCH: BenchmarkUDPServerOutbound-10
+BenchmarkUDPServerOutbound-10                      	  100000	       380.1 ns/op	     216 B/op	       9 allocs/op
+--- BENCH: BenchmarkUDPServerOutbound-10
+BenchmarkUDPServerOutbound-10                      	  100000	       380.3 ns/op	     216 B/op	       9 allocs/op
+--- BENCH: BenchmarkUDPServerOutbound-10
+BenchmarkTCPHandshakeServer/users=1/firstWrite=false-10         	   50000	      8255 ns/op	   76227 B/op	      23 allocs/op
+BenchmarkTCPHandshakeServer/users=1/firstWrite=false-10         	   50000	      8101 ns/op	   76226 B/op	      23 allocs/op
+BenchmarkTCPHandshakeServer/users=1/firstWrite=false-10         	   50000	      8170 ns/op	   76226 B/op	      23 allocs/op
+BenchmarkTCPHandshakeServer/users=1/firstWrite=true-10          	   50000	     16560 ns/op	  151526 B/op	      34 allocs/op
+BenchmarkTCPHandshakeServer/users=1/firstWrite=true-10          	   50000	     14799 ns/op	  151526 B/op	      34 allocs/op
+BenchmarkTCPHandshakeServer/users=1/firstWrite=true-10          	   50000	     14269 ns/op	  151526 B/op	      34 allocs/op
+BenchmarkTCPHandshakeServer/users=1000/firstWrite=false-10      	   50000	      7782 ns/op	   76223 B/op	      23 allocs/op
+BenchmarkTCPHandshakeServer/users=1000/firstWrite=false-10      	   50000	      8168 ns/op	   76223 B/op	      23 allocs/op
+BenchmarkTCPHandshakeServer/users=1000/firstWrite=false-10      	   50000	      9050 ns/op	   76223 B/op	      23 allocs/op
+BenchmarkTCPHandshakeServer/users=1000/firstWrite=true-10       	   50000	     13686 ns/op	  151519 B/op	      34 allocs/op
+BenchmarkTCPHandshakeServer/users=1000/firstWrite=true-10       	   50000	     13897 ns/op	  151519 B/op	      34 allocs/op
+BenchmarkTCPHandshakeServer/users=1000/firstWrite=true-10       	   50000	     13725 ns/op	  151519 B/op	      34 allocs/op
+BenchmarkTCPHandshakeServer/users=100000/firstWrite=false-10    	   50000	      7021 ns/op	   76207 B/op	      23 allocs/op
+BenchmarkTCPHandshakeServer/users=100000/firstWrite=false-10    	   50000	      6822 ns/op	   76207 B/op	      23 allocs/op
+BenchmarkTCPHandshakeServer/users=100000/firstWrite=false-10    	   50000	      6817 ns/op	   76207 B/op	      23 allocs/op
+BenchmarkTCPHandshakeServer/users=100000/firstWrite=true-10     	   50000	     13055 ns/op	  151488 B/op	      34 allocs/op
+BenchmarkTCPHandshakeServer/users=100000/firstWrite=true-10     	   50000	     11789 ns/op	  151488 B/op	      34 allocs/op
+BenchmarkTCPHandshakeServer/users=100000/firstWrite=true-10     	   50000	     12106 ns/op	  151488 B/op	      34 allocs/op
+BenchmarkMuxServerRecv/udp/1200B/addr-each-frame(XUDP)-10         	  527127	      2267 ns/op	 529.35 MB/s	        10.00 conn-reads/frame	     236 B/op	      21 allocs/op
+BenchmarkMuxServerRecv/udp/1200B/addr-each-frame(XUDP)-10         	  524292	      2321 ns/op	 516.99 MB/s	        10.00 conn-reads/frame	     236 B/op	      21 allocs/op
+BenchmarkMuxServerRecv/udp/1200B/addr-each-frame(XUDP)-10         	  512918	      2290 ns/op	 523.95 MB/s	        10.00 conn-reads/frame	     236 B/op	      21 allocs/op
+BenchmarkMuxServerRecv/udp/1200B/no-addr-10                       	  555625	      2658 ns/op	 451.51 MB/s	         6.000 conn-reads/frame	     204 B/op	      16 allocs/op
+BenchmarkMuxServerRecv/udp/1200B/no-addr-10                       	  567210	      2264 ns/op	 529.99 MB/s	         6.000 conn-reads/frame	     204 B/op	      16 allocs/op
+BenchmarkMuxServerRecv/udp/1200B/no-addr-10                       	  570528	      2280 ns/op	 526.43 MB/s	         6.000 conn-reads/frame	     204 B/op	      16 allocs/op
+BenchmarkMuxServerRecv/tcp/16KiB-10                               	 1000000	      1069 ns/op	15319.64 MB/s	         6.000 conn-reads/frame	     124 B/op	       9 allocs/op
+BenchmarkMuxServerRecv/tcp/16KiB-10                               	 1000000	      1044 ns/op	15698.88 MB/s	         6.000 conn-reads/frame	     124 B/op	       9 allocs/op
+BenchmarkMuxServerRecv/tcp/16KiB-10                               	 1000000	      1024 ns/op	16005.71 MB/s	         6.000 conn-reads/frame	     124 B/op	       9 allocs/op
+BenchmarkMuxServerRecv/tcp/1200B-10                               	 2094793	       575.1 ns/op	2086.60 MB/s	         6.000 conn-reads/frame	     124 B/op	       9 allocs/op
+BenchmarkMuxServerRecv/tcp/1200B-10                               	 2099322	       601.8 ns/op	1994.02 MB/s	         6.000 conn-reads/frame	     124 B/op	       9 allocs/op
+BenchmarkMuxServerRecv/tcp/1200B-10                               	 2077572	       605.9 ns/op	1980.61 MB/s	         6.000 conn-reads/frame	     124 B/op	       9 allocs/op

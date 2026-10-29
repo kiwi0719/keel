@@ -1,0 +1,3 @@
+/api/session: n=5 p50=60002.8ms p90=60013.0ms p99=60013.0ms max=60013.0ms
+  slowest: t=0s:18ms t=61s:60004ms t=121s:60013ms t=181s:60003ms t=241s:60003ms
+  non-200: [(60.50440287590027, 60.00407891604118, "TimeoutError('The read operation timed out')"), (120.51757907867432, 60.01298333401792, "TimeoutError('_ssl.c:1064: The handshake operation timed out')"), (180.5204780101776, 60.00270925019868, "TimeoutError('_ssl.c:1064: The handshake operation timed out')"), (240.52345895767212, 60.00278429198079, "TimeoutError('_ssl.c:1064: The handshake operation timed out')")]
