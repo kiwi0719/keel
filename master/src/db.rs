@@ -6,6 +6,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use crate::util::{random_b64, random_hex, random_uuid};
 
@@ -495,6 +496,9 @@ pub struct World {
     pub user_entries: HashMap<i64, Vec<i64>>,
     /// (node id, name, period) -> up + down
     pub usage: HashMap<(i64, String, String), i64>,
+    /// Sums over `usage`, built on first use: summing per lookup made every
+    /// config and panel refresh quadratic in the number of users.
+    totals: OnceLock<UsageTotals>,
     pub tz: i64,
     /// ACME account email and Cloudflare API token (Zone DNS edit), shared
     /// by every node that requests certificates.
@@ -514,12 +518,46 @@ impl World {
     }
     /// Sum of a counter name for a period across nodes, optionally skipping one.
     pub fn used(&self, name: &str, period: &str, skip_node: Option<i64>) -> i64 {
-        self.usage
-            .iter()
-            .filter(|((n, nm, p), _)| nm == name && p == period && Some(*n) != skip_node)
-            .map(|(_, v)| *v)
-            .sum()
+        let total = self.totals().by_name.get(name).and_then(|p| p.get(period)).copied().unwrap_or(0);
+        match skip_node {
+            Some(n) => total.saturating_sub(self.own(n, name, period)),
+            None => total,
+        }
     }
+
+    /// Sum of one node's counters for an exit in a period (the entries'
+    /// "n<entry>x<exit>" counters on that exit's node).
+    pub fn exit_used(&self, node: i64, exit: i64, period: &str) -> i64 {
+        self.totals().by_exit.get(&(node, exit)).and_then(|p| p.get(period)).copied().unwrap_or(0)
+    }
+
+    /// One node's own figure for a counter in a period.
+    pub fn own(&self, node: i64, name: &str, period: &str) -> i64 {
+        self.usage.get(&(node, name.to_string(), period.to_string())).copied().unwrap_or(0)
+    }
+
+    fn totals(&self) -> &UsageTotals {
+        self.totals.get_or_init(|| {
+            let mut t = UsageTotals::default();
+            for ((node, name, period), v) in &self.usage {
+                let sum = t.by_name.entry(name.clone()).or_default().entry(period.clone()).or_default();
+                *sum = sum.saturating_add(*v);
+                if let Some(exit) = crate::nodecfg::counter_exit(name) {
+                    let sum = t.by_exit.entry((*node, exit)).or_default().entry(period.clone()).or_default();
+                    *sum = sum.saturating_add(*v);
+                }
+            }
+            t
+        })
+    }
+}
+
+#[derive(Default)]
+struct UsageTotals {
+    /// name -> period -> sum over nodes
+    by_name: HashMap<String, HashMap<String, i64>>,
+    /// (node id, exit id) -> period -> sum of that node's counters for the exit
+    by_exit: HashMap<(i64, i64), HashMap<String, i64>>,
 }
 
 pub fn load_world(conn: &Connection) -> rusqlite::Result<World> {
@@ -643,15 +681,23 @@ pub fn node_counters(conn: &Connection, node: i64) -> rusqlite::Result<std::coll
 
 /// Stores the absolute counters from a node report. Within a period they only
 /// grow: a node that crashed before saving reports less than it had.
+///
+/// One transaction per report, and a counter that did not grow is not
+/// rewritten: every row in its own commit rewrote every counter of every
+/// node every 5 s, traffic or not.
 pub fn store_usage(conn: &Connection, node: i64, rows: &[(String, String, i64, i64)], now: i64) -> rusqlite::Result<()> {
-    let mut st = conn.prepare_cached(
-        "INSERT INTO usage(node_id,name,period,up,down,updated) VALUES(?1,?2,?3,?4,?5,?6)
-         ON CONFLICT(node_id,name,period) DO UPDATE SET up=MAX(up,excluded.up), down=MAX(down,excluded.down), updated=excluded.updated",
-    )?;
-    for (name, period, up, down) in rows {
-        st.execute(params![node, name, period, up, down, now])?;
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut st = tx.prepare_cached(
+            "INSERT INTO usage(node_id,name,period,up,down,updated) VALUES(?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(node_id,name,period) DO UPDATE SET up=MAX(up,excluded.up), down=MAX(down,excluded.down), updated=excluded.updated
+             WHERE excluded.up > usage.up OR excluded.down > usage.down",
+        )?;
+        for (name, period, up, down) in rows {
+            st.execute(params![node, name, period, up, down, now])?;
+        }
     }
-    Ok(())
+    tx.commit()
 }
 
 pub fn add_node_month(conn: &Connection, node: i64, month: &str, rx: i64, tx: i64) -> rusqlite::Result<()> {
@@ -731,4 +777,82 @@ fn self_signed(name: &str, year: i32) -> Result<(String, String), rcgen::Error> 
 pub fn cert_sha256(pem: &str) -> Option<String> {
     let der = rustls_pemfile::certs(&mut pem.as_bytes()).next()?.ok()?;
     Some(crate::util::hex(&crate::util::sha256(der.as_ref())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_totals_match_a_plain_sum() {
+        let mut w = World::default();
+        let mut seed: u64 = 7;
+        let mut next = |m: u64| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) % m
+        };
+        let names: Vec<String> = (1..=6).map(|i| format!("u{i}")).chain((1..=3).map(|i| format!("n{i}x9"))).chain(["n1x8".into(), "bad".into()]).collect();
+        let periods = ["2026-10-01", "2026-09-01", "2026-10-01#1"];
+        for node in 1..=5 {
+            for name in &names {
+                for p in periods {
+                    if next(3) > 0 {
+                        w.usage.insert((node, name.clone(), p.to_string()), next(1 << 40) as i64);
+                    }
+                }
+            }
+        }
+        let plain = |name: &str, period: &str, skip: Option<i64>| -> i64 {
+            w.usage.iter().filter(|((n, nm, p), _)| nm == name && p == period && Some(*n) != skip).map(|(_, v)| *v).sum()
+        };
+        let plain_exit = |node: i64, exit: i64, period: &str| -> i64 {
+            w.usage
+                .iter()
+                .filter(|((n, nm, p), _)| *n == node && p == period && crate::nodecfg::counter_exit(nm) == Some(exit))
+                .map(|(_, v)| *v)
+                .sum()
+        };
+        for name in &names {
+            for p in periods {
+                for skip in [None, Some(1), Some(3), Some(9)] {
+                    assert_eq!(w.used(name, p, skip), plain(name, p, skip), "{name} {p} {skip:?}");
+                }
+            }
+        }
+        for node in 0..=6 {
+            for exit in [8, 9, 10] {
+                for p in periods {
+                    assert_eq!(w.exit_used(node, exit, p), plain_exit(node, exit, p), "{node} {exit} {p}");
+                }
+            }
+        }
+        assert_eq!(w.used("u404", "2026-10-01", None), 0);
+    }
+
+    #[test]
+    fn store_usage_only_rewrites_counters_that_grew() {
+        let path = std::env::temp_dir().join(format!("keel-db-test-{}-{}.db", std::process::id(), random_hex(4)));
+        let conn = open(&path).unwrap();
+        let read = |conn: &Connection| -> (i64, i64, i64) {
+            conn.query_row("SELECT up,down,updated FROM usage WHERE node_id=1 AND name='u1' AND period='p'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap()
+        };
+        let row = |up: i64, down: i64| vec![("u1".to_string(), "p".to_string(), up, down)];
+        store_usage(&conn, 1, &row(10, 20), 100).unwrap();
+        assert_eq!(read(&conn), (10, 20, 100));
+        store_usage(&conn, 1, &row(10, 20), 200).unwrap(); // unchanged: not rewritten
+        assert_eq!(read(&conn), (10, 20, 100));
+        store_usage(&conn, 1, &row(11, 20), 300).unwrap(); // grew
+        assert_eq!(read(&conn), (11, 20, 300));
+        store_usage(&conn, 1, &row(5, 25), 400).unwrap(); // up fell back (crash), down grew: keep the larger of each
+        assert_eq!(read(&conn), (11, 25, 400));
+        store_usage(&conn, 1, &row(1, 1), 500).unwrap(); // both lower: nothing changes
+        assert_eq!(read(&conn), (11, 25, 400));
+        drop(conn);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
 }
