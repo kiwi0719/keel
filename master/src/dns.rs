@@ -141,12 +141,16 @@ async fn call(token: &str, method: &str, path: &str, body: Option<Value>) -> Res
 }
 
 async fn request(token: &str, method: &str, path: &str, body: Option<Value>) -> Result<(u16, Value), String> {
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+    // Built once: the web PKI roots, no client certificate.
+    static CONFIG: std::sync::OnceLock<Arc<rustls::ClientConfig>> = std::sync::OnceLock::new();
+    let config = CONFIG.get_or_init(|| {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        Arc::new(rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth())
+    });
     let tcp = TcpStream::connect((API_HOST, 443)).await.map_err(|e| format!("连接 Cloudflare 失败：{e}"))?;
     let server = rustls::pki_types::ServerName::try_from(API_HOST).map_err(|e| e.to_string())?;
-    let tls = TlsConnector::from(Arc::new(config)).connect(server, tcp).await.map_err(|e| format!("Cloudflare TLS：{e}"))?;
+    let tls = TlsConnector::from(config.clone()).connect(server, tcp).await.map_err(|e| format!("Cloudflare TLS：{e}"))?;
     let (mut send, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tls)).await.map_err(|e| e.to_string())?;
     tokio::spawn(conn);
     let req = hyper::Request::builder()

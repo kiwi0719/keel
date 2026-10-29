@@ -262,28 +262,39 @@ async fn node_ports(State(app): State<Arc<App>>, headers: HeaderMap) -> Response
     ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], out).into_response()
 }
 
-/// Node binaries placed in DIR/dist, e.g. keel-node-linux-amd64. Each file is
-/// read once and shared, so slow downloads do not each hold a copy.
+/// Node binaries placed in DIR/dist, e.g. keel-node-linux-amd64. Streamed
+/// from the file in 64 KiB pieces, so neither a slow download nor the master
+/// between downloads holds a copy of the binary.
 async fn download(State(app): State<Arc<App>>, UrlPath(name): UrlPath<String>) -> Response {
-    static CACHE: Mutex<Option<std::collections::HashMap<String, (std::time::SystemTime, bytes::Bytes)>>> = Mutex::new(None);
+    use tokio::io::AsyncReadExt;
     let valid = name.starts_with("keel-node-") && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_');
     if !valid {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let path = app.dist.join(&name);
     let missing = || (StatusCode::NOT_FOUND, format!("{name} is not in the master's dist directory\n")).into_response();
-    let Ok(modified) = tokio::fs::metadata(&path).await.and_then(|m| m.modified()) else { return missing() };
-    let cached = CACHE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).get(&name).filter(|(t, _)| *t == modified).map(|(_, b)| b.clone());
-    let bytes = match cached {
-        Some(b) => b,
-        None => {
-            let Ok(b) = tokio::fs::read(&path).await else { return missing() };
-            let b = bytes::Bytes::from(b);
-            CACHE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(name.clone(), (modified, b.clone()));
-            b
+    let Ok(file) = tokio::fs::File::open(app.dist.join(&name)).await else { return missing() };
+    // The length of the file opened, even if the name is replaced meanwhile.
+    let Ok(meta) = file.metadata().await else { return missing() };
+    if !meta.is_file() {
+        return missing();
+    }
+    let chunks = futures_util::stream::unfold(Some(file), |file| async move {
+        let mut file = file?;
+        let mut chunk = vec![0u8; 64 << 10];
+        match file.read(&mut chunk).await {
+            Ok(0) => None,
+            Ok(n) => {
+                chunk.truncate(n);
+                Some((Ok(bytes::Bytes::from(chunk)), Some(file)))
+            }
+            Err(e) => Some((Err(e), None)),
         }
-    };
-    ([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response()
+    });
+    (
+        [(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream")), (header::CONTENT_LENGTH, HeaderValue::from(meta.len()))],
+        axum::body::Body::from_stream(chunks),
+    )
+        .into_response()
 }
 
 async fn security_headers(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
@@ -542,6 +553,8 @@ async fn main() {
         let app = app.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(5));
+            // After a stall, carry on from now instead of catching up.
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut n: u64 = 0;
             loop {
                 tick.tick().await;

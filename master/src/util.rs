@@ -10,7 +10,13 @@ pub fn random_bytes(n: usize) -> Vec<u8> {
 }
 
 pub fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        s.push(DIGITS[usize::from(b >> 4)] as char);
+        s.push(DIGITS[usize::from(b & 0xf)] as char);
+    }
+    s
 }
 
 pub fn random_hex(n: usize) -> String {
@@ -78,4 +84,15 @@ pub fn percent_encode(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_matches_format() {
+        let all: Vec<u8> = (0..=255).collect();
+        assert_eq!(hex(&all), all.iter().map(|b| format!("{b:02x}")).collect::<String>());
+    }
 }
