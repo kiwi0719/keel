@@ -30,7 +30,7 @@ var verbose bool
 
 const (
 	configRecheck = 2 * time.Second
-	quotaRecheck  = time.Second
+	quotaRecheck  = 250 * time.Millisecond // over-quota traffic is cut within this
 	// Shorter than the service's restart delay, so a crash loop cannot
 	// keep throwing away usage.
 	saveInterval = 2 * time.Second
@@ -107,6 +107,22 @@ func main() {
 	configTicker := time.NewTicker(configRecheck)
 	quotaTicker := time.NewTicker(quotaRecheck)
 	saveTicker := time.NewTicker(saveInterval)
+	// Saving writes and syncs a file, which can take a while on slow disks;
+	// it runs beside this loop so quota checks are never held up by it.
+	saveNow := make(chan struct{}, 1)
+	go func() {
+		for range saveNow {
+			if err := n.users.save(); err != nil {
+				log.Print("save usage: ", err)
+			}
+		}
+	}()
+	requestSave := func() {
+		select {
+		case saveNow <- struct{}{}:
+		default: // one is already pending
+		}
+	}
 	for {
 		select {
 		case sig := <-signals:
@@ -115,9 +131,7 @@ func main() {
 				n.reloadFile(*configPath)
 				continue
 			case syscall.SIGUSR1:
-				if err := n.users.save(); err != nil {
-					log.Print("save usage: ", err)
-				}
+				requestSave()
 				continue
 			}
 			n.shutdown()
@@ -143,14 +157,10 @@ func main() {
 		case now := <-quotaTicker.C:
 			if n.users.check(now) {
 				n.pushUsers()
-				if err := n.users.save(); err != nil {
-					log.Print("save usage: ", err)
-				}
+				requestSave()
 			}
 		case <-saveTicker.C:
-			if err := n.users.save(); err != nil {
-				log.Print("save usage: ", err)
-			}
+			requestSave()
 			if verbose {
 				for _, u := range n.users.usage() {
 					log.Printf("usage %s up=%d down=%d conns=%d blocked=%v", u.Name, u.Up, u.Down, u.Conns, u.Blocked)

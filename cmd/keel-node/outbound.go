@@ -222,92 +222,50 @@ func (r *router) relayUDP(ctx context.Context, user string, packetConn N.PacketC
 		}
 		return
 	}
-	(&udpSession{r: r, user: user, client: packetConn, remotes: map[string]N.PacketConn{tag: remote}}).run(ctx, tag, remote)
+	mux := newUDPRoutes(ctx, r, user, tag, remote)
+	defer mux.Close()
+	bufio.CopyPacketConn(ctx, packetConn, mux)
 }
 
-// udpSession routes each packet of one UDP session by its own destination:
-// a later packet to a host the rules send elsewhere (or one that is
-// private) must not ride the outbound the first packet picked.
-type udpSession struct {
+// udpRoutes is the remote side of one UDP session, routing each packet by
+// its own destination: a later packet to a host the rules send elsewhere
+// (or one that is private) must not ride the outbound the first packet
+// picked. Remotes are opened per outbound on first use; the session ends
+// when every remote has idled out.
+type udpRoutes struct {
+	ctx     context.Context
 	r       *router
 	user    string
-	client  N.PacketConn
-	writeMu sync.Mutex // packets back to the client come from several remotes
 	mu      sync.Mutex
-	remotes map[string]N.PacketConn // by outbound tag, opened on first use
-	wg      sync.WaitGroup
+	remotes map[string]N.PacketConn
+	in      chan udpPacket
+	done    chan struct{}
+	once    sync.Once
 }
 
-func (s *udpSession) run(ctx context.Context, firstTag string, first N.PacketConn) {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	s.wg.Add(1)
-	go s.back(cancel, firstTag, first)
-	defer func() {
-		s.mu.Lock()
-		for _, remote := range s.remotes {
-			remote.Close()
-		}
-		s.mu.Unlock()
-		s.client.Close()
-		s.wg.Wait()
-	}()
-	for {
-		buffer := buf.NewPacket()
-		destination, err := s.client.ReadPacket(buffer)
-		if err != nil {
-			buffer.Release()
-			return
-		}
-		destination = destination.Unwrap()
-		if s.r.refused(destination) {
-			buffer.Release()
-			continue
-		}
-		out, tag, label := s.r.pick(destination)
-		s.mu.Lock()
-		remote := s.remotes[tag]
-		s.mu.Unlock()
-		if remote == nil {
-			if verbose {
-				log.Print("[", s.user, "] udp ", destination, " via ", label)
-			}
-			dialCtx, dialCancel := context.WithTimeout(ctx, dialTimeout)
-			remote, err = out.listenUDP(dialCtx, destination)
-			dialCancel()
-			if err != nil {
-				s.r.dialFailed(tag)
-				buffer.Release()
-				continue
-			}
-			s.mu.Lock()
-			s.remotes[tag] = remote
-			s.mu.Unlock()
-			s.wg.Add(1)
-			go s.back(cancel, tag, remote)
-		}
-		if err = remote.WritePacket(buffer, destination); err != nil && verbose {
-			log.Print("[", s.user, "] udp ", destination, ": ", err)
-		}
-	}
+type udpPacket struct {
+	data []byte
+	from M.Socksaddr
 }
 
-// back copies one remote's packets to the client until the remote idles out
-// or fails. The session ends when the client side fails, or when its last
-// remote is gone (nothing has moved for the UDP timeout).
-func (s *udpSession) back(cancel context.CancelFunc, tag string, remote N.PacketConn) {
-	defer s.wg.Done()
+func newUDPRoutes(ctx context.Context, r *router, user, tag string, first N.PacketConn) *udpRoutes {
+	u := &udpRoutes{ctx: ctx, r: r, user: user, remotes: map[string]N.PacketConn{tag: first}, in: make(chan udpPacket, 64), done: make(chan struct{})}
+	go u.read(tag, first)
+	return u
+}
+
+// read forwards one remote's packets until it fails or idles out.
+func (u *udpRoutes) read(tag string, remote N.PacketConn) {
 	defer func() {
 		remote.Close()
-		s.mu.Lock()
-		if s.remotes[tag] == remote {
-			delete(s.remotes, tag)
+		u.mu.Lock()
+		if u.remotes[tag] == remote {
+			delete(u.remotes, tag)
 		}
-		idle := len(s.remotes) == 0
-		s.mu.Unlock()
+		idle := len(u.remotes) == 0
+		u.mu.Unlock()
 		if idle {
-			cancel()
-			s.client.Close()
+			u.Close()
 		}
 	}()
 	for {
@@ -317,16 +275,77 @@ func (s *udpSession) back(cancel context.CancelFunc, tag string, remote N.Packet
 			buffer.Release()
 			return
 		}
-		s.writeMu.Lock()
-		err = s.client.WritePacket(buffer, from)
-		s.writeMu.Unlock()
-		if err != nil {
-			cancel()
-			s.client.Close()
+		p := udpPacket{data: append([]byte(nil), buffer.Bytes()...), from: from}
+		buffer.Release()
+		select {
+		case u.in <- p:
+		case <-u.done:
 			return
 		}
 	}
 }
+
+func (u *udpRoutes) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
+	select {
+	case p := <-u.in:
+		_, err := buffer.Write(p.data)
+		return p.from, err
+	case <-u.done:
+		return M.Socksaddr{}, net.ErrClosed
+	}
+}
+
+func (u *udpRoutes) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+	destination = destination.Unwrap()
+	if u.r.refused(destination) {
+		buffer.Release()
+		return nil // drop, keep the session
+	}
+	out, tag, label := u.r.pick(destination)
+	u.mu.Lock()
+	remote := u.remotes[tag]
+	u.mu.Unlock()
+	if remote == nil {
+		if verbose {
+			log.Print("[", u.user, "] udp ", destination, " via ", label)
+		}
+		dialCtx, cancel := context.WithTimeout(u.ctx, dialTimeout)
+		var err error
+		remote, err = out.listenUDP(dialCtx, destination)
+		cancel()
+		if err != nil {
+			u.r.dialFailed(tag)
+			buffer.Release()
+			return nil
+		}
+		u.mu.Lock()
+		u.remotes[tag] = remote
+		u.mu.Unlock()
+		go u.read(tag, remote)
+	}
+	return remote.WritePacket(buffer, destination)
+}
+
+// LazyHeadroom: which outbound a packet takes, and so the header room it
+// needs, is only known per packet; callers leave sing's default room.
+func (u *udpRoutes) LazyHeadroom() bool { return true }
+
+func (u *udpRoutes) Close() error {
+	u.once.Do(func() {
+		close(u.done)
+		u.mu.Lock()
+		for _, remote := range u.remotes {
+			remote.Close()
+		}
+		u.mu.Unlock()
+	})
+	return nil
+}
+
+func (u *udpRoutes) LocalAddr() net.Addr              { return &net.UDPAddr{} }
+func (u *udpRoutes) SetDeadline(time.Time) error      { return nil }
+func (u *udpRoutes) SetReadDeadline(time.Time) error  { return nil }
+func (u *udpRoutes) SetWriteDeadline(time.Time) error { return nil }
 
 // directOutbound dials from this machine. It also implements N.Dialer so the
 // other outbounds reach their servers through it (and honor ipv4_only).
