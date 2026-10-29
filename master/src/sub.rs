@@ -478,7 +478,7 @@ pub async fn subscription(
 }
 
 fn render(app: &App, token: &str, query: SubQuery, headers: &HeaderMap) -> Response {
-    let conn = app.db();
+    let conn = app.reader();
     let Some(user) = db::user_by_sub(&conn, token).ok().flatten() else {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     };

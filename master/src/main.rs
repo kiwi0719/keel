@@ -240,7 +240,7 @@ async fn install_script() -> Response {
 /// "<what> <listen port> <public port>". Authenticated by the node token.
 async fn node_ports(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     let token = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("").trim();
-    let node = if token.is_empty() { None } else { db::node_by_token(&app.db(), token).ok().flatten() };
+    let node = if token.is_empty() { None } else { db::node_by_token(&app.reader(), token).ok().flatten() };
     let Some(n) = node else {
         tokio::time::sleep(Duration::from_secs(1)).await;
         return (StatusCode::UNAUTHORIZED, "bad token\n").into_response();
@@ -254,7 +254,7 @@ async fn node_ports(State(app): State<Arc<App>>, headers: HeaderMap) -> Response
         if n.vless_on && n.vless_port > 0 {
             out.push_str(&format!("VLESS-Reality {} {}\n", n.vless_port, pick(n.vless_port, n.vless_pub)));
         }
-    } else if let Ok(exits) = db::exits_of(&app.db(), n.id) {
+    } else if let Ok(exits) = db::exits_of(&app.reader(), n.id) {
         for e in &exits {
             out.push_str(&format!("SS-2022({}) {} {}\n", e.name.replace(' ', "_"), e.port, e.public_port()));
         }
@@ -356,7 +356,7 @@ fn router(app: Arc<App>) -> Router {
         .route("/s/{token}", get(sub::subscription))
         .route("/api/login", post(api::login).layer(axum::extract::DefaultBodyLimit::max(4096)))
         .route("/api/session", get(|State(app): State<Arc<App>>, h: HeaderMap| async move {
-            axum::Json(serde_json::json!({"logged_in": api::logged_in(&app, &h)}))
+            axum::Json(serde_json::json!({"logged_in": api::logged_in(&app, &h).await}))
         }))
         .route("/api/node/ws", get(ws::handler))
         .route("/api/node/ports", get(node_ports))
@@ -538,8 +538,13 @@ async fn main() {
     };
     let dist = o.data.join("dist");
     let _ = std::fs::create_dir_all(&dist);
+    let reader = db::open_reader(&o.data.join("keel.db")).unwrap_or_else(|e| {
+        eprintln!("database: {e}");
+        std::process::exit(1)
+    });
     let app = Arc::new(App {
         db: Mutex::new(conn),
+        db_read: Mutex::new(reader),
         live: Mutex::new(live::Live::default()),
         secret,
         tls: tls_info,

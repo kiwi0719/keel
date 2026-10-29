@@ -58,7 +58,12 @@ pub async fn handler(
         .unwrap_or("")
         .trim()
         .to_string();
-    let node = if token.is_empty() { None } else { db::node_by_token(&app.db(), &token).ok().flatten() };
+    let node = if token.is_empty() {
+        None
+    } else {
+        let app = app.clone();
+        tokio::task::spawn_blocking(move || db::node_by_token(&app.reader(), &token).ok().flatten()).await.ok().flatten()
+    };
     let Some(node) = node else {
         tokio::time::sleep(Duration::from_secs(1)).await;
         // Close it: a rejected node would otherwise keep the socket alive.
@@ -85,29 +90,40 @@ async fn serve(app: Arc<App>, node_id: i64, token: String, ip: String, socket: W
 
     let (tx, mut rx) = mpsc::channel::<Message>(QUEUE);
     let stop = Arc::new(tokio::sync::Notify::new());
-    let conn_id = {
-        // The token was checked before the upgrade; check it again, holding
-        // the database lock, so a rotation or deletion that happened since
-        // (or happens now) cannot miss this connection.
-        let db = app.db();
-        let current = db::node_by_token(&db, &token).ok().flatten().is_some_and(|n| n.id == node_id);
-        if !current {
-            return;
-        }
-        let mut live = app.live();
-        live.next_conn += 1;
-        let id = live.next_conn;
-        let l = live.nodes.entry(node_id).or_default();
-        if let Some(old) = l.conn.replace(Conn { id, tx: tx.clone(), stop: stop.clone() }) {
-            old.stop.notify_one();
-        }
-        l.connected_at = now();
-        l.last_seen = now();
-        id
+    // Database work runs on the blocking pool, here and for every message.
+    let registered = {
+        let (app, tx, stop) = (app.clone(), tx.clone(), stop.clone());
+        tokio::task::spawn_blocking(move || {
+            let conn_id = {
+                // The token was checked before the upgrade; check it again,
+                // holding the database lock, so a rotation or deletion that
+                // happened since (or happens now) cannot miss this connection.
+                let db = app.db();
+                let current = db::node_by_token(&db, &token).ok().flatten().is_some_and(|n| n.id == node_id);
+                if !current {
+                    return None;
+                }
+                let mut live = app.live();
+                live.next_conn += 1;
+                let id = live.next_conn;
+                let l = live.nodes.entry(node_id).or_default();
+                if let Some(old) = l.conn.replace(Conn { id, tx, stop }) {
+                    old.stop.notify_one();
+                }
+                l.connected_at = now();
+                l.last_seen = now();
+                id
+            };
+            Some((conn_id, app.on_hello(node_id, hello, &ip)))
+        })
+        .await
+        .ok()
+        .flatten()
     };
+    let Some((conn_id, moved)) = registered else { return };
     // Cloudflare is only called when the node's address actually changed:
     // reconnecting in a loop must not make the master hammer the API.
-    if app.on_hello(node_id, hello, &ip) {
+    if moved {
         crate::dns::spawn_sync(app.clone());
     }
 
@@ -143,22 +159,31 @@ async fn serve(app: Arc<App>, node_id: i64, token: String, ip: String, socket: W
                                 if !current {
                                     break;
                                 }
-                                // A malformed system/probe/health section must not
-                                // drop the usage counters in the same report.
-                                let parsed = serde_json::from_value::<Report>(v).or_else(|_| {
-                                    let mut v: Value = serde_json::from_str(&text).unwrap_or_default();
-                                    if let Some(o) = v.as_object_mut() {
-                                        for k in ["system", "probes", "outbounds", "certs"] {
-                                            o.remove(k);
+                                // Awaited, so reports are stored in order and a
+                                // node cannot queue up work.
+                                let app = app.clone();
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    // A malformed system/probe/health section must not
+                                    // drop the usage counters in the same report.
+                                    let parsed = serde_json::from_value::<Report>(v).or_else(|_| {
+                                        let mut v: Value = serde_json::from_str(&text).unwrap_or_default();
+                                        if let Some(o) = v.as_object_mut() {
+                                            for k in ["system", "probes", "outbounds", "certs"] {
+                                                o.remove(k);
+                                            }
                                         }
+                                        serde_json::from_value::<Report>(v)
+                                    });
+                                    if let Ok(r) = parsed {
+                                        app.on_report(node_id, r);
                                     }
-                                    serde_json::from_value::<Report>(v)
-                                });
-                                if let Ok(r) = parsed {
-                                    app.on_report(node_id, r);
-                                }
+                                })
+                                .await;
                             }
-                            "applied" => app.on_applied(node_id, &v),
+                            "applied" => {
+                                let app = app.clone();
+                                let _ = tokio::task::spawn_blocking(move || app.on_applied(node_id, &v)).await;
+                            }
                             "acme_dns" => {
                                 let app = app.clone();
                                 tokio::spawn(async move {

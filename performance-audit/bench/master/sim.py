@@ -2,7 +2,7 @@
 """Simulates keel-node control connections (docs/node-protocol.md).
 
 sim.py --port 18444 --db large/keel.db [--roles entry,exit] [--limit N] [--duration 120]
-       [--traffic 0.2] [--interval 5] [--stats out.json] [--node old|new]
+       [--traffic 0.2] [--interval 5] [--stats out.json] [--node old|new] [--plain]
 
 Each simulated node: dials wss://127.0.0.1:PORT/api/node/ws with its token,
 sends hello (config_rev 0), answers every config with applied, and sends a
@@ -31,6 +31,7 @@ ap.add_argument("--interval", type=float, default=5)
 ap.add_argument("--stats", default="")
 ap.add_argument("--quiet", action="store_true")
 ap.add_argument("--node", choices=["old", "new"], default="old")
+ap.add_argument("--plain", action="store_true", help="ws:// to a master started with -no-tls")
 a = ap.parse_args()
 
 roles = a.roles.split(",")
@@ -53,8 +54,8 @@ async def node(nid, role, token):
                        "usage_msgs": 0, "usage_bytes": 0, "report_users": 0, "full_reports": 0, "errors": []}
     t_start = time.monotonic()
     try:
-        async with connect(f"wss://127.0.0.1:{a.port}/api/node/ws", additional_headers={"Authorization": f"Bearer {token}"},
-                           ssl=ctx, max_size=None, ping_interval=30, open_timeout=120, close_timeout=2, compression=None) as ws:
+        async with connect(f"{'ws' if a.plain else 'wss'}://127.0.0.1:{a.port}/api/node/ws", additional_headers={"Authorization": f"Bearer {token}"},
+                           ssl=None if a.plain else ctx, max_size=None, ping_interval=30, open_timeout=120, close_timeout=2, compression=None) as ws:
             st["open_s"] = time.monotonic() - t_start
             t_hello = time.monotonic()
             await ws.send(json.dumps({"type": "hello", "node_version": "sim", "protocols": ["anytls", "vless", "ss2022"],

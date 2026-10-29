@@ -80,11 +80,17 @@ function polyline(values, w, h, pad) {
 
 // ---------- data access ----------
 
-function node(id) { return S.data.nodes.find(n => n.id === id); }
-function exit(id) { return S.data.exits.find(e => e.id === id); }
+// By id, rebuilt with each state: pages look nodes up per user and card.
+let NODES = new Map(), EXITS = new Map();
+function index() {
+  NODES = new Map(S.data.nodes.map(n => [n.id, n]));
+  EXITS = new Map((S.data.exits || []).map((e, i) => [e.id, { e, i }]));
+}
+function node(id) { return NODES.get(id); }
+function exit(id) { const x = EXITS.get(id); return x && x.e; }
 function exitStyle(id) {
-  const i = S.data.exits.findIndex(e => e.id === id);
-  return i < 0 ? { color: C.faint, shape: 'circle' } : EXIT_STYLE[i % EXIT_STYLE.length];
+  const x = EXITS.get(id);
+  return x ? EXIT_STYLE[x.i % EXIT_STYLE.length] : { color: C.faint, shape: 'circle' };
 }
 function isExternal(e) { return e.kind && e.kind !== 'ss'; }
 function extProto(e) {
@@ -121,16 +127,24 @@ async function api(method, path, body) {
   return json;
 }
 
-async function refresh() {
+// One state request at a time. A poll joins the one in flight; anything
+// else (after an edit) waits for it and asks again, so it sees its change.
+// With draw false the caller renders.
+let inflight = null;
+async function refresh(opts = {}) {
+  if (inflight && opts.poll) return inflight;
+  while (inflight) await inflight;
+  inflight = fetchState(opts.draw !== false, opts.poll).finally(() => { inflight = null; });
+  return inflight;
+}
+
+async function fetchState(draw, poll) {
   try {
     const data = await api('GET', ADMIN ? '/api/state' : '/api/public');
-    // Unchanged data (most polls when idle) needs no re-render.
-    const sig = JSON.stringify(data);
-    const same = sig === S.sig;
-    S.sig = sig;
     S.data = data;
+    index();
     if (ADMIN) S.loggedIn = true;
-    if (!same && !busy()) render();
+    if (draw && !busy()) render(poll);
   } catch (e) { /* shown via login or kept stale */ }
 }
 
@@ -153,7 +167,7 @@ async function act(fn, okMsg) {
   try {
     await fn();
     if (okMsg) flash(okMsg);
-    await refresh();
+    await refresh({ draw: false });
     render();
     return true;
   } catch (e) {
@@ -165,17 +179,31 @@ async function act(fn, okMsg) {
 
 // ---------- pages ----------
 
-function render() {
+// The markup on screen, and the users page's parts, from the last render.
+let shown = '', shownUsers = null;
+
+// A poll's render (poll true) leaves the page alone when its markup is the
+// same, and on the users page redraws only the rows that changed: traffic
+// moves a few figures, and the page can hold thousands of elements. Other
+// renders redraw everything, which also resets what the user left in the
+// main area.
+function render(poll) {
   const root = document.getElementById('app');
   if (!ADMIN) {
-    root.innerHTML = S.data ? `<main class="public">${probePage()}</main>` : '';
+    const html = S.data ? `<main class="public">${probePage()}</main>` : '';
+    if (!poll || html !== shown) root.innerHTML = html;
+    shown = html;
     return;
   }
-  if (S.loggedIn === false) { root.innerHTML = loginPage(); S.drawer = null; renderDrawer(); return; }
-  if (!S.data) { root.innerHTML = ''; return; }
+  if (S.loggedIn === false || !S.data) {
+    shown = ''; shownUsers = null;
+    if (S.loggedIn === false) { root.innerHTML = loginPage(); S.drawer = null; renderDrawer(); } else root.innerHTML = '';
+    return;
+  }
   const t = S.tab;
   const tab = (id, label, mark) => `<button class="tab" data-act="tab" data-tab="${id}" aria-current="${t === id ? 'page' : 'false'}">${t === id ? mark : '<span class="mark"></span>'}${label}</button>`;
-  root.innerHTML = `
+  const users = t !== 'probe' && t !== 'lines' ? usersParts() : null;
+  const html = `
     <header class="top">
       <nav aria-label="主导航">
         ${tab('probe', '探针', shape({ color: C.blue, shape: 'circle' }, 10))}
@@ -184,7 +212,11 @@ function render() {
       </nav>
       <button class="icon-btn" data-act="settings" aria-label="设置" title="设置"><svg width="20" height="20" viewBox="0 0 20 20" aria-hidden="true"><path d="M2 5h16M2 10h16M2 15h16" stroke="currentColor" stroke-width="1.4"/><rect x="5" y="3" width="4" height="4" fill="var(--ground)" stroke="currentColor" stroke-width="1.4"/><rect x="11" y="8" width="4" height="4" fill="var(--ground)" stroke="currentColor" stroke-width="1.4"/><rect x="7" y="13" width="4" height="4" fill="var(--ground)" stroke="currentColor" stroke-width="1.4"/></svg></button>
     </header>
-    <main>${t === 'probe' ? probePage() : t === 'lines' ? linesPage() : usersPage()}</main>`;
+    <main>${t === 'probe' ? probePage() : t === 'lines' ? linesPage() : users.head + usersList(users.rows)}</main>`;
+  if (poll && html === shown) return;
+  if (!(poll && users && patchUsers(users))) root.innerHTML = html;
+  shown = html;
+  shownUsers = users;
   // The drawer is left alone here so typing in it survives the 2 s refresh.
 }
 
@@ -498,31 +530,52 @@ function exitNodeCard(x) {
 
 const USTATUS = { ok: '正常', warn: '将满', over: '超额停用', expired: '已过期', disabled: '已停用' };
 
-function usersPage() {
+// The users page in parts: the head, and one [id, markup] per user, so a
+// poll can redraw only the rows that changed.
+function usersParts() {
   const all = entries().map(n => n.id);
-  const list = S.data.users.map(u => {
-    const p = pct(u.used, u.quota_bytes), bad = ['over', 'expired', 'disabled'].includes(u.status);
-    const barColor = p >= 100 ? C.red : p >= 90 ? C.amber : C.ink;
-    const nodesText = !u.entries.length ? '没有入口' : (all.length && all.every(id => u.entries.includes(id))) ? '全部入口'
-      : u.entries.map(id => node(id)).filter(Boolean).map(nm).join(' · ');
-    const online = u.conns ? ` · ${u.conns} 个连接` : '';
-    return `<button class="user" data-act="user" data-id="${u.id}">
-      <span class="n">${esc(u.name)}</span>
-      <span class="bar">
-        <span style="display:flex;justify-content:space-between;font-size:14px"><span>${gib(u.used)} / ${u.quota_bytes ? gib(u.quota_bytes) + ' GB' : '不限'}</span><span style="color:${bad ? C.danger : C.muted}">${USTATUS[u.status]}${online}</span></span>
-        <span style="display:block;height:3px;background:#D6D1C6;margin-top:6px"><span style="display:block;height:100%;width:${u.quota_bytes ? p.toFixed(0) : 0}%;background:${barColor}"></span></span>
-      </span>
-      <span class="meta">到期 ${u.expire_date || '不限'} · ${u.reset_day} 号重置 · ${esc(nodesText)}</span>
-    </button>`;
-  }).join('');
+  return { head: usersHead(), rows: S.data.users.map(u => [u.id, userRow(u, all)]) };
+}
+
+function usersHead() {
   return `
     <div class="section-head" style="margin-bottom:20px">
       <h2>用户</h2>
       <span>${S.data.users.some(u => !u.per_entry) ? '<button class="btn" data-act="users-per-entry">每个入口用不同凭据</button> ' : ''}<button class="btn solid" data-act="new-user">添加用户</button></span>
     </div>
-    ${S.toast ? `<div class="toast" role="status">${shape({ color: C.blue, shape: 'circle' }, 8)}<span>${esc(S.toast)}</span></div>` : ''}
-    <div class="users">${list || '<div class="empty">还没有用户。</div>'}</div>
-    `;
+    ${S.toast ? `<div class="toast" role="status">${shape({ color: C.blue, shape: 'circle' }, 8)}<span>${esc(S.toast)}</span></div>` : ''}`;
+}
+
+function userRow(u, all) {
+  const p = pct(u.used, u.quota_bytes), bad = ['over', 'expired', 'disabled'].includes(u.status);
+  const barColor = p >= 100 ? C.red : p >= 90 ? C.amber : C.ink;
+  const nodesText = !u.entries.length ? '没有入口' : (all.length && all.every(id => u.entries.includes(id))) ? '全部入口'
+    : u.entries.map(id => node(id)).filter(Boolean).map(nm).join(' · ');
+  const online = u.conns ? ` · ${u.conns} 个连接` : '';
+  return `<button class="user" data-act="user" data-id="${u.id}">
+    <span class="n">${esc(u.name)}</span>
+    <span class="bar">
+      <span style="display:flex;justify-content:space-between;font-size:14px"><span>${gib(u.used)} / ${u.quota_bytes ? gib(u.quota_bytes) + ' GB' : '不限'}</span><span style="color:${bad ? C.danger : C.muted}">${USTATUS[u.status]}${online}</span></span>
+      <span style="display:block;height:3px;background:#D6D1C6;margin-top:6px"><span style="display:block;height:100%;width:${u.quota_bytes ? p.toFixed(0) : 0}%;background:${barColor}"></span></span>
+    </span>
+    <span class="meta">到期 ${u.expire_date || '不限'} · ${u.reset_day} 号重置 · ${esc(nodesText)}</span>
+  </button>`;
+}
+
+function usersList(rows) {
+  return `<div class="users">${rows.map(r => r[1]).join('') || '<div class="empty">还没有用户。</div>'}</div>`;
+}
+
+// Redraws the rows whose markup changed, when the users page on screen has
+// the same head and the same users in the same order; false otherwise.
+function patchUsers(users) {
+  const box = document.querySelector('#app .users');
+  if (!box || !shownUsers || !users.rows.length || users.head !== shownUsers.head || box.children.length !== users.rows.length) return false;
+  if (users.rows.some(([id], i) => box.children[i].dataset.id !== String(id))) return false;
+  users.rows.forEach(([, html], i) => {
+    if (html !== shownUsers.rows[i][1]) box.children[i].outerHTML = html;
+  });
+  return true;
 }
 
 // ---------- drawers ----------
@@ -1061,7 +1114,7 @@ const actions = {
         }
       }
       flash(`${patch.name || nm(n)} 已保存并热更新。`);
-      closeDrawer(); await refresh(); render();
+      closeDrawer(); await refresh({ draw: false }); render();
     } catch (e) { drawerError(e.message); }
   },
   async 'node-del'(el) {
@@ -1078,7 +1131,7 @@ const actions = {
     const e = exit(+el.dataset.exit);
     if (!confirm(`删除出口「${e.name}」？走它的入口和分流会改回默认或直连。`)) return;
     if (isExternal(e)) closeDrawer();
-    try { await api('DELETE', `/api/exits/${e.id}`); await refresh(); renderDrawer(); render(); }
+    try { await api('DELETE', `/api/exits/${e.id}`); await refresh({ draw: false }); renderDrawer(); render(); }
     catch (err) { drawerError(err.message); }
   },
   'ext-import'() { openDrawer({ kind: 'ext-import' }); },
@@ -1099,7 +1152,7 @@ const actions = {
     try {
       await api('PATCH', `/api/exits/${e.id}`, { name: f.name, link: f.link });
       flash(`「${f.name || e.name}」已保存并热更新。`);
-      closeDrawer(); await refresh(); render();
+      closeDrawer(); await refresh({ draw: false }); render();
     } catch (err) { drawerError(err.message); }
   },
   user(el) { openDrawer({ kind: 'user', id: +el.dataset.id }); },
@@ -1120,18 +1173,18 @@ const actions = {
     try {
       if (id) await api('PATCH', `/api/users/${id}`, body); else await api('POST', '/api/users', body);
       flash(id ? `${f.name} 已保存。` : `已添加 ${f.name}。`);
-      closeDrawer(); await refresh(); render();
+      closeDrawer(); await refresh({ draw: false }); render();
     } catch (e) { drawerError(e.message); }
   },
   async 'user-reset'(el) {
     const u = S.data.users.find(x => x.id === +el.dataset.id);
     if (!confirm(`把 ${u.name} 本期流量清零？`)) return;
-    try { await api('POST', `/api/users/${u.id}/reset`); flash(`${u.name} 的流量已清零。`); await refresh(); renderDrawer(); render(); }
+    try { await api('POST', `/api/users/${u.id}/reset`); flash(`${u.name} 的流量已清零。`); await refresh({ draw: false }); renderDrawer(); render(); }
     catch (e) { drawerError(e.message); }
   },
   async 'user-toggle'(el) {
     const u = S.data.users.find(x => x.id === +el.dataset.id);
-    try { await api('PATCH', `/api/users/${u.id}`, { enabled: !u.enabled }); flash(`${u.name} 已${u.enabled ? '停用' : '启用'}。`); await refresh(); renderDrawer(); render(); }
+    try { await api('PATCH', `/api/users/${u.id}`, { enabled: !u.enabled }); flash(`${u.name} 已${u.enabled ? '停用' : '启用'}。`); await refresh({ draw: false }); renderDrawer(); render(); }
     catch (e) { drawerError(e.message); }
   },
   async 'user-del'(el) {
@@ -1163,7 +1216,7 @@ const actions = {
     if (f.cf_token) body.cf_token = f.cf_token.trim();
     body.username = f.username.trim(); body.current_password = f.current_password;
     if (f.password) body.password = f.password;
-    try { await api('PATCH', '/api/settings', body); flash('设置已保存。'); closeDrawer(); await refresh(); render(); }
+    try { await api('PATCH', '/api/settings', body); flash('设置已保存。'); closeDrawer(); await refresh({ draw: false }); render(); }
     catch (e) { drawerError(e.message); }
   },
   async 'cf-clear'() {
@@ -1226,7 +1279,7 @@ document.addEventListener('submit', async e => {
     const pw = e.target.password.value, user = e.target.username.value;
     try {
       await api('POST', '/api/login', { username: user, password: pw });
-      S.loggedIn = true; await refresh(); render();
+      S.loggedIn = true; await refresh({ draw: false }); render();
     } catch (err) {
       const box = document.getElementById('login-err');
       if (box) box.textContent = err.message;
@@ -1242,9 +1295,17 @@ document.addEventListener('submit', async e => {
       S.loggedIn = s.logged_in;
     } catch (e) { S.loggedIn = false; }
   }
-  if (S.loggedIn || !ADMIN) await refresh();
+  if (S.loggedIn || !ADMIN) await refresh({ draw: false });
   render();
-  // No polling while the tab is in the background.
-  setInterval(() => { if ((S.loggedIn || !ADMIN) && !document.hidden) refresh(); }, ADMIN ? 2000 : 3000);
-  document.addEventListener('visibilitychange', () => { if (!document.hidden && (S.loggedIn || !ADMIN)) refresh(); });
+  // No polling while the tab is in the background. The next poll waits at
+  // least twice as long as the last answer took, so a slow master is asked
+  // less often instead of piling requests up.
+  const every = ADMIN ? 2000 : 3000;
+  const poll = async () => {
+    const start = Date.now();
+    if ((S.loggedIn || !ADMIN) && !document.hidden) await refresh({ poll: true });
+    setTimeout(poll, Math.max(every, 2 * (Date.now() - start)));
+  };
+  setTimeout(poll, every);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden && (S.loggedIn || !ADMIN)) refresh({ poll: true }); });
 })();
