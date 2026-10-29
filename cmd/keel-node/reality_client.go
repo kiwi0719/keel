@@ -108,7 +108,10 @@ func (r *realityClient) handshake(ctx context.Context, conn net.Conn) (*utls.UCo
 		return nil, err
 	}
 	hello := uConn.HandshakeState.Hello
-	if len(hello.Raw) < 39+32 {
+	// The session ID sits at Raw[39:71] behind its length byte; a
+	// fingerprint with another length would have the seal overwrite the
+	// cipher suites instead.
+	if len(hello.Raw) < 39+32 || hello.Raw[38] != 32 {
 		return nil, errors.New("reality: unexpected ClientHello layout")
 	}
 	keys := uConn.HandshakeState.State13.KeyShareKeys
@@ -131,6 +134,8 @@ func (r *realityClient) handshake(ctx context.Context, conn net.Conn) (*utls.UCo
 		return nil, err
 	}
 	// Session ID plaintext: version (3 bytes), reserved, unix time, short ID.
+	// A server that sets maxClientVer below this version treats the client
+	// as a probe (the handshake then fails as unverified).
 	sessionID := make([]byte, 32)
 	copy(sessionID, []byte{26, 10, 30})
 	binary.BigEndian.PutUint32(sessionID[4:], uint32(time.Now().Unix()))

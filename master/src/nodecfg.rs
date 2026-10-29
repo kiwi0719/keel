@@ -186,9 +186,13 @@ fn entry(w: &World, node: &Node, secret: &str, now: i64) -> Value {
                     if !e.tls_sni.is_empty() {
                         o["tls"] = json!({"server_name": e.tls_sni});
                     }
+                    // Only these two keys: the stored JSON must never replace
+                    // the server, uuid or tls the master sets.
                     if let Ok(Value::Object(opts)) = serde_json::from_str::<Value>(&e.vless_opts) {
-                        for (k, v) in opts {
-                            o[k] = v;
+                        for k in ["flow", "reality"] {
+                            if let Some(v) = opts.get(k) {
+                                o[k] = v.clone();
+                            }
                         }
                     }
                     return Some(o);
