@@ -230,26 +230,45 @@ func (r *router) relayUDP(ctx context.Context, user string, packetConn N.PacketC
 // udpRoutes is the remote side of one UDP session, routing each packet by
 // its own destination: a later packet to a host the rules send elsewhere
 // (or one that is private) must not ride the outbound the first packet
-// picked. Remotes are opened per outbound on first use; the session ends
-// when every remote has idled out.
+// picked. Remotes are opened per outbound on first use, in the background,
+// so a slow outbound does not hold up the session's other packets; the
+// session ends when every remote has idled out.
 type udpRoutes struct {
 	ctx     context.Context
 	r       *router
 	user    string
 	mu      sync.Mutex
 	remotes map[string]N.PacketConn
+	opening map[string][]udpPacket // outbounds being opened, with the packets waiting for them
+	failed  map[string]time.Time   // outbounds that failed to open: skipped until then
 	in      chan udpPacket
 	done    chan struct{}
 	once    sync.Once
 }
 
+// udpPacket is a packet with the address it came from or goes to.
 type udpPacket struct {
-	data []byte
-	from M.Socksaddr
+	buffer *buf.Buffer
+	addr   M.Socksaddr
 }
 
+const (
+	// udpPendingMax packets may wait for an outbound being opened; later
+	// ones are dropped.
+	udpPendingMax = 16
+	// udpOpenBackoff is how long an outbound that failed to open is skipped.
+	udpOpenBackoff = 2 * time.Second
+)
+
 func newUDPRoutes(ctx context.Context, r *router, user, tag string, first N.PacketConn) *udpRoutes {
-	u := &udpRoutes{ctx: ctx, r: r, user: user, remotes: map[string]N.PacketConn{tag: first}, in: make(chan udpPacket, 64), done: make(chan struct{})}
+	u := &udpRoutes{
+		ctx: ctx, r: r, user: user,
+		remotes: map[string]N.PacketConn{tag: first},
+		opening: make(map[string][]udpPacket),
+		failed:  make(map[string]time.Time),
+		in:      make(chan udpPacket, 64),
+		done:    make(chan struct{}),
+	}
 	go u.read(tag, first)
 	return u
 }
@@ -262,7 +281,7 @@ func (u *udpRoutes) read(tag string, remote N.PacketConn) {
 		if u.remotes[tag] == remote {
 			delete(u.remotes, tag)
 		}
-		idle := len(u.remotes) == 0
+		idle := len(u.remotes) == 0 && len(u.opening) == 0
 		u.mu.Unlock()
 		if idle {
 			u.Close()
@@ -275,11 +294,10 @@ func (u *udpRoutes) read(tag string, remote N.PacketConn) {
 			buffer.Release()
 			return
 		}
-		p := udpPacket{data: append([]byte(nil), buffer.Bytes()...), from: from}
-		buffer.Release()
 		select {
-		case u.in <- p:
+		case u.in <- udpPacket{buffer, from}:
 		case <-u.done:
+			buffer.Release()
 			return
 		}
 	}
@@ -288,8 +306,9 @@ func (u *udpRoutes) read(tag string, remote N.PacketConn) {
 func (u *udpRoutes) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
 	select {
 	case p := <-u.in:
-		_, err := buffer.Write(p.data)
-		return p.from, err
+		_, err := buffer.Write(p.buffer.Bytes())
+		p.buffer.Release()
+		return p.addr, err
 	case <-u.done:
 		return M.Socksaddr{}, net.ErrClosed
 	}
@@ -303,27 +322,88 @@ func (u *udpRoutes) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) err
 	}
 	out, tag, label := u.r.pick(destination)
 	u.mu.Lock()
-	remote := u.remotes[tag]
-	u.mu.Unlock()
-	if remote == nil {
-		if verbose {
-			log.Print("[", u.user, "] udp ", destination, " via ", label)
-		}
-		dialCtx, cancel := context.WithTimeout(u.ctx, dialTimeout)
-		var err error
-		remote, err = out.listenUDP(dialCtx, destination)
-		cancel()
-		if err != nil {
-			u.r.dialFailed(tag)
-			buffer.Release()
-			return nil
-		}
-		u.mu.Lock()
-		u.remotes[tag] = remote
+	if remote := u.remotes[tag]; remote != nil {
 		u.mu.Unlock()
-		go u.read(tag, remote)
+		return remote.WritePacket(buffer, destination)
 	}
-	return remote.WritePacket(buffer, destination)
+	if pending, ok := u.opening[tag]; ok {
+		if len(pending) < udpPendingMax {
+			u.opening[tag] = append(pending, udpPacket{buffer, destination})
+		} else {
+			buffer.Release()
+		}
+		u.mu.Unlock()
+		return nil
+	}
+	if time.Now().Before(u.failed[tag]) {
+		u.mu.Unlock()
+		buffer.Release()
+		return nil
+	}
+	u.opening[tag] = []udpPacket{{buffer, destination}}
+	u.mu.Unlock()
+	if verbose {
+		log.Print("[", u.user, "] udp ", destination, " via ", label)
+	}
+	go u.open(out, tag, destination)
+	return nil
+}
+
+// open opens the outbound for tag, sends the packets that waited for it in
+// order, and only then lets later packets go to it directly.
+func (u *udpRoutes) open(out outbound, tag string, destination M.Socksaddr) {
+	defer recoverConn("udp", u)
+	dialCtx, cancel := context.WithTimeout(u.ctx, dialTimeout)
+	remote, err := out.listenUDP(dialCtx, destination)
+	cancel()
+	if err != nil {
+		u.r.dialFailed(tag)
+		if verbose {
+			log.Print("[", u.user, "] udp ", destination, ": ", err)
+		}
+	}
+	for {
+		u.mu.Lock()
+		pending := u.opening[tag]
+		closed := u.closed()
+		if err == nil && !closed && len(pending) > 0 {
+			u.opening[tag] = nil
+			u.mu.Unlock()
+			for _, p := range pending {
+				if werr := remote.WritePacket(p.buffer, p.addr); werr != nil && verbose {
+					log.Print("[", u.user, "] udp ", p.addr, ": ", werr)
+				}
+			}
+			continue
+		}
+		delete(u.opening, tag)
+		if err != nil {
+			u.failed[tag] = time.Now().Add(udpOpenBackoff)
+		} else if !closed {
+			u.remotes[tag] = remote
+		}
+		u.mu.Unlock()
+		for _, p := range pending {
+			p.buffer.Release()
+		}
+		switch {
+		case err != nil:
+		case closed:
+			remote.Close()
+		default:
+			go u.read(tag, remote)
+		}
+		return
+	}
+}
+
+func (u *udpRoutes) closed() bool {
+	select {
+	case <-u.done:
+		return true
+	default:
+		return false
+	}
 }
 
 // LazyHeadroom: which outbound a packet takes, and so the header room it
@@ -338,6 +418,14 @@ func (u *udpRoutes) Close() error {
 			remote.Close()
 		}
 		u.mu.Unlock()
+		for {
+			select {
+			case p := <-u.in:
+				p.buffer.Release()
+			default:
+				return
+			}
+		}
 	})
 	return nil
 }
@@ -361,6 +449,9 @@ type directOutbound struct {
 
 // maxResolved caps the names one direct UDP session keeps resolved.
 const maxResolved = 256
+
+// udpResolveWait is the longest a UDP packet to a name waits for its lookup.
+const udpResolveWait = 200 * time.Millisecond
 
 var errPrivateDestination = errors.New("destination is a private or local address")
 
@@ -420,20 +511,39 @@ func isPublic(a netip.Addr) bool {
 
 // The node's own addresses count as private: Linux delivers a connection to
 // them over lo, past firewalls that only filter the outside interface.
+// The list is read without locking (UDP checks every packet) and refreshed
+// every 10 s by one caller while the others keep using the previous one.
 var local struct {
-	sync.Mutex
+	refresh sync.Mutex
+	current atomic.Pointer[localSet]
+}
+
+type localSet struct {
 	at    time.Time
 	addrs map[netip.Addr]bool
 }
 
 func isLocal(a netip.Addr) bool {
-	local.Lock()
-	defer local.Unlock()
-	if time.Since(local.at) > 10*time.Second {
-		local.at = time.Now()
-		local.addrs = localAddrs()
+	set := local.current.Load()
+	if set == nil || time.Since(set.at) > 10*time.Second {
+		set = refreshLocal(set)
 	}
-	return local.addrs[a]
+	return set.addrs[a]
+}
+
+func refreshLocal(stale *localSet) *localSet {
+	if stale == nil {
+		local.refresh.Lock() // nothing to fall back on: wait for the first list
+	} else if !local.refresh.TryLock() {
+		return stale
+	}
+	defer local.refresh.Unlock()
+	if set := local.current.Load(); set != stale {
+		return set
+	}
+	set := &localSet{at: time.Now(), addrs: localAddrs()}
+	local.current.Store(set)
+	return set
 }
 
 // localAddrs lists the interface addresses and each IPv4 network's
@@ -492,7 +602,14 @@ func (d *directOutbound) network(name string) string {
 }
 
 func (d *directOutbound) dialTCP(ctx context.Context, destination M.Socksaddr) (net.Conn, error) {
-	return d.userDialer().DialContext(ctx, d.network("tcp"), destination.String())
+	if !destination.IsFqdn() {
+		return d.userDialer().DialContext(ctx, d.network("tcp"), destination.String())
+	}
+	addrs, err := resolver.resolve(ctx, destination.Fqdn, d.ipv4Only, dnsTimeout)
+	if err != nil {
+		return nil, err
+	}
+	return dialAddrs(ctx, d.userDialer(), d.network("tcp"), addrs, destination.Port)
 }
 
 // dialServer reaches an outbound's own server, which may be private.
@@ -682,17 +799,14 @@ func (c *udpOutbound) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) e
 	if destination.IsFqdn() {
 		ip, ok := c.resolved[destination.Fqdn]
 		if !ok {
-			network := "ip"
-			if c.ipv4Only {
-				network = "ip4"
-			}
 			if len(c.resolved) >= maxResolved {
 				clear(c.resolved) // bounded: a session may name endless hosts
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			ips, err := net.DefaultResolver.LookupNetIP(ctx, network, destination.Fqdn)
-			cancel()
-			if err != nil || len(ips) == 0 {
+			// A slow name costs this packet at most udpResolveWait; the
+			// lookup goes on in the background and later packets find
+			// the answer (or the failure) cached.
+			ips, err := resolver.resolve(context.Background(), destination.Fqdn, c.ipv4Only, udpResolveWait)
+			if err != nil {
 				return nil // drop packet, keep session alive
 			}
 			ip = ips[0]
