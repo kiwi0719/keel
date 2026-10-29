@@ -146,6 +146,16 @@ func New(method string, pskList [][]byte, timeFunc func() time.Time) (shadowsock
 		}
 	}
 
+	if m.blockConstructor != nil {
+		for _, psk := range pskList[:len(pskList)-1] {
+			b, err := m.blockConstructor(psk)
+			if err != nil {
+				return nil, err
+			}
+			m.identityCiphers = append(m.identityCiphers, b)
+		}
+	}
+
 	m.pskList = pskList
 	return m, nil
 }
@@ -186,6 +196,9 @@ type Method struct {
 	udpBlockDecryptCipher cipher.Block
 	pskList               [][]byte
 	pskHash               []byte
+	// identityCiphers[i] encrypts the i-th identity header of a UDP packet
+	// (keyed by pskList[i]); built once instead of per packet.
+	identityCiphers []cipher.Block
 }
 
 func (m *Method) Name() string {
@@ -492,17 +505,13 @@ func (c *clientPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksad
 	)
 
 	if c.udpCipher == nil && pskLen > 1 {
-		for i, psk := range c.pskList {
+		for i := range c.pskList {
 			dataIndex += aes.BlockSize
 			pskHash := c.pskHash[aes.BlockSize*i : aes.BlockSize*(i+1)]
 
 			identityHeader := header.Extend(aes.BlockSize)
 			xorWords(identityHeader, pskHash, header.To(aes.BlockSize))
-			b, err := c.blockConstructor(psk)
-			if err != nil {
-				return err
-			}
-			b.Encrypt(identityHeader, identityHeader)
+			c.identityCiphers[i].Encrypt(identityHeader, identityHeader)
 
 			if i == pskLen-2 {
 				break
@@ -725,17 +734,13 @@ func (c *clientPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	)
 
 	if c.udpCipher == nil && pskLen > 1 {
-		for i, psk := range c.pskList {
+		for i := range c.pskList {
 			dataIndex += aes.BlockSize
 			pskHash := c.pskHash[aes.BlockSize*i : aes.BlockSize*(i+1)]
 
 			identityHeader := buffer.Extend(aes.BlockSize)
 			xorWords(identityHeader, pskHash, buffer.To(aes.BlockSize))
-			b, err := c.blockConstructor(psk)
-			if err != nil {
-				return 0, err
-			}
-			b.Encrypt(identityHeader, identityHeader)
+			c.identityCiphers[i].Encrypt(identityHeader, identityHeader)
 
 			if i == pskLen-2 {
 				break
