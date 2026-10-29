@@ -233,6 +233,7 @@ type clientConn struct {
 	requestSalt []byte
 	reader      *shadowaead.Reader
 	writer      *shadowaead.Writer
+	readWait    N.ReadWaitOptions
 }
 
 func (m *Method) time() time.Time {
@@ -436,6 +437,38 @@ func (c *clientConn) Write(p []byte) (n int, err error) {
 		return
 	}
 	return c.writer.Write(p)
+}
+
+func (c *clientConn) InitializeReadWaiter(options N.ReadWaitOptions) (needCopy bool) {
+	c.readWait = options
+	return false
+}
+
+// WaitReadBuffer opens each chunk in a buffer of its own, so a copy needs no
+// buffer of its own while it waits.
+func (c *clientConn) WaitReadBuffer() (*buf.Buffer, error) {
+	if err := c.readResponse(); err != nil {
+		return nil, err
+	}
+	return c.reader.ReadBuffer(c.readWait)
+}
+
+// WriteBuffer seals in the caller's buffer once the request header is out.
+func (c *clientConn) WriteBuffer(buffer *buf.Buffer) error {
+	if c.writer == nil {
+		defer buffer.Release()
+		_, err := c.Write(buffer.Bytes())
+		return err
+	}
+	return c.writer.WriteBuffer(buffer)
+}
+
+func (c *clientConn) FrontHeadroom() int {
+	return shadowaead.PacketLengthBufferSize + shadowaead.Overhead
+}
+
+func (c *clientConn) RearHeadroom() int {
+	return shadowaead.Overhead
 }
 
 func (c *clientConn) NeedHandshake() bool {

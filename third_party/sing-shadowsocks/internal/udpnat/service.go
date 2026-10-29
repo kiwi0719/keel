@@ -155,6 +155,22 @@ func (s *Service[T]) NewContextPacketEx(ctx context.Context, key T, buffer *buf.
 	}
 }
 
+// Push hands a packet to key's session if it has one still open and reports
+// whether it did. A caller builds the init function for NewContextPacket,
+// which allocates, only when there is none.
+func (s *Service[T]) Push(key T, buffer *buf.Buffer, destination M.Socksaddr) bool {
+	c, loaded := s.nat.Load(key)
+	if !loaded || common.Done(c.ctx) {
+		return false
+	}
+	select {
+	case c.data <- packet{data: buffer, destination: destination}:
+	default:
+		buffer.Release() // as in NewContextPacketEx
+	}
+	return true
+}
+
 type packet struct {
 	data        *buf.Buffer
 	destination M.Socksaddr

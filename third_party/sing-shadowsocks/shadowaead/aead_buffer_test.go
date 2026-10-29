@@ -11,6 +11,9 @@ import (
 	"sync"
 	"testing"
 	"testing/iotest"
+
+	"github.com/sagernet/sing/common/buf"
+	N "github.com/sagernet/sing/common/network"
 )
 
 func testAEAD(t testing.TB) cipher.AEAD {
@@ -261,5 +264,84 @@ func TestRawBuffersStayWithTheCaller(t *testing.T) {
 	}
 	if len(r.buffer.data) != len(rawRead) {
 		t.Fatal("raw reader dropped the caller's buffer")
+	}
+}
+
+// WriteBuffer, sealing in the caller's buffer, writes what Write writes.
+func TestWriteBufferOutputUnchanged(t *testing.T) {
+	for _, size := range testSizes {
+		aead := testAEAD(t)
+		var got bytes.Buffer
+		w := NewWriter(&got, aead, 65535)
+		p := randomBytes(size)
+		// Room as a copy into the writer leaves it; too little falls back to Write.
+		for _, room := range [][2]int{{w.FrontHeadroom(), w.RearHeadroom()}, {0, 0}} {
+			buffer := buf.NewSize(room[0] + size + room[1])
+			buffer.Resize(room[0], 0)
+			buffer.Write(p)
+			if err := w.WriteBuffer(buffer); err != nil {
+				t.Fatal(err)
+			}
+		}
+		nonce := make([]byte, aead.NonceSize())
+		want := append(refChunks(aead, nonce, p, 65535), refChunks(aead, nonce, p, 65535)...)
+		if !bytes.Equal(got.Bytes(), want) {
+			t.Fatalf("size %d: WriteBuffer output differs from Write", size)
+		}
+	}
+}
+
+// ReadBuffer hands out each opened chunk, with the room asked for, what is
+// cached first; a tampered chunk is an error and nothing of it comes out.
+func TestReadBuffer(t *testing.T) {
+	aead := testAEAD(t)
+	var stream bytes.Buffer
+	chunks := [][]byte{randomBytes(1000), randomBytes(65535), randomBytes(3)}
+	w := NewWriter(&stream, aead, 65535)
+	for _, c := range chunks {
+		w.Write(c)
+	}
+	r := NewReader(iotest.HalfReader(bytes.NewReader(stream.Bytes())), aead, 65535)
+	head := make([]byte, 10)
+	if _, err := io.ReadFull(r, head); err != nil {
+		t.Fatal(err)
+	}
+	options := N.ReadWaitOptions{FrontHeadroom: 7, RearHeadroom: 16}
+	got := append([]byte(nil), head...)
+	for {
+		buffer, err := r.ReadBuffer(options)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if buffer.Start() < 7 || buffer.FreeLen() < 16 {
+			t.Fatalf("room %d/%d, want 7/16", buffer.Start(), buffer.FreeLen())
+		}
+		got = append(got, buffer.Bytes()...)
+		buffer.Release()
+		if r.buffer.data != nil {
+			t.Fatal("reader kept a buffer between chunks")
+		}
+	}
+	if !bytes.Equal(got, bytes.Join(chunks, nil)) {
+		t.Fatalf("got %d bytes, want %d intact", len(got), stream.Len())
+	}
+
+	data := append([]byte(nil), stream.Bytes()...)
+	data[len(data)-1] ^= 1
+	r = NewReader(bytes.NewReader(data), aead, 65535)
+	var out []byte
+	var err error
+	for err == nil {
+		var buffer *buf.Buffer
+		if buffer, err = r.ReadBuffer(options); err == nil {
+			out = append(out, buffer.Bytes()...)
+			buffer.Release()
+		}
+	}
+	if errors.Is(err, io.EOF) || len(out) != 1000+65535 {
+		t.Fatalf("tampered last chunk: %v after %d bytes", err, len(out))
 	}
 }

@@ -256,6 +256,7 @@ type serverConn struct {
 	reader      *shadowaead.Reader
 	writer      *shadowaead.Writer
 	requestSalt []byte
+	readWait    N.ReadWaitOptions
 }
 
 func (c *serverConn) writeResponse(payload []byte) (n int, err error) {
@@ -336,6 +337,35 @@ func (c *serverConn) Write(p []byte) (n int, err error) {
 	return c.writeResponse(p)
 }
 
+func (c *serverConn) InitializeReadWaiter(options N.ReadWaitOptions) (needCopy bool) {
+	c.readWait = options
+	return false
+}
+
+// WaitReadBuffer opens each chunk in a buffer of its own, so a copy needs no
+// buffer of its own while it waits.
+func (c *serverConn) WaitReadBuffer() (*buf.Buffer, error) {
+	return c.reader.ReadBuffer(c.readWait)
+}
+
+// WriteBuffer seals in the caller's buffer once the response header is out.
+func (c *serverConn) WriteBuffer(buffer *buf.Buffer) error {
+	if c.writer == nil {
+		defer buffer.Release()
+		_, err := c.Write(buffer.Bytes())
+		return err
+	}
+	return c.writer.WriteBuffer(buffer)
+}
+
+func (c *serverConn) FrontHeadroom() int {
+	return shadowaead.PacketLengthBufferSize + shadowaead.Overhead
+}
+
+func (c *serverConn) RearHeadroom() int {
+	return shadowaead.Overhead
+}
+
 func (c *serverConn) Close() error {
 	return common.Close(
 		c.Conn,
@@ -383,17 +413,19 @@ func (s *Service) newPacket(ctx context.Context, conn N.PacketConn, buffer *buf.
 		s.udpBlockCipher.Decrypt(packetHeader, packetHeader)
 	}
 
-	var sessionId, packetId uint64
-	err := binary.Read(buffer, binary.BigEndian, &sessionId)
+	sessionId, err := readUint64(buffer)
 	if err != nil {
 		return err
 	}
-	err = binary.Read(buffer, binary.BigEndian, &packetId)
+	packetId, err := readUint64(buffer)
 	if err != nil {
 		return err
 	}
 
-	session, loaded := s.udpSessions.LoadOrStore(sessionId, s.newUDPSession)
+	session, loaded := s.udpSessions.Load(sessionId)
+	if !loaded {
+		session, loaded = s.udpSessions.LoadOrStore(sessionId, s.newUDPSession)
+	}
 	if !loaded {
 		session.remoteSessionId = sessionId
 		if packetHeader != nil {
@@ -441,7 +473,7 @@ process:
 	}
 
 	var epoch uint64
-	err = binary.Read(buffer, binary.BigEndian, &epoch)
+	epoch, err = readUint64(buffer)
 	if err != nil {
 		goto returnErr
 	}
@@ -452,7 +484,7 @@ process:
 	}
 
 	var paddingLen uint16
-	err = binary.Read(buffer, binary.BigEndian, &paddingLen)
+	paddingLen, err = readUint16(buffer)
 	if err != nil {
 		err = E.Cause(err, "read padding length")
 		goto returnErr
@@ -465,9 +497,11 @@ process:
 	}
 	metadata.Protocol = "shadowsocks"
 	metadata.Destination = destination
-	s.udpNat.NewPacket(ctx, sessionId, buffer, metadata, func(natConn N.PacketConn) N.PacketWriter {
-		return &serverPacketWriter{s, conn, natConn, session, s.udpBlockCipher}
-	})
+	if !s.udpNat.Push(sessionId, buffer, destination) {
+		s.udpNat.NewPacket(ctx, sessionId, buffer, metadata, func(natConn N.PacketConn) N.PacketWriter {
+			return &serverPacketWriter{s, conn, natConn, session, s.udpBlockCipher, M.SocksaddrFromNet(natConn.LocalAddr())}
+		})
+	}
 	return nil
 }
 
@@ -481,6 +515,25 @@ type serverPacketWriter struct {
 	nat            N.PacketConn
 	session        *serverUDPSession
 	udpBlockCipher cipher.Block
+	natAddr        M.Socksaddr // nat's local address, worked out once
+}
+
+// readUint64 and readUint16 take a big-endian value off the front of the
+// buffer; binary.Read allocated for each.
+func readUint64(buffer *buf.Buffer) (uint64, error) {
+	b, err := buffer.ReadBytes(8)
+	if err != nil {
+		return 0, err
+	}
+	return binary.BigEndian.Uint64(b), nil
+}
+
+func readUint16(buffer *buf.Buffer) (uint16, error) {
+	b, err := buffer.ReadBytes(2)
+	if err != nil {
+		return 0, err
+	}
+	return binary.BigEndian.Uint16(b), nil
 }
 
 func (w *serverPacketWriter) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
@@ -501,30 +554,30 @@ func (w *serverPacketWriter) WritePacket(buffer *buf.Buffer, destination M.Socks
 	hdrLen += 2  // padding length
 	hdrLen += paddingLen
 	hdrLen += M.SocksaddrSerializer.AddrPortLen(destination)
-	header := buf.With(buffer.ExtendHeader(hdrLen))
+	header := buffer.ExtendHeader(hdrLen)
 
 	var dataIndex int
 	if w.udpCipher != nil {
-		common.Must1(header.ReadFullFrom(w.session.rng, PacketNonceSize))
+		common.Must1(io.ReadFull(w.session.rng, header[:PacketNonceSize]))
 		dataIndex = PacketNonceSize
+		header = header[PacketNonceSize:]
 	} else {
 		dataIndex = aes.BlockSize
 	}
 
-	common.Must(
-		binary.Write(header, binary.BigEndian, w.session.sessionId),
-		binary.Write(header, binary.BigEndian, w.session.nextPacketId()),
-		header.WriteByte(HeaderTypeServer),
-		binary.Write(header, binary.BigEndian, uint64(w.time().Unix())),
-		binary.Write(header, binary.BigEndian, w.session.remoteSessionId),
-		binary.Write(header, binary.BigEndian, uint16(paddingLen)), // padding length
-	)
-
-	if paddingLen > 0 {
-		common.Must(header.WriteZeroN(paddingLen))
+	// Written in place; binary.Write allocated for each field.
+	binary.BigEndian.PutUint64(header[0:], w.session.sessionId)
+	binary.BigEndian.PutUint64(header[8:], w.session.nextPacketId())
+	header[16] = HeaderTypeServer
+	binary.BigEndian.PutUint64(header[17:], uint64(w.time().Unix()))
+	binary.BigEndian.PutUint64(header[25:], w.session.remoteSessionId)
+	binary.BigEndian.PutUint16(header[33:], uint16(paddingLen))
+	padding := header[35 : 35+paddingLen]
+	for i := range padding {
+		padding[i] = 0 // the buffer is pooled and not cleared
 	}
 
-	err := M.SocksaddrSerializer.WriteAddrPort(header, destination)
+	err := M.SocksaddrSerializer.WriteAddrPort(buf.With(header[35+paddingLen:]), destination)
 	if err != nil {
 		buffer.Release()
 		return err
@@ -539,7 +592,7 @@ func (w *serverPacketWriter) WritePacket(buffer *buf.Buffer, destination M.Socks
 		buffer.Extend(shadowaead.Overhead)
 		w.udpBlockCipher.Encrypt(packetHeader, packetHeader)
 	}
-	return w.source.WritePacket(buffer, M.SocksaddrFromNet(w.nat.LocalAddr()))
+	return w.source.WritePacket(buffer, w.natAddr)
 }
 
 func (w *serverPacketWriter) FrontHeadroom() int {
