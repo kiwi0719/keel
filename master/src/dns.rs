@@ -57,9 +57,9 @@ async fn sync_all(app: &App) {
     let _one = RUN.lock().await;
     let (token, wanted) = {
         let conn = app.db();
-        let Ok(w) = db::load_world(&conn) else { return };
-        let wanted: Vec<(i64, String, String)> = w
-            .nodes
+        let Ok(nodes) = db::load_nodes(&conn) else { return };
+        let token = db::get_setting(&conn, "cf_token").ok().flatten().unwrap_or_default();
+        let wanted: Vec<(i64, String, String)> = nodes
             .iter()
             .filter(|n| n.role == "entry")
             .map(|n| {
@@ -67,7 +67,7 @@ async fn sync_all(app: &App) {
                 (n.id, name, n.address().to_string())
             })
             .collect();
-        (w.cf_token, wanted)
+        (token, wanted)
     };
     for (id, name, addr) in wanted {
         // Only a real domain pointing at a known IP; a host set to a domain
@@ -192,7 +192,7 @@ pub async fn acme_challenge(app: &App, node_id: i64, op: &str, domain: &str, val
     let (token, sni, acme) = {
         let conn = app.db();
         let token = db::get_setting(&conn, "cf_token").ok().flatten().unwrap_or_default();
-        let node = db::load_world(&conn).ok().and_then(|w| w.node(node_id).cloned()).ok_or("节点不存在")?;
+        let node = db::node_by_id(&conn, node_id).ok().flatten().ok_or("节点不存在")?;
         (token, node.anytls_sni, node.anytls_acme)
     };
     if token.is_empty() {

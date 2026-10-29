@@ -110,6 +110,9 @@ CREATE TABLE IF NOT EXISTS usage(
 CREATE INDEX IF NOT EXISTS usage_updated ON usage(updated);
 -- node_counters looks entries up by node.
 CREATE INDEX IF NOT EXISTS user_entries_node ON user_entries(node_id);
+-- A subscription reads one user's rows. Only inserts touch it: reports
+-- change up, down and updated, never the name.
+CREATE INDEX IF NOT EXISTS usage_name ON usage(name);
 CREATE TABLE IF NOT EXISTS node_month(
   node_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
   month TEXT NOT NULL,
@@ -592,29 +595,8 @@ pub fn load_world(conn: &Connection) -> rusqlite::Result<World> {
     w.cf_token = get_setting(conn, "cf_token")?.unwrap_or_default();
     let mut st = conn.prepare(&format!("SELECT {NODE_COLS} FROM nodes ORDER BY sort, id"))?;
     w.nodes = st.query_map([], node_from_row)?.collect::<Result<_, _>>()?;
-    let mut st = conn.prepare("SELECT id,COALESCE(node_id,0),name,port,psk,quota_bytes,reset_day,udp_over_tcp,sort,kind,server,uuid,method,pub_port,tls_sni,vless_opts FROM exits ORDER BY sort, id")?;
-    w.exits = st
-        .query_map([], |r| {
-            Ok(Exit {
-                id: r.get(0)?,
-                node_id: r.get(1)?,
-                name: r.get(2)?,
-                port: r.get(3)?,
-                psk: r.get(4)?,
-                quota_bytes: r.get(5)?,
-                reset_day: r.get(6)?,
-                udp_over_tcp: r.get(7)?,
-                sort: r.get(8)?,
-                kind: r.get(9)?,
-                server: r.get(10)?,
-                uuid: r.get(11)?,
-                method: r.get(12)?,
-                tls_sni: r.get(14)?,
-                vless_opts: r.get(15)?,
-                pub_port: r.get(13)?,
-            })
-        })?
-        .collect::<Result<_, _>>()?;
+    let mut st = conn.prepare(&format!("SELECT {EXIT_COLS} FROM exits ORDER BY sort, id"))?;
+    w.exits = st.query_map([], exit_from_row)?.collect::<Result<_, _>>()?;
     let mut st = conn.prepare("SELECT id,label,description,domains FROM rulesets ORDER BY sort, id")?;
     w.rulesets = st
         .query_map([], |r| Ok(RuleSet { id: r.get(0)?, label: r.get(1)?, description: r.get(2)?, domains: r.get(3)? }))?
@@ -647,6 +629,72 @@ pub fn load_world(conn: &Connection) -> rusqlite::Result<World> {
         w.usage.insert((n, name, period), up.max(0).saturating_add(down.max(0)));
     }
     Ok(w)
+}
+
+/// What one user's subscription needs, instead of the whole world: the
+/// user's entries and the recent usage rows of their counter (on any node,
+/// as World::used counts them).
+pub fn load_user_world(conn: &Connection, user: &User) -> rusqlite::Result<World> {
+    let mut w = World::default();
+    w.tz = get_setting(conn, "tz_offset")?.and_then(|v| v.parse().ok()).unwrap_or(480);
+    let mut st = conn.prepare_cached(&format!(
+        "SELECT {NODE_COLS} FROM nodes WHERE id IN (SELECT node_id FROM user_entries WHERE user_id=?1) ORDER BY sort, id"
+    ))?;
+    w.nodes = st.query_map([user.id], node_from_row)?.collect::<Result<_, _>>()?;
+    w.user_entries.insert(user.id, w.nodes.iter().map(|n| n.id).collect());
+    let since = crate::period::now() - 70 * 86_400;
+    let mut st = conn.prepare_cached("SELECT node_id,period,up,down FROM usage WHERE name=?1 AND updated >= ?2")?;
+    let name = crate::nodecfg::user_counter(user.id);
+    let rows = st.query_map(params![name, since], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?)))?;
+    for (n, period, up, down) in rows.flatten() {
+        w.usage.insert((n, name.clone(), period), up.max(0).saturating_add(down.max(0)));
+    }
+    Ok(w)
+}
+
+/// Every node, in panel order.
+pub fn load_nodes(conn: &Connection) -> rusqlite::Result<Vec<Node>> {
+    let mut st = conn.prepare_cached(&format!("SELECT {NODE_COLS} FROM nodes ORDER BY sort, id"))?;
+    let nodes = st.query_map([], node_from_row)?.collect();
+    nodes
+}
+
+pub fn node_by_id(conn: &Connection, id: i64) -> rusqlite::Result<Option<Node>> {
+    conn.query_row(&format!("SELECT {NODE_COLS} FROM nodes WHERE id=?1"), [id], node_from_row).optional()
+}
+
+pub fn user_by_id(conn: &Connection, id: i64) -> rusqlite::Result<Option<User>> {
+    conn.query_row(&format!("SELECT {USER_COLS} FROM users WHERE id=?1"), [id], user_from_row).optional()
+}
+
+/// The SS 2022 ports an exit node serves, in panel order.
+pub fn exits_of(conn: &Connection, node_id: i64) -> rusqlite::Result<Vec<Exit>> {
+    let mut st = conn.prepare_cached(&format!("SELECT {EXIT_COLS} FROM exits WHERE node_id=?1 ORDER BY sort, id"))?;
+    let exits = st.query_map([node_id], exit_from_row)?.collect();
+    exits
+}
+
+const EXIT_COLS: &str = "id,COALESCE(node_id,0),name,port,psk,quota_bytes,reset_day,udp_over_tcp,sort,kind,server,uuid,method,pub_port,tls_sni,vless_opts";
+
+fn exit_from_row(r: &rusqlite::Row) -> rusqlite::Result<Exit> {
+    Ok(Exit {
+        id: r.get(0)?,
+        node_id: r.get(1)?,
+        name: r.get(2)?,
+        port: r.get(3)?,
+        psk: r.get(4)?,
+        quota_bytes: r.get(5)?,
+        reset_day: r.get(6)?,
+        udp_over_tcp: r.get(7)?,
+        sort: r.get(8)?,
+        kind: r.get(9)?,
+        server: r.get(10)?,
+        uuid: r.get(11)?,
+        method: r.get(12)?,
+        tls_sni: r.get(14)?,
+        vless_opts: r.get(15)?,
+        pub_port: r.get(13)?,
+    })
 }
 
 pub fn node_by_token(conn: &Connection, token: &str) -> rusqlite::Result<Option<Node>> {
