@@ -66,12 +66,7 @@ pub fn exit_period(w: &World, e: &Exit, now: i64) -> String {
 }
 
 pub fn exit_used(w: &World, e: &Exit, now: i64) -> i64 {
-    let period = exit_period(w, e, now);
-    w.usage
-        .iter()
-        .filter(|((n, name, p), _)| *n == e.node_id && *p == period && counter_exit(name) == Some(e.id))
-        .map(|(_, v)| *v)
-        .sum()
+    w.exit_used(e.node_id, e.id, &exit_period(w, e, now))
 }
 
 fn lines(text: &str) -> Vec<String> {
@@ -309,12 +304,7 @@ fn exit(w: &World, node: &Node, secret: &str, now: i64) -> Value {
             if e.quota_bytes > 0 {
                 // Each exit port has one monthly quota shared by all entries:
                 // every entry's counter carries what the others used.
-                let others: i64 = w
-                    .usage
-                    .iter()
-                    .filter(|((n, nm, p), _)| *n == node.id && *p == period && *nm != name && counter_exit(nm) == Some(e.id))
-                    .map(|(_, v)| *v)
-                    .sum();
+                let others = w.exit_used(node.id, e.id, &period).saturating_sub(w.own(node.id, &name, &period));
                 v["quota_bytes"] = json!(e.quota_bytes);
                 if others > 0 {
                     v["used_base"] = json!(others);
