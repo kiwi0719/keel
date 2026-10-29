@@ -21,6 +21,9 @@ pub struct Imported {
     /// VLESS over TLS: the name the server's certificate must carry; empty
     /// for plain TCP.
     pub tls_sni: String,
+    /// VLESS: flow and REALITY settings as the node config's JSON
+    /// ({"flow":..,"reality":{..}}), or empty.
+    pub vless_opts: String,
 }
 
 pub const SS_METHODS: &[&str] = &[
@@ -132,6 +135,7 @@ fn parse_vless(rest: &str) -> Result<Imported, String> {
     let (uuid, hostport) = body.rsplit_once('@').ok_or("vless 链接缺少 uuid@地址")?;
     let server = host_port(hostport, 443)?;
     check_plain_vless(param(&q, "type"), param(&q, "security"), param(&q, "flow"), param(&q, "encryption"), param(&q, "headerType"))?;
+    let vless_opts = vless_options(param(&q, "security"), param(&q, "flow"), param(&q, "sni"), param(&q, "pbk"), param(&q, "sid"), param(&q, "fp"))?;
     if matches!(param(&q, "allowInsecure"), "1" | "true") || matches!(param(&q, "insecure"), "1" | "true") {
         return Err("不接受跳过证书校验的 VLESS（allowInsecure）".into());
     }
@@ -145,18 +149,44 @@ fn parse_vless(rest: &str) -> Result<Imported, String> {
     if uuid.is_empty() {
         return Err("vless 链接缺少 uuid".into());
     }
-    Ok(Imported { name, kind: "vless", server, uuid, method: String::new(), password: String::new(), tls_sni })
+    Ok(Imported { name, kind: "vless", server, uuid, method: String::new(), password: String::new(), tls_sni, vless_opts })
+}
+
+/// The flow and REALITY part of a VLESS outbound, as JSON for the node.
+fn vless_options(security: &str, flow: &str, sni: &str, pbk: &str, sid: &str, fp: &str) -> Result<String, String> {
+    let mut o = serde_json::Map::new();
+    if !flow.is_empty() {
+        o.insert("flow".into(), Value::String(flow.into()));
+    }
+    if security == "reality" {
+        let key = URL_SAFE_NO_PAD.decode(pbk.trim_end_matches('='));
+        if !key.is_ok_and(|k| k.len() == 32) {
+            return Err("Reality 链接的公钥（pbk）不对".into());
+        }
+        if sni.is_empty() {
+            return Err("Reality 链接缺少 sni".into());
+        }
+        if sid.len() > 16 || sid.len() % 2 != 0 || !sid.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("Reality 链接的 shortId（sid）不对".into());
+        }
+        let fp = if matches!(fp, "chrome" | "firefox" | "safari" | "ios" | "edge") { fp } else { "chrome" };
+        o.insert("reality".into(), serde_json::json!({"server_name": sni, "public_key": pbk, "short_id": sid, "fingerprint": fp}));
+    }
+    Ok(if o.is_empty() { String::new() } else { Value::Object(o).to_string() })
 }
 
 fn check_plain_vless(network: &str, security: &str, flow: &str, encryption: &str, header: &str) -> Result<(), String> {
     if !matches!(network, "" | "tcp" | "raw") {
         return Err(format!("VLESS 暂时只支持 TCP，这条是 {network}"));
     }
-    if !matches!(security, "" | "none" | "tls") {
-        return Err(format!("VLESS 只支持 TCP 明文或 TLS（security=none/tls），这条是 {security}"));
+    if !matches!(security, "" | "none" | "tls" | "reality") {
+        return Err(format!("VLESS 只支持 TCP 明文、TLS 或 Reality，这条是 {security}"));
     }
-    if !flow.is_empty() {
-        return Err(format!("VLESS 出站不能带 flow（{flow}）"));
+    if !matches!(flow, "" | "xtls-rprx-vision") {
+        return Err(format!("不支持 VLESS flow {flow}"));
+    }
+    if !flow.is_empty() && !matches!(security, "tls" | "reality") {
+        return Err("flow 要配合 TLS 或 Reality".into());
     }
     if !matches!(encryption, "" | "none") {
         return Err(format!("不支持 VLESS encryption={encryption}"));
@@ -191,7 +221,7 @@ fn parse_ss(rest: &str) -> Result<Imported, String> {
     if password.is_empty() {
         return Err("SS 链接缺少密码".into());
     }
-    Ok(Imported { name, kind: "shadowsocks", server: host_port(&hostport, 0)?, uuid: String::new(), method, password, tls_sni: String::new() })
+    Ok(Imported { name, kind: "shadowsocks", server: host_port(&hostport, 0)?, uuid: String::new(), method, password, tls_sni: String::new(), vless_opts: String::new() })
 }
 
 /// SIP002 userinfo is base64(method:password); SIP022 allows it
@@ -244,7 +274,16 @@ fn parse_outbound(o: &Value) -> Result<Imported, String> {
             } else {
                 String::new()
             };
-            Ok(Imported { name, kind: "vless", server, uuid, method: String::new(), password: String::new(), tls_sni })
+            let rs = &stream["realitySettings"];
+            let vless_opts = vless_options(
+                stream["security"].as_str().unwrap_or(""),
+                user["flow"].as_str().unwrap_or(""),
+                rs["serverName"].as_str().unwrap_or(""),
+                rs["publicKey"].as_str().or(rs["password"].as_str()).unwrap_or(""),
+                rs["shortId"].as_str().unwrap_or(""),
+                rs["fingerprint"].as_str().unwrap_or(""),
+            )?;
+            Ok(Imported { name, kind: "vless", server, uuid, method: String::new(), password: String::new(), tls_sni, vless_opts })
         }
         _ => {
             let srv = s["servers"].get(0).unwrap_or(s);
@@ -259,7 +298,7 @@ fn parse_outbound(o: &Value) -> Result<Imported, String> {
             if password.is_empty() {
                 return Err("SS 出站缺少密码".into());
             }
-            Ok(Imported { name, kind: "shadowsocks", server: address_port(srv)?, uuid: String::new(), method, password, tls_sni: String::new() })
+            Ok(Imported { name, kind: "shadowsocks", server: address_port(srv)?, uuid: String::new(), method, password, tls_sni: String::new(), vless_opts: String::new() })
         }
     }
 }
@@ -350,6 +389,14 @@ mod tests {
         assert_eq!(parse_link("vless://abc@v.example.net:443?security=tls").unwrap().tls_sni, "v.example.net");
         assert!(parse_link("vless://abc@192.0.2.9:443?security=tls&allowInsecure=1").is_err());
         assert_eq!(parse_link("vless://abc@192.0.2.9:443?security=none").unwrap().tls_sni, "");
+        // VLESS + Reality + Vision: settings carried to the node config
+        let pbk = "SYIxGG0Hl1PQSQEXjLdHq0YozuSUH3SkgFVnaDzNP3c";
+        let i = parse_link(&format!("vless://abc@192.0.2.9:443?security=reality&sni=www.microsoft.com&pbk={pbk}&sid=0123abcd&fp=firefox&flow=xtls-rprx-vision&type=tcp#r")).unwrap();
+        let o: Value = serde_json::from_str(&i.vless_opts).unwrap();
+        assert_eq!((o["flow"].as_str(), o["reality"]["public_key"].as_str(), o["reality"]["short_id"].as_str(), o["reality"]["fingerprint"].as_str()), (Some("xtls-rprx-vision"), Some(pbk), Some("0123abcd"), Some("firefox")));
+        assert!(parse_link("vless://abc@192.0.2.9:443?security=reality&sni=a.com&pbk=short").is_err());
+        assert!(parse_link(&format!("vless://abc@192.0.2.9:443?security=reality&pbk={pbk}")).is_err());
+        assert!(parse_link("vless://abc@192.0.2.9:443?flow=xtls-rprx-vision").is_err());
         assert!(parse_link("vless://u@h:1?type=ws").is_err());
         assert_eq!(parse_link("vless://u@[2001:db8::1]:8443").unwrap().server, "[2001:db8::1]:8443");
     }
