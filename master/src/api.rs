@@ -13,11 +13,13 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::app::App;
-use crate::db;
+use crate::db::{self, World};
+use crate::live::Live;
 use crate::link;
 use crate::nodecfg::{self, ProbeTarget};
 use crate::period::{format_date_end, month_label, now, parse_date_end, period_end};
@@ -86,12 +88,21 @@ fn device_value(app: &App) -> String {
     crate::util::hex(&crate::util::sha256(format!("device:{}", app.secret).as_bytes()))
 }
 
-pub fn logged_in(app: &App, headers: &HeaderMap) -> bool {
+/// Whether the request carries a live session. Looked up on the read
+/// connection, on the blocking pool: every panel request asks.
+pub async fn logged_in(app: &Arc<App>, headers: &HeaderMap) -> bool {
     let Some(token) = session_token(headers) else { return false };
-    let conn = app.db();
-    conn.query_row("SELECT 1 FROM sessions WHERE token=?1 AND expires>?2", params![token, now()], |_| Ok(()))
-        .is_ok()
+    let app = app.clone();
+    tokio::task::spawn_blocking(move || {
+        app.reader().query_row("SELECT 1 FROM sessions WHERE token=?1 AND expires>?2", params![token, now()], |_| Ok(())).is_ok()
+    })
+    .await
+    .unwrap_or(false)
 }
+
+/// Counts requests that may have changed something, so the next panel poll
+/// builds a new state instead of serving a copy from before the change.
+static EDITS: AtomicU64 = AtomicU64::new(0);
 
 pub async fn require_login(State(app): State<Arc<App>>, req: Request, next: Next) -> Response {
     // Changes need a header a form or a cross-site fetch cannot send without
@@ -101,8 +112,12 @@ pub async fn require_login(State(app): State<Arc<App>>, req: Request, next: Next
     if !safe && req.headers().get("x-keel").is_none_or(|v| v != "1") {
         return (StatusCode::FORBIDDEN, Json(json!({"error": "请求来源不对"}))).into_response();
     }
-    if logged_in(&app, req.headers()) {
-        next.run(req).await
+    if logged_in(&app, req.headers()).await {
+        let resp = next.run(req).await;
+        if !safe {
+            EDITS.fetch_add(1, Ordering::Relaxed);
+        }
+        resp
     } else {
         (StatusCode::UNAUTHORIZED, Json(json!({"error": "请先登录"}))).into_response()
     }
@@ -227,7 +242,7 @@ pub async fn logout(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResul
 
 /// The URL nodes and subscription clients use for this master.
 pub fn base_url(app: &App, headers: &HeaderMap) -> String {
-    if let Some(u) = db::get_setting(&app.db(), "panel_url").ok().flatten().filter(|u| !u.is_empty()) {
+    if let Some(u) = db::get_setting(&app.reader(), "panel_url").ok().flatten().filter(|u| !u.is_empty()) {
         return u.trim_end_matches('/').to_string();
     }
     // The host ends up in a shell command run as root: plain host[:port] only.
@@ -301,7 +316,36 @@ fn exists(conn: &Connection, table: &str, id: i64) -> bool {
 // ---------- state ----------
 
 pub async fn state(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult {
-    ok(state_value(&app, &headers)?)
+    // Every open panel asks every 2 s. The state is built off the async
+    // workers, at most once a second (or after an edit), and polls that come
+    // together get the same copy. Only logged-in requests get here.
+    struct Copy {
+        at: Instant,
+        edits: u64,
+        key: String,
+        body: bytes::Bytes,
+    }
+    static CACHE: tokio::sync::Mutex<Option<Copy>> = tokio::sync::Mutex::const_new(None);
+    const FRESH: Duration = Duration::from_secs(1);
+    // What base_url takes from the request.
+    let key = [header::HOST.as_str(), "x-forwarded-proto"].map(|h| headers.get(h).and_then(|v| v.to_str().ok()).unwrap_or("")).join("|");
+    let edits = EDITS.load(Ordering::Relaxed);
+    let mut cache = CACHE.lock().await;
+    if let Some(c) = cache.as_ref().filter(|c| c.at.elapsed() < FRESH && c.edits == edits && c.key == key) {
+        return Ok(json_body(c.body.clone()));
+    }
+    let body = tokio::task::spawn_blocking(move || {
+        let v = state_value(&app, &headers)?;
+        serde_json::to_vec(&v).map(bytes::Bytes::from).map_err(internal)
+    })
+    .await
+    .map_err(internal)??;
+    *cache = Some(Copy { at: Instant::now(), edits, key, body: body.clone() });
+    Ok(json_body(body))
+}
+
+fn json_body(body: bytes::Bytes) -> Response {
+    ([(header::CONTENT_TYPE, "application/json")], body).into_response()
 }
 
 /// The public status page at /: per-node health and probes only. No
@@ -309,10 +353,10 @@ pub async fn state(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult
 /// without logging in.
 /// Whether the anonymous probe page at / is on (a setting, off by default).
 pub fn public_page(app: &App) -> bool {
-    db::get_setting(&app.db(), "public_page").ok().flatten().is_some_and(|v| v == "1")
+    db::get_setting(&app.reader(), "public_page").ok().flatten().is_some_and(|v| v == "1")
 }
 
-pub async fn public_state(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult {
+pub async fn public_state(State(app): State<Arc<App>>) -> ApiResult {
     if !public_page(&app) {
         return Err(StatusCode::NOT_FOUND.into_response());
     }
@@ -325,13 +369,28 @@ pub async fn public_state(State(app): State<Arc<App>>, headers: HeaderMap) -> Ap
     if let Some((_, v)) = cache.as_ref().filter(|(at, _)| at.elapsed() < FRESH) {
         return ok(v.clone());
     }
-    let v = tokio::task::spawn_blocking(move || public_value(&app, &headers)).await.map_err(internal)??;
+    let v = tokio::task::spawn_blocking(move || public_value(&app)).await.map_err(internal)??;
     *cache = Some((std::time::Instant::now(), v.clone()));
     ok(v)
 }
 
-fn public_value(app: &Arc<App>, headers: &HeaderMap) -> Result<Value, Response> {
-    let full = state_value(app, headers)?;
+/// Built from the nodes and exits alone: users and their usage never enter
+/// it.
+fn public_value(app: &App) -> Result<Value, Response> {
+    let ts = now();
+    let (w, months, targets) = {
+        let conn = app.reader();
+        let mut w = World::default();
+        w.tz = tz_of(&conn);
+        w.nodes = db::load_nodes(&conn).map_err(internal)?;
+        w.exits = db::load_exits(&conn).map_err(internal)?;
+        let months = db::node_months(&conn, &month_label(ts, w.tz)).map_err(internal)?;
+        (w, months, App::probe_targets(&conn))
+    };
+    let live = app.live();
+    let (nodes, online, month) = node_values(&w, &live, &months, &targets);
+    let speed: Vec<_> = live.speed.iter().map(|(rx, tx)| [rx.round(), tx.round()]).collect();
+    drop(live);
     const KEEP: &[&str] = &["id", "name", "role", "online", "last_seen", "month_rx", "month_tx", "probes", "checks"];
     const SYSTEM: &[&str] = &["cpu_pct", "mem_total", "mem_used", "disk_total", "disk_used", "rx_rate", "tx_rate", "uptime_s", "tcp_retrans_pct"];
     let pick = |v: &Value, keys: &[&str]| -> Value {
@@ -343,37 +402,22 @@ fn public_value(app: &Arc<App>, headers: &HeaderMap) -> Result<Value, Response> 
         }
         Value::Object(o)
     };
-    let nodes: Vec<Value> = full["nodes"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .map(|n| {
-                    let mut o = pick(n, KEEP);
-                    if n["system"].is_object() {
-                        o["system"] = pick(&n["system"], SYSTEM);
-                    }
-                    o
-                })
-                .collect()
+    let nodes: Vec<Value> = nodes
+        .iter()
+        .map(|n| {
+            let mut o = pick(n, KEEP);
+            if n["system"].is_object() {
+                o["system"] = pick(&n["system"], SYSTEM);
+            }
+            o
         })
-        .unwrap_or_default();
-    Ok(json!({"now": full["now"], "nodes": nodes, "summary": full["summary"]}))
+        .collect();
+    Ok(json!({"now": ts, "nodes": nodes, "summary": {"speed": speed, "online": online, "month": month}}))
 }
 
-fn state_value(app: &Arc<App>, headers: &HeaderMap) -> Result<Value, Response> {
-    let ts = now();
-    let base = base_url(&app, &headers);
-    let conn = app.db();
-    let w = db::load_world(&conn).map_err(internal)?;
-    let months = db::node_months(&conn, &month_label(ts, w.tz)).map_err(internal)?;
-    let targets = App::probe_targets(&conn);
-    let panel_url = db::get_setting(&conn, "panel_url").ok().flatten().unwrap_or_default();
-    let username = admin_user(&conn);
-    let public_page = db::get_setting(&conn, "public_page").ok().flatten().is_some_and(|v| v == "1");
-    let panel_acme = db::get_setting(&conn, "panel_acme").ok().flatten().is_some_and(|v| v == "1");
-    drop(conn);
-    let live = app.live();
-
+/// Every node as the panel shows it, the number online and this month's
+/// traffic of all nodes.
+fn node_values(w: &World, live: &Live, months: &HashMap<i64, (i64, i64)>, targets: &[ProbeTarget]) -> (Vec<Value>, i64, i64) {
     let mut month_total = 0i64;
     let mut online = 0;
     let nodes: Vec<Value> = w
@@ -454,6 +498,30 @@ fn state_value(app: &Arc<App>, headers: &HeaderMap) -> Result<Value, Response> {
             v
         })
         .collect();
+    (nodes, online, month_total)
+}
+
+fn state_value(app: &App, headers: &HeaderMap) -> Result<Value, Response> {
+    let ts = now();
+    let base = base_url(app, headers);
+    let conn = app.reader();
+    let w = db::load_world_summed(&conn).map_err(internal)?;
+    let months = db::node_months(&conn, &month_label(ts, w.tz)).map_err(internal)?;
+    let targets = App::probe_targets(&conn);
+    let panel_url = db::get_setting(&conn, "panel_url").ok().flatten().unwrap_or_default();
+    let username = admin_user(&conn);
+    let public_page = db::get_setting(&conn, "public_page").ok().flatten().is_some_and(|v| v == "1");
+    let panel_acme = db::get_setting(&conn, "panel_acme").ok().flatten().is_some_and(|v| v == "1");
+    drop(conn);
+    let live = app.live();
+    let (nodes, online, month_total) = node_values(&w, &live, &months, &targets);
+    // Open connections per counter, summed over the nodes once.
+    let mut conns: HashMap<&str, i64> = HashMap::new();
+    for l in live.nodes.values() {
+        for (name, n) in &l.conns {
+            *conns.entry(name.as_str()).or_default() += n;
+        }
+    }
 
     let exits: Vec<Value> = w
         .exits
@@ -485,7 +553,7 @@ fn state_value(app: &Arc<App>, headers: &HeaderMap) -> Result<Value, Response> {
                 "ok"
             };
             let counter = nodecfg::user_counter(u.id);
-            let conns: i64 = live.nodes.values().filter_map(|l| l.conns.get(&counter)).sum();
+            let conns = conns.get(counter.as_str()).copied().unwrap_or(0);
             let mut v = serde_json::to_value(u).unwrap_or_default();
             let o = v.as_object_mut().expect("object");
             o.insert("per_entry".into(), json!(u.per_entry));

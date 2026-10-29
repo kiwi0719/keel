@@ -105,6 +105,9 @@ pub struct TlsInfo {
 
 pub struct App {
     pub db: Mutex<Connection>,
+    /// Read-only second connection (db::open_reader) for the panel state,
+    /// session checks, subscriptions and token lookups.
+    pub db_read: Mutex<Connection>,
     pub live: Mutex<Live>,
     pub secret: String,
     pub tls: Option<TlsInfo>,
@@ -118,6 +121,10 @@ pub struct App {
 impl App {
     pub fn db(&self) -> MutexGuard<'_, Connection> {
         self.db.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn reader(&self) -> MutexGuard<'_, Connection> {
+        self.db_read.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn live(&self) -> MutexGuard<'_, Live> {

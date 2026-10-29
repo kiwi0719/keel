@@ -239,6 +239,16 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
+/// A second connection to the database, for reads that should not wait
+/// behind writes: with WAL they run side by side. It refuses writes. Opened
+/// after `open`, so the files exist with their modes.
+pub fn open_reader(path: &Path) -> rusqlite::Result<Connection> {
+    let conn = Connection::open(path)?;
+    conn.pragma_update(None, "busy_timeout", 5000)?;
+    conn.pragma_update(None, "query_only", "ON")?;
+    Ok(conn)
+}
+
 /// A new id for `table` ("nodes" or "exits") that was never used before,
 /// even by a deleted row: ids name config tags and usage counters, so a
 /// reused id would inherit a deleted node's history.
@@ -568,12 +578,7 @@ impl World {
         self.totals.get_or_init(|| {
             let mut t = UsageTotals::default();
             for ((node, name, period), v) in &self.usage {
-                let sum = t.by_name.entry(name.clone()).or_default().entry(period.clone()).or_default();
-                *sum = sum.saturating_add(*v);
-                if let Some(exit) = crate::nodecfg::counter_exit(name) {
-                    let sum = t.by_exit.entry((*node, exit)).or_default().entry(period.clone()).or_default();
-                    *sum = sum.saturating_add(*v);
-                }
+                t.add(*node, name, period, *v);
             }
             t
         })
@@ -588,15 +593,74 @@ struct UsageTotals {
     by_exit: HashMap<(i64, i64), HashMap<String, i64>>,
 }
 
+impl UsageTotals {
+    /// Adds one usage row (up + down already summed), saturating.
+    fn add(&mut self, node: i64, name: &str, period: &str, v: i64) {
+        fn sum(periods: &mut HashMap<String, i64>, period: &str, v: i64) {
+            match periods.get_mut(period) {
+                Some(s) => *s = s.saturating_add(v),
+                None => {
+                    periods.insert(period.to_owned(), v);
+                }
+            }
+        }
+        if !self.by_name.contains_key(name) {
+            self.by_name.insert(name.to_owned(), HashMap::new());
+        }
+        sum(self.by_name.get_mut(name).expect("inserted"), period, v);
+        if let Some(exit) = crate::nodecfg::counter_exit(name) {
+            sum(self.by_exit.entry((node, exit)).or_default(), period, v);
+        }
+    }
+}
+
 pub fn load_world(conn: &Connection) -> rusqlite::Result<World> {
+    let mut w = load_world_base(conn)?;
+    // Periods are at most a month long; older rows only matter for history.
+    let since = crate::period::now() - 70 * 86_400;
+    // Summed here rather than in SQL: an overflowing up+down turns into a
+    // REAL there, and one unreadable row must not take the whole world down.
+    let mut st = conn.prepare("SELECT node_id,name,period,up,down FROM usage WHERE updated >= ?1")?;
+    let rows = st.query_map([since], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?))
+    })?;
+    for (n, name, period, up, down) in rows.flatten() {
+        w.usage.insert((n, name, period), up.max(0).saturating_add(down.max(0)));
+    }
+    Ok(w)
+}
+
+/// load_world for the panel: the usage rows are summed as they are read,
+/// with the same rules, so World::used and World::exit_used work but
+/// World::own, which needs the rows, does not. Not for node configs.
+/// Keeping a map entry per row was most of the cost of the panel's state.
+pub fn load_world_summed(conn: &Connection) -> rusqlite::Result<World> {
+    let w = load_world_base(conn)?;
+    let since = crate::period::now() - 70 * 86_400;
+    let mut totals = UsageTotals::default();
+    let mut st = conn.prepare_cached("SELECT node_id,name,period,up,down FROM usage WHERE updated >= ?1")?;
+    let mut rows = st.query([since])?;
+    while let Some(r) = rows.next()? {
+        let (Ok(node), Ok(name), Ok(period), Ok(up), Ok(down)) =
+            (r.get::<_, i64>(0), r.get_ref(1).map(|v| v.as_str()), r.get_ref(2).map(|v| v.as_str()), r.get::<_, i64>(3), r.get::<_, i64>(4))
+        else {
+            continue;
+        };
+        let (Ok(name), Ok(period)) = (name, period) else { continue };
+        totals.add(node, name, period, up.max(0).saturating_add(down.max(0)));
+    }
+    let _ = w.totals.set(totals);
+    Ok(w)
+}
+
+/// Everything but the usage rows.
+fn load_world_base(conn: &Connection) -> rusqlite::Result<World> {
     let mut w = World::default();
     w.tz = get_setting(conn, "tz_offset")?.and_then(|v| v.parse().ok()).unwrap_or(480);
     w.acme_email = get_setting(conn, "acme_email")?.unwrap_or_default();
     w.cf_token = get_setting(conn, "cf_token")?.unwrap_or_default();
-    let mut st = conn.prepare(&format!("SELECT {NODE_COLS} FROM nodes ORDER BY sort, id"))?;
-    w.nodes = st.query_map([], node_from_row)?.collect::<Result<_, _>>()?;
-    let mut st = conn.prepare(&format!("SELECT {EXIT_COLS} FROM exits ORDER BY sort, id"))?;
-    w.exits = st.query_map([], exit_from_row)?.collect::<Result<_, _>>()?;
+    w.nodes = load_nodes(conn)?;
+    w.exits = load_exits(conn)?;
     let mut st = conn.prepare("SELECT id,label,description,domains FROM rulesets ORDER BY sort, id")?;
     w.rulesets = st
         .query_map([], |r| Ok(RuleSet { id: r.get(0)?, label: r.get(1)?, description: r.get(2)?, domains: r.get(3)? }))?
@@ -616,17 +680,6 @@ pub fn load_world(conn: &Connection) -> rusqlite::Result<World> {
     for row in st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))? {
         let (u, n) = row?;
         w.user_entries.entry(u).or_default().push(n);
-    }
-    // Periods are at most a month long; older rows only matter for history.
-    let since = crate::period::now() - 70 * 86_400;
-    // Summed here rather than in SQL: an overflowing up+down turns into a
-    // REAL there, and one unreadable row must not take the whole world down.
-    let mut st = conn.prepare("SELECT node_id,name,period,up,down FROM usage WHERE updated >= ?1")?;
-    let rows = st.query_map([since], |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?))
-    })?;
-    for (n, name, period, up, down) in rows.flatten() {
-        w.usage.insert((n, name, period), up.max(0).saturating_add(down.max(0)));
     }
     Ok(w)
 }
@@ -665,6 +718,13 @@ pub fn node_by_id(conn: &Connection, id: i64) -> rusqlite::Result<Option<Node>> 
 
 pub fn user_by_id(conn: &Connection, id: i64) -> rusqlite::Result<Option<User>> {
     conn.query_row(&format!("SELECT {USER_COLS} FROM users WHERE id=?1"), [id], user_from_row).optional()
+}
+
+/// Every exit, in panel order.
+pub fn load_exits(conn: &Connection) -> rusqlite::Result<Vec<Exit>> {
+    let mut st = conn.prepare_cached(&format!("SELECT {EXIT_COLS} FROM exits ORDER BY sort, id"))?;
+    let exits = st.query_map([], exit_from_row)?.collect();
+    exits
 }
 
 /// The SS 2022 ports an exit node serves, in panel order.
@@ -924,6 +984,29 @@ mod tests {
         assert_eq!(read(&conn), (11, 25, 400));
         store_usage(&conn, 1, &row(1, 1), 500).unwrap(); // both lower: nothing changes
         assert_eq!(read(&conn), (11, 25, 400));
+        drop(conn);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[test]
+    fn summed_world_matches_the_full_one() {
+        let path = std::env::temp_dir().join(format!("keel-db-test-{}-{}.db", std::process::id(), random_hex(4)));
+        let conn = open(&path).unwrap();
+        let ts = crate::period::now();
+        let exit = crate::nodecfg::exit_counter(1, 2);
+        store_usage(&conn, 1, &[("u1".into(), "p".into(), 5, 7), (exit.clone(), "p".into(), 1, 2)], ts).unwrap();
+        store_usage(&conn, 2, &[("u1".into(), "p".into(), i64::MAX, 1), ("u1".into(), "q".into(), 3, 0)], ts).unwrap();
+        // An unreadable row is skipped by both.
+        conn.execute("INSERT INTO usage(node_id,name,period,up,down,updated) VALUES(3,'u1','p',1e30,0,?1)", [ts]).unwrap();
+        let (full, summed) = (load_world(&conn).unwrap(), load_world_summed(&conn).unwrap());
+        for (name, period) in [("u1", "p"), ("u1", "q"), (exit.as_str(), "p"), ("u9", "p")] {
+            assert_eq!(full.used(name, period, None), summed.used(name, period, None), "{name} {period}");
+        }
+        assert_eq!(summed.used("u1", "p", None), i64::MAX);
+        assert_eq!(full.exit_used(1, 2, "p"), summed.exit_used(1, 2, "p"));
+        assert_eq!(summed.exit_used(1, 2, "p"), 3);
         drop(conn);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
