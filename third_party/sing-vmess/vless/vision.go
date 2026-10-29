@@ -326,7 +326,9 @@ func (c *VisionConn) padding(buffer *buf.Buffer, command byte) *buf.Buffer {
 		common.Must1(newBuffer.Write(buffer.Bytes()))
 		buffer.Release()
 	}
-	newBuffer.Extend(paddingLen)
+	// Zeroed: the buffer comes from a pool, and Extend would send whatever
+	// an earlier connection left in it (possibly another user's data).
+	common.Must(newBuffer.WriteZeroN(paddingLen))
 	c.logger.Trace("XtlsPadding ", contentLen, " ", paddingLen, " ", command)
 	return newBuffer
 }

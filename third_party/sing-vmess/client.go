@@ -315,7 +315,7 @@ func (c *rawClientConn) encodeHeader(headerBuffer *buf.Buffer, paddingLen int) e
 		}
 	}
 	if paddingLen > 0 {
-		headerBuffer.Extend(paddingLen)
+		common.Must(headerBuffer.WriteZeroN(paddingLen))
 	}
 	headerHash := fnv.New32a()
 	common.Must1(headerHash.Write(headerBuffer.Bytes()))
