@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-shadowsocks"
+	"github.com/sagernet/sing-shadowsocks/internal/udpnat"
 	"github.com/sagernet/sing-shadowsocks/shadowaead"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
@@ -25,7 +26,6 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/replay"
-	"github.com/sagernet/sing/common/udpnat"
 
 	"golang.org/x/crypto/chacha20poly1305"
 )
