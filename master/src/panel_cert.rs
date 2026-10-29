@@ -284,7 +284,12 @@ async fn issue(app: &App, tls: &PanelTls, domain: &str) -> Result<String, String
             return Err(format!("验证没通过（{status:?}）"));
         }
         let key = rcgen::KeyPair::from_pem(&tls.key_pem).map_err(|e| e.to_string())?;
-        let csr = rcgen::CertificateParams::new(vec![domain.to_string()]).map_err(|e| e.to_string())?.serialize_request(&key).map_err(|e| e.to_string())?;
+        // rcgen's default subject ("rcgen self signed cert") is not a name a
+        // CA accepts: the request carries only the domain.
+        let mut params = rcgen::CertificateParams::new(vec![domain.to_string()]).map_err(|e| e.to_string())?;
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params.distinguished_name.push(rcgen::DnType::CommonName, domain);
+        let csr = params.serialize_request(&key).map_err(|e| e.to_string())?;
         order.finalize_csr(csr.der()).await.map_err(|e| e.to_string())?;
         order.poll_certificate(&RetryPolicy::default()).await.map_err(|e| e.to_string())
     }
