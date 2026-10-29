@@ -7,7 +7,9 @@ import (
 	"io"
 	"sync"
 
+	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
+	N "github.com/sagernet/sing/common/network"
 )
 
 // https://shadowsocks.org/en/wiki/AEAD-Ciphers.html
@@ -142,6 +144,39 @@ func (r *Reader) consumed() {
 		r.index = 0
 		r.buffer.release()
 	}
+}
+
+// ReadBuffer returns the next data in a buffer of its own with the front and
+// rear room options ask for: what is cached first, else the next chunk, read
+// and opened in that buffer. Only an opened chunk is handed out, and nothing
+// is held between calls: a reader waiting for data holds no buffer.
+func (r *Reader) ReadBuffer(options N.ReadWaitOptions) (*buf.Buffer, error) {
+	if r.cached > 0 {
+		buffer := buf.NewSize(options.FrontHeadroom + r.cached + options.RearHeadroom)
+		buffer.Resize(options.FrontHeadroom, 0)
+		common.Must1(buffer.Write(r.buffer.data[r.index : r.index+r.cached]))
+		r.cached = 0
+		r.consumed()
+		return buffer, nil
+	}
+	length, err := r.readLength()
+	if err != nil {
+		return nil, err
+	}
+	buffer := buf.NewSize(options.FrontHeadroom + length + Overhead + options.RearHeadroom)
+	buffer.Resize(options.FrontHeadroom, 0)
+	_, err = buffer.ReadFullFrom(r.upstream, length+Overhead)
+	if err == nil {
+		data := buffer.Bytes()
+		_, err = r.cipher.Open(data[:0], r.nonce, data, nil)
+	}
+	if err != nil {
+		buffer.Release()
+		return nil, err
+	}
+	increaseNonce(r.nonce)
+	buffer.Truncate(length)
+	return buffer, nil
 }
 
 func (r *Reader) WriteTo(writer io.Writer) (n int64, err error) {
@@ -371,6 +406,42 @@ func (w *Writer) ReadFrom(r io.Reader) (n int64, err error) {
 		}
 		n += int64(readN)
 	}
+}
+
+// FrontHeadroom and RearHeadroom ask for room around the data for its sealed
+// length and its tag, so that WriteBuffer seals a chunk where it is.
+func (w *Writer) FrontHeadroom() int {
+	return PacketLengthBufferSize + Overhead
+}
+
+func (w *Writer) RearHeadroom() int {
+	return Overhead
+}
+
+// WriteBuffer writes what Write would for the same data; without the room,
+// or with more than one chunk of data, it goes through Write.
+func (w *Writer) WriteBuffer(buffer *buf.Buffer) error {
+	defer buffer.Release()
+	dataLen := buffer.Len()
+	if dataLen == 0 {
+		return nil
+	}
+	if dataLen > w.maxPacketSize || buffer.Start() < w.FrontHeadroom() || buffer.FreeLen() < w.RearHeadroom() {
+		_, err := w.Write(buffer.Bytes())
+		return err
+	}
+	w.access.Lock()
+	defer w.access.Unlock()
+	header := buffer.ExtendHeader(PacketLengthBufferSize + Overhead)
+	binary.BigEndian.PutUint16(header, uint16(dataLen))
+	w.cipher.Seal(header[:0], w.nonce, header[:PacketLengthBufferSize], nil)
+	increaseNonce(w.nonce)
+	payload := buffer.Bytes()[PacketLengthBufferSize+Overhead:]
+	w.cipher.Seal(payload[:0], w.nonce, payload, nil)
+	increaseNonce(w.nonce)
+	buffer.Extend(Overhead)
+	_, err := w.upstream.Write(buffer.Bytes())
+	return err
 }
 
 func (w *Writer) Write(p []byte) (n int, err error) {
