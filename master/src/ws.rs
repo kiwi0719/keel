@@ -121,7 +121,7 @@ async fn serve(app: Arc<App>, node_id: i64, token: String, ip: String, socket: W
         let _ = tokio::time::timeout(WRITE_TIMEOUT, sink.close()).await;
     });
 
-    app.sync();
+    app.sync_node(node_id);
 
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.tick().await;

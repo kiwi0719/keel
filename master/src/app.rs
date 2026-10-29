@@ -4,8 +4,9 @@
 use axum::extract::ws::Message;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::db;
 use crate::live::{Hello, Live, Report};
@@ -20,6 +21,16 @@ const MAX_INTERVAL_BYTES: i64 = 1 << 40;
 
 /// A used_base-only change is pushed at most this often.
 const USAGE_PUSH_INTERVAL: i64 = 60;
+
+/// Sync requests: at most one run at a time; requests during a run are
+/// collected here for the next one.
+static SYNC: Mutex<SyncRequests> = Mutex::new(SyncRequests { running: false, all: false, nodes: BTreeSet::new() });
+
+struct SyncRequests {
+    running: bool,
+    all: bool,
+    nodes: BTreeSet<i64>,
+}
 
 pub struct TlsInfo {
     /// Hex SHA-256 of the leaf certificate (DER), shown for browsers.
@@ -63,50 +74,142 @@ impl App {
     /// Rebuilds every connected node's config and pushes the ones that
     /// changed. Called after each edit and every 30 s (periods roll over,
     /// used_base moves as other nodes report traffic).
-    pub fn sync(&self) {
-        let conn = self.db();
-        if let Err(e) = db::ensure_self_certs(&conn) {
-            eprintln!("sync: anytls certificates: {e}");
-        }
-        let world = match db::load_world(&conn) {
-            Ok(w) => w,
-            Err(e) => {
-                eprintln!("sync: load: {e}");
+    ///
+    /// The work runs on a blocking thread, and the database and live locks
+    /// are only held to read the world and to record what was sent, not
+    /// while configs are built. Requests that arrive during a run fold into
+    /// one more run, so a burst of edits or reconnects costs at most two
+    /// runs instead of one per request; none is dropped.
+    pub fn sync(self: &Arc<Self>) {
+        self.request_sync(None);
+    }
+
+    /// Like `sync`, for one node that just connected: the others' configs
+    /// did not change because of it.
+    pub fn sync_node(self: &Arc<Self>, node_id: i64) {
+        self.request_sync(Some(node_id));
+    }
+
+    fn request_sync(self: &Arc<Self>, node: Option<i64>) {
+        {
+            let mut s = SYNC.lock().unwrap_or_else(|e| e.into_inner());
+            match node {
+                Some(id) => {
+                    s.nodes.insert(id);
+                }
+                None => s.all = true,
+            }
+            if s.running {
                 return;
             }
+            s.running = true;
+        }
+        let app = self.clone();
+        let run = move || loop {
+            let scope = {
+                let mut s = SYNC.lock().unwrap_or_else(|e| e.into_inner());
+                if !s.all && s.nodes.is_empty() {
+                    s.running = false;
+                    return;
+                }
+                let scope = if s.all { None } else { Some(std::mem::take(&mut s.nodes)) };
+                s.all = false;
+                s.nodes.clear();
+                scope
+            };
+            app.sync_now(scope.as_ref());
         };
-        let probes = Self::probe_targets(&conn);
-        let mut live = self.live();
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                rt.spawn_blocking(run);
+            }
+            Err(_) => run(),
+        }
+    }
+
+    fn sync_now(&self, only: Option<&BTreeSet<i64>>) {
         let ts = now();
-        for node in &world.nodes {
-            let Some(l) = live.nodes.get_mut(&node.id) else { continue };
-            let Some(c) = &l.conn else { continue };
+        let (world, probes) = {
+            let conn = self.db();
+            if let Err(e) = db::ensure_self_certs(&conn) {
+                eprintln!("sync: anytls certificates: {e}");
+            }
+            let world = match db::load_world(&conn) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("sync: load: {e}");
+                    return;
+                }
+            };
+            (world, Self::probe_targets(&conn))
+        };
+        // The connected nodes and what they were last sent.
+        let targets: Vec<(i64, u64, Vec<String>, String, String, i64, i64)> = {
+            let live = self.live();
+            world
+                .nodes
+                .iter()
+                .filter(|n| only.is_none_or(|ids| ids.contains(&n.id)))
+                .filter_map(|n| {
+                    let l = live.nodes.get(&n.id)?;
+                    let c = l.conn.as_ref()?;
+                    Some((n.id, c.id, l.hello.protocols.clone(), l.sent_hash.clone(), l.sent_shape.clone(), l.sent_at, l.sent_rev))
+                })
+                .collect()
+        };
+        let mut pushes = Vec::new();
+        for (node_id, conn_id, protocols, sent_hash, sent_shape, sent_at, sent_rev) in targets {
+            let Some(node) = world.node(node_id) else { continue };
             let mut config = nodecfg::build(&world, node, &self.secret, &probes, ts);
-            nodecfg::drop_unsupported(&mut config, &l.hello.protocols);
+            nodecfg::drop_unsupported(&mut config, &protocols);
             if let Some(t) = &self.tls {
                 config["master_spki"] = json!(t.spki_sha256);
             }
             let full = serde_json::to_string(&config).unwrap_or_default();
             let hash = hex(&sha256(full.as_bytes()));
+            if hash == sent_hash {
+                continue;
+            }
             let shape = hex(&sha256(serde_json::to_string(&nodecfg::shape(&config)).unwrap_or_default().as_bytes()));
-            if hash == l.sent_hash || (shape == l.sent_shape && ts - l.sent_at < USAGE_PUSH_INTERVAL) {
+            if shape == sent_shape && ts - sent_at < USAGE_PUSH_INTERVAL {
                 continue;
             }
-            let rev = node.config_rev.max(l.sent_rev) + 1;
-            let msg = json!({"type": "config", "rev": rev, "config": config}).to_string();
-            if !c.send(Message::Text(msg.into())) {
-                continue;
+            let rev = node.config_rev.max(sent_rev) + 1;
+            let msg = format!(r#"{{"type":"config","rev":{rev},"config":{full}}}"#);
+            pushes.push((node_id, conn_id, rev, hash, shape, msg));
+        }
+        if pushes.is_empty() {
+            return;
+        }
+        let mut sent = Vec::new();
+        {
+            let mut live = self.live();
+            for (node_id, conn_id, rev, hash, shape, msg) in pushes {
+                let Some(l) = live.nodes.get_mut(&node_id) else { continue };
+                // A node that reconnected meanwhile gets its own run.
+                let Some(c) = l.conn.as_ref().filter(|c| c.id == conn_id) else { continue };
+                if !c.send(Message::Text(msg.into())) {
+                    continue;
+                }
+                l.sent_rev = rev;
+                l.sent_hash = hash.clone();
+                l.sent_shape = shape.clone();
+                l.sent_at = ts;
+                sent.push((node_id, rev, hash, shape));
             }
-            l.sent_rev = rev;
-            l.sent_hash = hash.clone();
-            l.sent_shape = shape.clone();
-            l.sent_at = ts;
-            if let Err(e) = conn.execute(
-                "UPDATE nodes SET config_rev=?1, config_hash=?2, config_shape=?3 WHERE id=?4",
-                params![rev, hash, shape, node.id],
-            ) {
-                eprintln!("sync: save rev: {e}");
+        }
+        let conn = self.db();
+        let saved = conn.unchecked_transaction().and_then(|tx| {
+            for (node_id, rev, hash, shape) in &sent {
+                tx.execute(
+                    "UPDATE nodes SET config_rev=?1, config_hash=?2, config_shape=?3 WHERE id=?4",
+                    params![rev, hash, shape, node_id],
+                )?;
             }
+            tx.commit()
+        });
+        if let Err(e) = saved {
+            eprintln!("sync: save rev: {e}");
         }
     }
 
