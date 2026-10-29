@@ -107,8 +107,20 @@ type OutboundConfig struct {
 
 	// vless: a third-party VLESS server (no flow), over TLS when TLS is set,
 	// else plain TCP.
-	UUID string             `json:"uuid,omitempty"`
-	TLS  *OutboundTLSConfig `json:"tls,omitempty"`
+	UUID    string                 `json:"uuid,omitempty"`
+	Flow    string                 `json:"flow,omitempty"` // "" or "xtls-rprx-vision"
+	TLS     *OutboundTLSConfig     `json:"tls,omitempty"`
+	Reality *OutboundRealityConfig `json:"reality,omitempty"`
+}
+
+// OutboundRealityConfig connects to a VLESS server behind REALITY: the
+// server's X25519 public key (base64url), a short ID, the borrowed site's
+// name and the TLS fingerprint to present.
+type OutboundRealityConfig struct {
+	ServerName  string `json:"server_name"`
+	PublicKey   string `json:"public_key"`
+	ShortID     string `json:"short_id,omitempty"`
+	Fingerprint string `json:"fingerprint,omitempty"`
 }
 
 // OutboundTLSConfig makes an outbound connect over TLS, verifying the
