@@ -2,6 +2,7 @@ package vless
 
 import (
 	"bytes"
+	"github.com/sagernet/sing/common/buf"
 	"testing"
 
 	"github.com/sagernet/sing/common/logger"
@@ -26,7 +27,7 @@ func TestFilterTLSShortSessionID(t *testing.T) {
 	c := &VisionConn{logger: logger.NOP(), numberOfPacketToFilter: 8}
 	hello := make([]byte, 80)
 	hello[0], hello[1], hello[2], hello[3], hello[4], hello[5] = 22, 3, 3, 0x10, 0, 2
-	hello[43] = 255 // session id length past the end of the record
+	hello[43] = 255              // session id length past the end of the record
 	c.filterTLS([][]byte{hello}) // must not panic
 }
 
@@ -40,5 +41,28 @@ func TestUnPaddingHeaderAcrossReads(t *testing.T) {
 	got = c.unPadding([]byte{3, 0, 0, 'a', 'b', 'c'})
 	if len(got) != 1 || string(got[0].Bytes()) != "abc" {
 		t.Fatalf("second part: %v", got)
+	}
+}
+
+func TestVisionPaddingIsZeroed(t *testing.T) {
+	// Leave dirty buffers in the pool, as earlier connections would.
+	for i := 0; i < 64; i++ {
+		b := buf.NewSize(2048)
+		b.Extend(b.FreeLen())
+		for j := range b.Bytes() {
+			b.Bytes()[j] = 0xAA
+		}
+		b.Release()
+	}
+	c := &VisionConn{logger: logger.NOP(), isTLS: true}
+	for i := 0; i < 32; i++ {
+		out := c.padding(nil, commandPaddingContinue)
+		pad := out.Bytes()[5:] // command, content length, padding length
+		for _, x := range pad {
+			if x != 0 {
+				t.Fatalf("padding carries leftover byte %#x", x)
+			}
+		}
+		out.Release()
 	}
 }
