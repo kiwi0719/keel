@@ -521,7 +521,7 @@ func (w *serverPacketWriter) WritePacket(buffer *buf.Buffer, destination M.Socks
 	)
 
 	if paddingLen > 0 {
-		header.Extend(paddingLen)
+		common.Must(header.WriteZeroN(paddingLen))
 	}
 
 	err := M.SocksaddrSerializer.WriteAddrPort(header, destination)
