@@ -94,6 +94,9 @@ fn checked(mut i: Imported) -> Result<Imported, String> {
     if local {
         return Err(format!("出口地址不能是本机或内网地址：{}", short(&i.server)));
     }
+    if !i.tls_sni.is_empty() && !(i.tls_sni.len() <= 253 && i.tls_sni.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')) {
+        return Err("TLS 的 sni 不是合法的域名".into());
+    }
     if let Some(bits) = i.method.strip_prefix("2022-blake3-") {
         let size = if bits.starts_with("aes-128") { 16 } else { 32 };
         let ok = !i.password.is_empty()
@@ -163,8 +166,9 @@ fn vless_options(security: &str, flow: &str, sni: &str, pbk: &str, sid: &str, fp
         if !key.is_ok_and(|k| k.len() == 32) {
             return Err("Reality 链接的公钥（pbk）不对".into());
         }
-        if sni.is_empty() {
-            return Err("Reality 链接缺少 sni".into());
+        let host_name = |s: &str| !s.is_empty() && s.len() <= 253 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
+        if !host_name(sni) {
+            return Err("Reality 链接的 sni 不是合法的域名".into());
         }
         if sid.len() > 16 || sid.len() % 2 != 0 || !sid.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err("Reality 链接的 shortId（sid）不对".into());
@@ -397,6 +401,7 @@ mod tests {
         assert!(parse_link("vless://abc@192.0.2.9:443?security=reality&sni=a.com&pbk=short").is_err());
         assert!(parse_link(&format!("vless://abc@192.0.2.9:443?security=reality&pbk={pbk}")).is_err());
         assert!(parse_link("vless://abc@192.0.2.9:443?flow=xtls-rprx-vision").is_err());
+        assert!(parse_link(&format!("vless://abc@192.0.2.9:443?security=reality&sni=a%22b.com&pbk={pbk}")).is_err());
         assert!(parse_link("vless://u@h:1?type=ws").is_err());
         assert_eq!(parse_link("vless://u@[2001:db8::1]:8443").unwrap().server, "[2001:db8::1]:8443");
     }
