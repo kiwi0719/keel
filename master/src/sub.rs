@@ -471,11 +471,19 @@ pub async fn subscription(
     Query(query): Query<SubQuery>,
     headers: HeaderMap,
 ) -> Response {
+    // The database reads and the rendering run off the async workers.
+    tokio::task::spawn_blocking(move || render(&app, &token, query, &headers))
+        .await
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn render(app: &App, token: &str, query: SubQuery, headers: &HeaderMap) -> Response {
     let conn = app.db();
-    let Some(user) = db::user_by_sub(&conn, &token).ok().flatten() else {
+    let Some(user) = db::user_by_sub(&conn, token).ok().flatten() else {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     };
-    let Ok(world) = db::load_world(&conn) else {
+    // Only this user's entries and usage, not the whole world.
+    let Ok(world) = db::load_user_world(&conn, &user) else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     drop(conn);
@@ -498,7 +506,7 @@ pub async fn subscription(
 
     let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("").to_lowercase();
     let format = query.format.as_deref().and_then(Format::parse).unwrap_or_else(|| Format::from_agent(&ua));
-    let plan = Plan { proxies: list, url: format!("{}/s/{token}?format=surge", api::base_url(&app, &headers)) };
+    let plan = Plan { proxies: list, url: format!("{}/s/{token}?format=surge", api::base_url(app, headers)) };
 
     let used = nodecfg::user_used(&world, &user, now());
     let mut info = format!("upload=0; download={used}; total={}", user.quota_bytes);

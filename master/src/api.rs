@@ -1016,9 +1016,8 @@ pub async fn update_user(State(app): State<Arc<App>>, Path(id): Path<i64>, Json(
 pub async fn reset_user(State(app): State<Arc<App>>, Path(id): Path<i64>) -> ApiResult {
     {
         let conn = app.db();
-        let w = db::load_world(&conn).map_err(internal)?;
-        let u = w.users.iter().find(|u| u.id == id).ok_or_else(|| bad("没有这个用户"))?;
-        let base = crate::period::period_label(now(), w.tz, u.reset_day as u32, 0);
+        let u = db::user_by_id(&conn, id).map_err(internal)?.ok_or_else(|| bad("没有这个用户"))?;
+        let base = crate::period::period_label(now(), tz_of(&conn), u.reset_day as u32, 0);
         let seq = if u.reset_period == base { u.reset_seq + 1 } else { 1 };
         conn.execute("UPDATE users SET reset_period=?1, reset_seq=?2 WHERE id=?3", params![base, seq, id]).map_err(internal)?;
     }

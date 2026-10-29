@@ -254,8 +254,8 @@ async fn node_ports(State(app): State<Arc<App>>, headers: HeaderMap) -> Response
         if n.vless_on && n.vless_port > 0 {
             out.push_str(&format!("VLESS-Reality {} {}\n", n.vless_port, pick(n.vless_port, n.vless_pub)));
         }
-    } else if let Ok(w) = db::load_world(&app.db()) {
-        for e in w.exits.iter().filter(|e| e.node_id == n.id) {
+    } else if let Ok(exits) = db::exits_of(&app.db(), n.id) {
+        for e in &exits {
             out.push_str(&format!("SS-2022({}) {} {}\n", e.name.replace(' ', "_"), e.port, e.public_port()));
         }
     }
