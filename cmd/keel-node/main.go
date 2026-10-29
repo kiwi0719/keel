@@ -31,7 +31,9 @@ var verbose bool
 const (
 	configRecheck = 2 * time.Second
 	quotaRecheck  = time.Second
-	saveInterval  = 10 * time.Second
+	// Shorter than the service's restart delay, so a crash loop cannot
+	// keep throwing away usage.
+	saveInterval = 2 * time.Second
 )
 
 func main() {
@@ -121,6 +123,11 @@ func main() {
 			n.shutdown()
 			return
 		case mc := <-masterConfigs:
+			if mc.revoke {
+				n.revoke(*configPath)
+				mc.result <- nil
+				continue
+			}
 			err := n.applyMaster(mc.content, mc.rev, *configPath)
 			if stat, statErr := os.Stat(*configPath); statErr == nil {
 				configStat = stat // our own write must not trigger a reload
@@ -136,6 +143,9 @@ func main() {
 		case now := <-quotaTicker.C:
 			if n.users.check(now) {
 				n.pushUsers()
+				if err := n.users.save(); err != nil {
+					log.Print("save usage: ", err)
+				}
 			}
 		case <-saveTicker.C:
 			if err := n.users.save(); err != nil {
@@ -182,15 +192,53 @@ func (n *node) applyMaster(content []byte, rev int64, path string) error {
 	return nil
 }
 
+// revoke stops every inbound and drops every user, and removes the cached
+// config so a restart does not bring them back: the master has disowned
+// this node, and users disabled since can no longer be pushed to it.
+func (n *node) revoke(path string) {
+	if err := n.reload(&Config{}); err != nil {
+		log.Print("revoke: ", err)
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		log.Print("revoke: ", err)
+	}
+	log.Print("master: token rejected for ", revokeAfter, "; stopped serving. Reinstall the node with a new token to bring it back.")
+}
+
+// writeFileAtomic replaces path with content: a new, uniquely named file in
+// the same directory (never an existing file or link someone left there),
+// flushed to disk before it takes the name, so a crash leaves either the old
+// file or the new one, never a truncated one.
 func writeFileAtomic(path string, content []byte, perm os.FileMode) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, content, perm); err != nil {
+	f, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	tmp := f.Name()
+	defer os.Remove(tmp) // no-op once renamed
+	if err = f.Chmod(perm); err == nil {
+		if _, err = f.Write(content); err == nil {
+			err = f.Sync()
+		}
+	}
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	if err = os.Rename(tmp, path); err != nil {
+		return err
+	}
+	if d, err := os.Open(dir); err == nil {
+		d.Sync()
+		d.Close()
+	}
+	return nil
 }
 
 type node struct {

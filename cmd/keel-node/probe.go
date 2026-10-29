@@ -4,7 +4,9 @@ import (
 	"context"
 	"math"
 	"net"
+	"net/netip"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -141,6 +143,18 @@ func tcping(ctx context.Context, target ProbeTarget, ipv4 bool) ProbeResult {
 		network = "tcp4"
 	}
 	dialer := net.Dialer{Timeout: probeTimeout}
+	// Targets are third-party names re-resolved on every dial: one that
+	// starts resolving to a private address is not dialed, and its result
+	// is published on the probe page. A literal IP is the admin's choice.
+	if host, _, err := net.SplitHostPort(target.Host); err == nil && net.ParseIP(host) == nil {
+		dialer.Control = func(_, address string, _ syscall.RawConn) error {
+			ap, err := netip.ParseAddrPort(address)
+			if err != nil || !isPublic(ap.Addr()) {
+				return errPrivateDestination
+			}
+			return nil
+		}
+	}
 	var times []float64
 	for i := range probeSamples {
 		if i > 0 {

@@ -142,9 +142,6 @@ func (s *MultiService[U]) NewConnection0(ctx context.Context, conn net.Conn, met
 		return shadowaead.ErrBadHeader
 	}
 	requestSalt := requestHeader[:s.keySaltLength]
-	if !s.replayFilter.Check(requestSalt) {
-		return ErrSaltNotUnique
-	}
 
 	var _eiHeader [aes.BlockSize]byte
 	eiHeader := _eiHeader[:]
@@ -194,6 +191,11 @@ func (s *MultiService[U]) NewConnection0(ctx context.Context, conn net.Conn, met
 	err = reader.ReadExternalChunk(requestHeader[s.keySaltLength+aes.BlockSize:])
 	if err != nil {
 		return err
+	}
+	// The salt goes into the replay filter only once the first chunk
+	// authenticated: anonymous garbage must not fill the filter.
+	if !s.replayFilter.Check(requestSalt) {
+		return ErrSaltNotUnique
 	}
 
 	headerType, err := rw.ReadByte(reader)

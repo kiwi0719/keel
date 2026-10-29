@@ -28,9 +28,44 @@ func TestIsPublic(t *testing.T) {
 		"fe80::1":          false,
 		"fd00::1":          false,
 		"::ffff:127.0.0.1": false,
+		// platform endpoints and IANA ranges netip calls global unicast
+		"168.63.129.16": false,
+		"192.0.0.192":   false,
+		"198.18.0.1":    false,
+		"240.0.0.1":     false,
+		"203.0.113.9":   false,
+		"fec0::1":       false,
+		"2001:db8::1":   false,
+		"2001:0:1::1":   false,
+		// IPv4 carried in IPv6 translation prefixes
+		"64:ff9b::a9fe:a9fe": false,
+		"64:ff9b::a00:5":     false,
+		"64:ff9b::101:101":   true,
+		"64:ff9b:1::a00:5":   false,
+		"2002:a00:5::1":      false,
+		"2002:7f00:1::":      false,
+		"::a00:5":            false,
+		"::ffff:0:a00:5":     false,
 	} {
 		if got := isPublic(netip.MustParseAddr(addr)); got != want {
 			t.Errorf("isPublic(%s) = %v, want %v", addr, got, want)
+		}
+	}
+}
+
+func TestIsPublicRefusesOwnAddresses(t *testing.T) {
+	ifaddrs, err := net.InterfaceAddrs()
+	if err != nil {
+		t.Skip(err)
+	}
+	for _, ia := range ifaddrs {
+		n, ok := ia.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		a, _ := netip.AddrFromSlice(n.IP)
+		if isPublic(a.Unmap()) {
+			t.Errorf("isPublic(%s) = true for this machine's own address", a)
 		}
 	}
 }

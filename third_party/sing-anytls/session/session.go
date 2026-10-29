@@ -18,6 +18,10 @@ import (
 	"github.com/sagernet/sing/common/logger"
 )
 
+// MaxStreams caps the open streams of one session; a client past it is
+// cut off, so one user cannot pile up goroutines without limit.
+var MaxStreams = 1024
+
 type Session struct {
 	conn     net.Conn
 	connLock sync.Mutex
@@ -209,6 +213,13 @@ func (s *Session) recvLoop() error {
 					return nil
 				}
 				s.streamLock.Lock()
+				if len(s.streams) >= MaxStreams {
+					s.streamLock.Unlock()
+					f := newFrame(cmdAlert, 0)
+					f.data = []byte("too many streams")
+					s.writeControlFrame(f)
+					return nil
+				}
 				if _, ok := s.streams[sid]; !ok {
 					stream := newStream(sid, s)
 					s.streams[sid] = stream

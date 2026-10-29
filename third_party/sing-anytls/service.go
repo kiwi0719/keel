@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	stdatomic "sync/atomic"
+	"time"
 
 	"github.com/anytls/sing-anytls/padding"
 	"github.com/anytls/sing-anytls/session"
@@ -109,11 +110,14 @@ func (s *Service) NewConnection(ctx context.Context, conn net.Conn, source M.Soc
 	}
 
 	session := session.NewServerSession(conn, func(stream *session.Stream) {
+		// A stream that never names its destination would otherwise wait forever.
+		stream.SetReadDeadline(time.Now().Add(30 * time.Second))
 		destination, err := M.SocksaddrSerializer.ReadAddrPort(stream)
 		if err != nil {
-			s.logger.ErrorContext(ctx, "ReadAddrPort:", err)
+			stream.Close()
 			return
 		}
+		stream.SetReadDeadline(time.Time{})
 
 		s.handler.NewConnectionEx(ctx, stream, source, destination, onClose)
 	}, &s.padding, s.logger)

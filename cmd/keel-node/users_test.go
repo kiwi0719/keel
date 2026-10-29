@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io"
 	"path/filepath"
 	"testing"
 	"time"
@@ -64,3 +65,50 @@ func TestExpiryAndRemoval(t *testing.T) {
 type fakeConn struct{ closed bool }
 
 func (c *fakeConn) Close() error { c.closed = true; return nil }
+
+func TestUsageSurvivesRemovalAndCrash(t *testing.T) {
+	r := newRegistry("")
+	r.apply([]UserConfig{{Name: "u1", Period: "p"}})
+	r.users["u1"].up.Store(500)
+	// Taken off the node and put back in the same period: counters come back.
+	r.apply(nil)
+	r.apply([]UserConfig{{Name: "u1", Period: "p"}})
+	if got := r.users["u1"].used(); got != 500 {
+		t.Fatalf("after re-adding, used = %d, want 500", got)
+	}
+	// A restarted node that lost counters is lifted to what the master has.
+	r2 := newRegistry("")
+	r2.apply([]UserConfig{{Name: "u1", Period: "p", UsedSelf: 800}})
+	if got := r2.users["u1"].used(); got != 800 {
+		t.Fatalf("with used_self 800, used = %d", got)
+	}
+	// A new period starts from zero.
+	r.apply([]UserConfig{{Name: "u1", Period: "q"}})
+	if got := r.users["u1"].used(); got != 0 {
+		t.Fatalf("new period, used = %d", got)
+	}
+}
+
+func TestUserConnectionCap(t *testing.T) {
+	old := maxUserConns
+	maxUserConns = 2
+	defer func() { maxUserConns = old }()
+	u := &userState{conns: make(map[io.Closer]struct{})}
+	a, b := nopCloser{1}, nopCloser{2}
+	u.track(a)
+	if u.full() {
+		t.Fatal("full after one connection")
+	}
+	untrack := u.track(b)
+	if !u.full() {
+		t.Fatal("not full at the cap")
+	}
+	untrack()
+	if u.full() {
+		t.Fatal("still full after a connection closed")
+	}
+}
+
+type nopCloser struct{ id int }
+
+func (nopCloser) Close() error { return nil }
