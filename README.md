@@ -73,7 +73,7 @@ keel-node  1a2b3c4 （2026-10-22 21:08 提交）
 
 - 配置文件改了会在 2 秒内自动重新加载，`kill -HUP` 可以立刻生效。设置没变的监听保持不动；改了或删掉的监听停止接新连接，已经建立的连接不受影响。
 - 每个用户可以有三种凭据（`anytls_password`、`uuid`+`flow`、`ss_key`），缺哪个就不能用哪个协议。SS 2022 客户端的密码写成 `服务端password:用户ss_key`。
-- `quota_bytes` 按上行加下行算，超额后 1 秒内断开并拒绝新连接；`expire_at` 是 unix 秒数。`period` 一变，这个用户的计数就从零开始（每月重置就靠主控下发新的 period）。
+- `quota_bytes` 按上行加下行算，超额后 0.25 秒内断开并拒绝新连接；`expire_at` 是 unix 秒数。`period` 一变，这个用户的计数就从零开始（每月重置就靠主控下发新的 period）。
 - 计数每 10 秒和退出时写入 `-state` 文件，重启后同一 period 的计数接着算；`kill -USR1` 立刻写一次。
 - 删除用户会断开他所有正在用的连接。
 - `outbounds` 里定义出口：`ss2022`（连出口节点，`password` 写 `出口password:入口的ss_key`；`method` 也可以是 aes-128/256-gcm、chacha20-ietf-poly1305 这类普通加密，连第三方 SS，`password` 就是普通密码；`udp_over_tcp` 让 UDP 走 TCP 连接，适合入口到出口之间 UDP 不稳的线路）、`socks`（比如本机 sslocal 走家宽落地）和 `vless`（第三方 VLESS 上游，明文 TCP、不带 TLS，只填 `server` 和 `uuid`，UDP 走 XUDP）。`direct` 是内置的直连。
