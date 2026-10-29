@@ -303,7 +303,7 @@ func (c *clientConn) writeRequest(payload []byte) error {
 	}
 	common.Must(binary.Write(variableLengthBuffer, binary.BigEndian, uint16(paddingLen)))
 	if paddingLen > 0 {
-		variableLengthBuffer.Extend(paddingLen)
+		common.Must(variableLengthBuffer.WriteZeroN(paddingLen))
 	}
 	if payloadLen > 0 {
 		common.Must1(variableLengthBuffer.Write(payload[:payloadLen]))
@@ -516,7 +516,7 @@ func (c *clientPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksad
 	)
 
 	if paddingLen > 0 {
-		header.Extend(paddingLen)
+		common.Must(header.WriteZeroN(paddingLen))
 	}
 
 	err := M.SocksaddrSerializer.WriteAddrPort(header, destination)
@@ -749,7 +749,7 @@ func (c *clientPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	)
 
 	if paddingLen > 0 {
-		buffer.Extend(paddingLen)
+		common.Must(buffer.WriteZeroN(paddingLen))
 	}
 
 	err = M.SocksaddrSerializer.WriteAddrPort(buffer, destination)
