@@ -61,6 +61,7 @@ fn proxies(user: &User, entries: &[&Node], trusted: &[i64]) -> Vec<Proxy> {
         if server.is_empty() {
             continue;
         }
+        let (password, uuid) = user.credentials_for(n.id);
         let label = if n.name.is_empty() { n.code.clone() } else { n.name.clone() };
         // Both protocols on one entry get a suffix; a lone one keeps the
         // entry's own name.
@@ -79,7 +80,7 @@ fn proxies(user: &User, entries: &[&Node], trusted: &[i64]) -> Vec<Proxy> {
             list.push(Proxy {
                 name: named("AnyTLS"),
                 kind: Kind::AnyTls {
-                    password: user.credentials_for(n.id).0,
+                    password,
                     sni: n.anytls_sni.clone(),
                     verify,
                     pin,
@@ -92,7 +93,7 @@ fn proxies(user: &User, entries: &[&Node], trusted: &[i64]) -> Vec<Proxy> {
             list.push(Proxy {
                 name: named("Reality"),
                 kind: Kind::Reality {
-                    uuid: user.credentials_for(n.id).1,
+                    uuid,
                     sni: n.reality_names().into_iter().next().unwrap_or_default(),
                     public_key: n.reality_public.clone(),
                     short_id: n.reality_short_ids().into_iter().next().unwrap_or_default(),
