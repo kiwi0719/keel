@@ -87,7 +87,10 @@ function exitStyle(id) {
   return i < 0 ? { color: C.faint, shape: 'circle' } : EXIT_STYLE[i % EXIT_STYLE.length];
 }
 function isExternal(e) { return e.kind && e.kind !== 'ss'; }
-function extProto(e) { return e.kind === 'vless' ? 'VLESS' : 'SS ' + e.method; }
+function extProto(e) {
+  if (e.kind !== 'vless') return 'SS ' + e.method;
+  return { reality: 'VLESS Reality', tls: 'VLESS TLS', plain: 'VLESS 明文（不加密）' }[e.transport] || 'VLESS';
+}
 function entries() { return S.data.nodes.filter(n => n.role === 'entry'); }
 function exitNodes() { return S.data.nodes.filter(n => n.role === 'exit'); }
 function nodeStatus(n) {
@@ -515,7 +518,7 @@ function usersPage() {
   return `
     <div class="section-head" style="margin-bottom:20px">
       <h2>用户</h2>
-      <button class="btn solid" data-act="new-user">添加用户</button>
+      <span>${S.data.users.some(u => !u.per_entry) ? '<button class="btn" data-act="users-per-entry">每个入口用不同凭据</button> ' : ''}<button class="btn solid" data-act="new-user">添加用户</button></span>
     </div>
     ${S.toast ? `<div class="toast" role="status">${shape({ color: C.blue, shape: 'circle' }, 8)}<span>${esc(S.toast)}</span></div>` : ''}
     <div class="users">${list || '<div class="empty">还没有用户。</div>'}</div>
@@ -737,7 +740,7 @@ function newEntryProtos(d) {
         <p class="small muted" style="margin:0">端口随机生成，证书、Short ID 等创建后点开节点再改。</p>`;
 }
 
-const EXT_HELP = `<p class="small muted" style="margin:0">一行一条：<b>vless://</b>（明文 TCP，不带 TLS / Reality）、<b>ss://</b>（SS-2022 或 aes-gcm / chacha20，不带插件）。也可以粘贴 3x-ui / Xray 的出站 JSON，或整份 Xray 配置，会取出里面的 vless 和 shadowsocks 出站。名称取链接 # 后面的备注。</p>`;
+const EXT_HELP = `<p class="small muted" style="margin:0">一行一条：<b>vless://</b>（Reality、TLS 或明文 TCP，可带 xtls-rprx-vision；明文的话 UUID、目的地和内容在路上都看得见，尽量用 Reality 或 TLS）、<b>ss://</b>（SS-2022 或 aes-gcm / chacha20，不带插件）。也可以粘贴 3x-ui / Xray 的出站 JSON，或整份 Xray 配置，会取出里面的 vless 和 shadowsocks 出站。名称取链接 # 后面的备注。</p>`;
 
 function extImportDrawer(d) {
   return {
@@ -1136,6 +1139,11 @@ const actions = {
     if (!confirm(`删除 ${u.name}？他正在用的连接会立即断开。`)) return;
     closeDrawer();
     act(() => api('DELETE', `/api/users/${u.id}`), `已删除 ${u.name}。`);
+  },
+  async 'users-per-entry'() {
+    const old = S.data.users.filter(u => !u.per_entry).length;
+    if (!confirm(`让 ${old} 个老用户在每个入口用不同的密码和 UUID？一个入口泄露的配置就开不了别的入口。切换后这些用户要刷新订阅（客户端一般 12 小时内自动刷新），刷新前连不上。继续？`)) return;
+    act(() => api('POST', '/api/users/per-entry'), '已切换，让用户刷新一下订阅。');
   },
   async 'sub-rotate'(el) {
     if (!confirm('重置后旧订阅链接和代理密码都立即失效，要把新链接重新发给这个用户，他的客户端要重新导入。继续？')) return;

@@ -321,6 +321,7 @@ fn router(app: Arc<App>) -> Router {
         .route("/api/users/{id}", patch(api::update_user).delete(api::delete_user))
         .route("/api/users/{id}/reset", post(api::reset_user))
         .route("/api/users/{id}/sub", post(api::rotate_sub))
+        .route("/api/users/per-entry", post(api::users_per_entry))
         .route("/api/settings", patch(api::update_settings))
         .route("/api/logout", post(api::logout))
         .route_layer(axum::middleware::from_fn_with_state(app.clone(), api::require_login));

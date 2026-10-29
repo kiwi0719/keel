@@ -463,6 +463,7 @@ fn state_value(app: &Arc<App>, headers: &HeaderMap) -> Result<Value, Response> {
             let o = v.as_object_mut().expect("object");
             o.insert("used".into(), json!(nodecfg::exit_used(&w, e, ts)));
             o.insert("period_end".into(), json!(period_end(ts, w.tz, e.reset_day as u32)));
+            o.insert("transport".into(), json!(e.transport()));
             v
         })
         .collect();
@@ -487,6 +488,7 @@ fn state_value(app: &Arc<App>, headers: &HeaderMap) -> Result<Value, Response> {
             let conns: i64 = live.nodes.values().filter_map(|l| l.conns.get(&counter)).sum();
             let mut v = serde_json::to_value(u).unwrap_or_default();
             let o = v.as_object_mut().expect("object");
+            o.insert("per_entry".into(), json!(u.per_entry));
             o.insert("used".into(), json!(used));
             o.insert("status".into(), json!(status));
             o.insert("conns".into(), json!(conns));
@@ -837,8 +839,8 @@ fn import_exits(conn: &mut Connection, text: &str, name: Option<&str>) -> Result
             _ => it.name.clone(),
         };
         tx.execute(
-            "INSERT INTO exits(id,node_id,name,kind,server,uuid,method,psk,sort,tls_sni) VALUES(?8,NULL,?1,?2,?3,?4,?5,?6,?7,?9)",
-            params![name.chars().take(40).collect::<String>(), it.kind, it.server, it.uuid, it.method, it.password, sort, db::fresh_id(&tx, "exits").map_err(internal)?, it.tls_sni],
+            "INSERT INTO exits(id,node_id,name,kind,server,uuid,method,psk,sort,tls_sni,vless_opts) VALUES(?8,NULL,?1,?2,?3,?4,?5,?6,?7,?9,?10)",
+            params![name.chars().take(40).collect::<String>(), it.kind, it.server, it.uuid, it.method, it.password, sort, db::fresh_id(&tx, "exits").map_err(internal)?, it.tls_sni, it.vless_opts],
         )
         .map_err(internal)?;
         ids.push(tx.last_insert_rowid());
@@ -858,8 +860,8 @@ fn reimport_exit(conn: &Connection, id: i64, text: &str) -> Result<(), Response>
     let it = items.remove(0);
     let n = conn
         .execute(
-            "UPDATE exits SET kind=?1, server=?2, uuid=?3, method=?4, psk=?5, tls_sni=?7 WHERE id=?6 AND node_id IS NULL",
-            params![it.kind, it.server, it.uuid, it.method, it.password, id, it.tls_sni],
+            "UPDATE exits SET kind=?1, server=?2, uuid=?3, method=?4, psk=?5, tls_sni=?7, vless_opts=?8 WHERE id=?6 AND node_id IS NULL",
+            params![it.kind, it.server, it.uuid, it.method, it.password, id, it.tls_sni, it.vless_opts],
         )
         .map_err(internal)?;
     if n == 0 {
@@ -1022,6 +1024,15 @@ pub async fn reset_user(State(app): State<Arc<App>>, Path(id): Path<i64>) -> Api
     }
     app.sync();
     ok(json!({"ok": true}))
+}
+
+/// Gives every user per-entry credentials (users from before keep one set
+/// for all entries until this or a subscription reset). Their clients need
+/// the refreshed subscription afterwards.
+pub async fn users_per_entry(State(app): State<Arc<App>>) -> ApiResult {
+    let n = app.db().execute("UPDATE users SET per_entry=1 WHERE per_entry=0", []).map_err(internal)?;
+    app.sync();
+    ok(json!({"ok": true, "changed": n}))
 }
 
 /// A new subscription link comes with new proxy credentials: a leaked link

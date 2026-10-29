@@ -142,6 +142,8 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     ("users", "per_entry", "INTEGER NOT NULL DEFAULT 0"),
     // External VLESS exit over TLS: the certificate name to verify ('' = plain TCP).
     ("exits", "tls_sni", "TEXT NOT NULL DEFAULT ''"),
+    // External VLESS exit: flow and REALITY settings as JSON ('' = none).
+    ("exits", "vless_opts", "TEXT NOT NULL DEFAULT ''"),
     // uTLS fingerprint clients present for Reality (subscription only).
     ("nodes", "reality_fp", "TEXT NOT NULL DEFAULT 'chrome'"),
     // Public ports for NAT boxes, where the provider maps public -> listen
@@ -392,6 +394,25 @@ pub struct Exit {
     pub method: String,
     /// External VLESS over TLS: the certificate name; empty for plain TCP.
     pub tls_sni: String,
+    /// External VLESS: flow and REALITY settings (JSON), empty for none.
+    #[serde(skip)]
+    pub vless_opts: String,
+}
+
+impl Exit {
+    /// How traffic to an external VLESS exit is protected, for the panel:
+    /// "reality", "tls" or "plain"; empty for other exits.
+    pub fn transport(&self) -> &'static str {
+        if self.kind != "vless" {
+            ""
+        } else if self.vless_opts.contains("\"reality\"") {
+            "reality"
+        } else if !self.tls_sni.is_empty() {
+            "tls"
+        } else {
+            "plain"
+        }
+    }
 }
 
 impl Exit {
@@ -567,7 +588,7 @@ pub fn load_world(conn: &Connection) -> rusqlite::Result<World> {
     w.cf_token = get_setting(conn, "cf_token")?.unwrap_or_default();
     let mut st = conn.prepare(&format!("SELECT {NODE_COLS} FROM nodes ORDER BY sort, id"))?;
     w.nodes = st.query_map([], node_from_row)?.collect::<Result<_, _>>()?;
-    let mut st = conn.prepare("SELECT id,COALESCE(node_id,0),name,port,psk,quota_bytes,reset_day,udp_over_tcp,sort,kind,server,uuid,method,pub_port,tls_sni FROM exits ORDER BY sort, id")?;
+    let mut st = conn.prepare("SELECT id,COALESCE(node_id,0),name,port,psk,quota_bytes,reset_day,udp_over_tcp,sort,kind,server,uuid,method,pub_port,tls_sni,vless_opts FROM exits ORDER BY sort, id")?;
     w.exits = st
         .query_map([], |r| {
             Ok(Exit {
@@ -585,6 +606,7 @@ pub fn load_world(conn: &Connection) -> rusqlite::Result<World> {
                 uuid: r.get(11)?,
                 method: r.get(12)?,
                 tls_sni: r.get(14)?,
+                vless_opts: r.get(15)?,
                 pub_port: r.get(13)?,
             })
         })?

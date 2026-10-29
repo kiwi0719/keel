@@ -186,6 +186,11 @@ fn entry(w: &World, node: &Node, secret: &str, now: i64) -> Value {
                     if !e.tls_sni.is_empty() {
                         o["tls"] = json!({"server_name": e.tls_sni});
                     }
+                    if let Ok(Value::Object(opts)) = serde_json::from_str::<Value>(&e.vless_opts) {
+                        for (k, v) in opts {
+                            o[k] = v;
+                        }
+                    }
                     return Some(o);
                 }
                 "shadowsocks" => {
