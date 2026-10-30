@@ -230,3 +230,91 @@ python3 -I performance-audit/bench/master/panel_poll.py https://127.0.0.1:18444/
 python3 -I performance-audit/bench/master/wal_bench.py /tmp/km-large/keel.db 1 20
 python3 -I performance-audit/bench/master/mon.py <PID> 5 205 label   # macOS (libproc) only
 ```
+
+## After the fixes
+
+### Node: audit-time code against the final build, back to back
+
+`bench/build-ref.sh` for `42014bf` (the audit commit; it still has R1, so TCP only) and `e06be4d`, then `bench/ab.sh` (entry and exit swapped together, same containers, node on CPU 0), and `bench.sh keel` once more for each.
+
+```
+=== orig (42014bf)
+keel anytls x1                       2384 MB/s  srv  0.33 cpu-s/GB
+keel anytls x8                       2616 MB/s  srv  0.38 cpu-s/GB
+keel ss2022 x1                       4328 MB/s  srv  0.23 cpu-s/GB
+keel ss2022 x8                       4221 MB/s  srv  0.23 cpu-s/GB
+keel vless-reality x1                2945 MB/s  srv  0.34 cpu-s/GB
+keel vless-reality x8                2952 MB/s  srv  0.34 cpu-s/GB
+keel vision http x1                  3000 MB/s  srv  0.33 cpu-s/GB
+keel vision https x1                 3575 MB/s  srv  0.22 cpu-s/GB
+keel vision https x8                 6374 MB/s  srv  0.15 cpu-s/GB
+keel->exit anytls x1                 1904 MB/s  srv  0.53 cpu-s/GB  exit  0.23 cpu-s/GB
+keel->exit anytls x8                 1858 MB/s  srv  0.54 cpu-s/GB  exit  0.25 cpu-s/GB
+anytls(stream) c32   rate=21170/s  srv cpu-ms/conn=0.042
+ss2022 c32           rate=14214/s  srv cpu-ms/conn=0.070
+vless-reality c32    rate=3686/s   srv cpu-ms/conn=0.257
+anytls(1 session)   1000 conns entry RSS= 103.3MB heapInuse= 48.6MB | closed RSS=  95.9MB
+ss2022              1000 conns entry RSS= 268.8MB heapInuse=178.9MB | closed RSS= 247.4MB
+vless-reality       1000 conns entry RSS=  83.3MB heapInuse= 45.0MB | closed RSS=  78.0MB
+anytls->ss2022 exit 1000 conns entry RSS= 313.9MB heapInuse=223.1MB exit RSS= 271.1MB | closed entry RSS= 285.4MB
+=== final (e06be4d)
+keel anytls x1                       2614 MB/s  srv  0.27 cpu-s/GB
+keel anytls x8                       2902 MB/s  srv  0.34 cpu-s/GB
+keel ss2022 x1                       3951 MB/s  srv  0.25 cpu-s/GB
+keel ss2022 x8                       3851 MB/s  srv  0.26 cpu-s/GB
+keel vless-reality x1                2947 MB/s  srv  0.34 cpu-s/GB
+keel vless-reality x8                2997 MB/s  srv  0.33 cpu-s/GB
+keel vision http x1                  2937 MB/s  srv  0.34 cpu-s/GB
+keel vision https x1                 3435 MB/s  srv  0.21 cpu-s/GB
+keel vision https x8                 6212 MB/s  srv  0.11 cpu-s/GB
+keel->exit anytls x1                 2186 MB/s  srv  0.46 cpu-s/GB  exit  0.23 cpu-s/GB
+keel->exit anytls x8                 2136 MB/s  srv  0.47 cpu-s/GB  exit  0.24 cpu-s/GB
+anytls(stream) c32   rate=23945/s  srv cpu-ms/conn=0.038
+ss2022 c32           rate=20176/s  srv cpu-ms/conn=0.049
+vless-reality c32    rate=3641/s   srv cpu-ms/conn=0.257
+anytls(1 session)   1000 conns entry RSS=  73.8MB heapInuse= 16.5MB | closed RSS=  48.5MB
+ss2022              1000 conns entry RSS= 101.6MB heapInuse=  7.2MB | closed RSS=  61.7MB
+vless-reality       1000 conns entry RSS=  85.1MB heapInuse= 45.1MB | closed RSS=  72.6MB
+anytls->ss2022 exit 1000 conns entry RSS= 111.9MB heapInuse= 18.6MB exit RSS= 110.4MB | closed entry RSS=  53.9MB
+=== second round, bench.sh keel only
+orig:  anytls 2568/2604 MB/s 0.33/0.38; ss2022 4326/4275 MB/s 0.23/0.23; vless 2914/3024 0.34/0.33; vision https 3609/6558 0.22/0.15
+final: anytls 2613/2990 MB/s 0.27/0.34; ss2022 3897/3887 MB/s 0.26/0.26; vless 2962/3021 0.34/0.33; vision https 3387/7371 0.21/0.12
+```
+
+SS 2022 single hop is the one case that got slower. CPU profiles of the same download (`prof.sh`, 4 s, both builds saturate the core):
+
+```
+orig:  gcmAesEnc 52.1%, syscalls 46.9% (readv via vectorisedSyscallReadWaiter 18.6%, write 28.5%); serverConn.WriteVectorised 81.1% cum
+final: syscalls 51.4% (read via syscallReadWaiter 20.7%), gcmAesEnc 46.6%; serverConn.WriteBuffer 79.4% cum
+```
+
+With `WriteVectorised` on the connection, sing reads with `readv` into up to 8 buffers (`DefaultBatchSize`) and keeps the ones it did not fill for the next read (`copy_direct_posix.go`, `vectorisedSyscallReadWaiter`), which is where most of N1's idle memory came from. Without it each read takes at most one 64 KiB buffer. In the chain the exit runs the same SS 2022 download path unsaturated at 2.1 GB/s, and its CPU per GB is unchanged (0.23-0.25 before, 0.23-0.24 after).
+
+Vision inbound -> keel's VLESS REALITY Vision outbound -> second node's Vision inbound (`bench/vchain.sh`), single stream, final build, six runs: entry 0.21, 0.16, 0.15, 0.15, 0.15, 0.18 CPU-s/GB; exit 0.24, 0.20, 0.21, 0.18, 0.18, 0.21. Before the Vision change: entry 0.23, exit 0.24. In the final build 83% of the entry's CPU is in `unix.Splice` under `bufio.copyDirect`.
+
+SS 2022 UDP head-of-line test (`udp-hol.sh`, final build): the victim's ping-pong ran 13 400-15 600 round trips every second with `lost=0` for all 16 s while the other session flooded a name whose lookup never answers (before: interrupted for 11+ s).
+
+```
+t= 0s ok=15551 lost=0 worst_rtt=14.379ms
+t= 4s ok=13486 lost=0 worst_rtt=1.11ms
+t= 8s ok=14089 lost=0 worst_rtt=1.013ms
+flood sent 3309
+t=12s ok=14190 lost=0 worst_rtt=1.1ms
+t=15s ok=14335 lost=0 worst_rtt=241µs
+```
+
+### Protocol libraries
+
+- AnyTLS (`session/stream_test.go`): on the old code a 1 MiB transfer written in pieces of up to 200 KB arrives as 32 KiB (16-bit frame length cut), and a second stream never arrives behind an unread one; both pass now. Data queued before a FIN is read in full on both.
+- VLESS mux (`mux_test.go`): the frame-encoding test passes on the old code too (same bytes on the wire); on the old code the second sub-stream never arrives behind an unread first one (test blocked until its timeout).
+- SS 2022 UDP (`perf_test.go` benchmarks from the library sub-audit, 2000 iterations x 5): inbound 10 -> 5 allocations per packet (1 or 1000 users); outbound 9 -> 3 allocations, 218 -> 130 B, 584 -> 464 ns median.
+- SS 2022 interop (unmodified peers built from the module cache): sing-shadowsocks v0.2.8 and sing-shadowsocks2 v0.2.1 clients through keel's inbound and keel's outbound to a v0.2.8 server: 8 x 3 MB random echoes intact, 100 MB downloads with the same SHA-256 every way.
+
+### Master
+
+- `/api/state`, large (2000 users, 50 nodes, 164k usage rows in the 70-day window), idle: rebuild 48-50 ms to first byte once warm (75-100 ms the first time), a shared copy 3 ms. The rebuild is SQLite stepping through the usage rows; JSON is about 5%.
+- Two tabs polling `/api/state` for 60 s with 16 simulated nodes reporting (large): previous build (`6677c52`) p50 0.17 s, max 0.22 s, `/api/session` p90 37 ms, p99 124 ms, master CPU 13.4%; final p50 0.11 s, max 0.12 s, `/api/session` p90 1.5 ms, p99 84 ms, CPU 8.2%. State and public JSON identical between the two builds.
+- Subscriptions, large: 80.2 ms -> 1.1 ms median (60 sequential requests); 65 users x 6 formats compared with the previous build, identical except Surge's own URL, which carried each test master's port.
+- Control channel, medium (20 nodes, 1000 users, 20% of users active per report), 210 s, old-style nodes vs new nodes on the same master: config re-pushes 30 (7.65 MB) vs usage messages 70 (1.97 MB); reports 41.2 MB (479 users each) vs 15.8 MB (179 users each); master CPU 3.65 s vs 2.65 s; disk written 129 vs 131 MB (0.6 MB/s; the sub-audit measured 7.95 MB/s for medium before the per-frame transaction).
+- Panel, users page with 1000 users in a hidden browser pane (no layout): full redraw 9-20 ms; a poll whose markup is unchanged 0.8 ms; a poll with 100 changed users 2.5-3 ms. Polls are one at a time, every 2 s, and with 3 s answers spaced 9.3 s apart.
+- `/dl` of a 20 MB file at 2 MB/s: master RSS 14.5 MB during the download, SHA-256 and length unchanged.

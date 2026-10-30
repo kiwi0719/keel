@@ -23,6 +23,7 @@ SINGBOX=/path/to/sing-box-linux-arm64 performance-audit/bench/setup.sh /tmp/keel
 ./bench.sh chain     # 入口 AnyTLS → ss2022 出口
 ./bench.sh vision    # 只跑 Vision 的三项
 ./vchain.sh          # Vision 入站 → VLESS Reality Vision 出站 → 第二个节点的 Vision 入站 → HTTPS 目标（两端都会进直连）
+./interop.sh         # keel 的 SS2022 和未修改的上游库（_go/interop）互通：上游客户端 → keel 入站，keel 出站 → 上游服务端
 ./churn.sh           # 新建连接速率、每条连接的 CPU
 ./hold.sh 1000       # 1000 条打开连接时的内存
 ./udp-hol.sh         # SS2022 UDP 队头阻塞
@@ -30,6 +31,16 @@ SINGBOX=/path/to/sing-box-linux-arm64 performance-audit/bench/setup.sh /tmp/keel
 docker run --rm --ulimit nofile=200000:200000 --cpuset-cpus=0 -v "$PWD/bin":/b alpine /b/procnet 20000   # /proc/net/tcp 的开销
 ./bench.sh down
 ```
+
+两个版本背靠背比较（修复前后的数字就是这样测的）：
+
+```sh
+performance-audit/bench/build-ref.sh /tmp/keel-bench 42014bf orig   # 任意提交，编成 bin/keel-node{,-pprof}-orig
+performance-audit/bench/build-ref.sh /tmp/keel-bench HEAD final
+/tmp/keel-bench/ab.sh orig final                                     # 吞吐、链路、新建连接、1000 条连接的内存
+```
+
+`42014bf` 还带着 R1，所以 `ab.sh` 只跑 TCP。
 
 微基准（`isPublic`、分流匹配、存盘、配置推送、上报体积）：
 
