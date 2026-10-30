@@ -460,6 +460,9 @@ fn node_values(w: &World, live: &Live, months: &HashMap<i64, (i64, i64)>, target
                 o.insert("apply_error".into(), json!(l.apply_error));
                 o.insert("health".into(), json!(l.outbounds));
                 o.insert("certs".into(), json!(l.certs));
+                if n.is_entry() {
+                    o.insert("dest_latency".into(), json!(l.dest_latency));
+                }
                 let probes: Vec<Value> = targets
                     .iter()
                     .filter_map(|t| {

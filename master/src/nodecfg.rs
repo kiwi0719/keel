@@ -291,11 +291,25 @@ fn entry(w: &World, node: &Node, secret: &str, now: i64) -> Value {
         })
         .collect();
 
-    let mut config = json!({"route": route, "inbounds": inbounds, "users": users});
+    let mut config = json!({"route": route, "inbounds": inbounds, "users": users, "dest_probes": dest_candidates(node)});
     if !outbounds.is_empty() {
         config["outbounds"] = Value::Array(outbounds);
     }
     config
+}
+
+/// What an entry times for its REALITY dest: the usual sites, its current
+/// first SNI and its dest. The node does not dial names that resolve to
+/// private addresses.
+fn dest_candidates(node: &Node) -> Vec<String> {
+    let mut list: Vec<String> = crate::db::REALITY_DESTS.iter().map(|d| format!("{d}:443")).collect();
+    let current = node.reality_names().first().map(|s| format!("{s}:443"));
+    for extra in current.into_iter().chain((!node.reality_dest.is_empty()).then(|| node.reality_dest.clone())) {
+        if !list.contains(&extra) {
+            list.push(extra);
+        }
+    }
+    list
 }
 
 fn exit(w: &World, node: &Node, secret: &str, now: i64) -> Value {
@@ -354,6 +368,18 @@ pub fn shape(config: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dest_candidates_add_the_current_site() {
+        let mut node = Node::default();
+        node.reality_sni = "www.apple.com,b.example".into();
+        let list = dest_candidates(&node);
+        assert_eq!(list.len(), crate::db::REALITY_DESTS.len(), "the first SNI is already a candidate");
+        node.reality_sni = "a.example".into();
+        node.reality_dest = "10.0.0.5:8443".into();
+        let list = dest_candidates(&node);
+        assert!(list.ends_with(&["a.example:443".to_string(), "10.0.0.5:8443".to_string()]));
+    }
 
     #[test]
     fn counters() {

@@ -58,7 +58,7 @@ func main() {
 	setMemoryLimit()
 
 	certDir = filepath.Dir(*configPath)
-	n := &node{users: newRegistry(*statePath), running: make(map[string]*runningInbound), prober: newProber(), started: time.Now()}
+	n := &node{users: newRegistry(*statePath), running: make(map[string]*runningInbound), prober: newProber(), destProber: newProber(), started: time.Now()}
 	n.handler = &handler{users: n.users}
 	config, err := loadConfig(*configPath, *master == "")
 	n.strict = *master == ""
@@ -79,6 +79,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go n.prober.run(ctx)
+	go n.destProber.run(ctx)
 	go runHealthChecks(ctx)
 	masterConfigs := make(chan masterConfig)
 	if *master != "" {
@@ -281,7 +282,9 @@ type node struct {
 	users   *registry
 	handler *handler
 	prober  *prober
-	config  atomic.Pointer[Config]
+	// destProber times the REALITY dest candidates of the config.
+	destProber *prober
+	config     atomic.Pointer[Config]
 	// masterState is the master connection, for the status file; nil
 	// without -master.
 	masterState atomic.Pointer[MasterState]
@@ -341,6 +344,7 @@ func (n *node) reload(config *Config) error {
 	currentRouter.Store(r)
 	n.config.Store(config)
 	n.prober.setTargets(config.Probes, config.Route.IPv4Only, time.Duration(config.ProbeInterval))
+	n.destProber.setTargets(destTargets(config.DestProbes), config.Route.IPv4Only, destProbeInterval)
 	n.failed = make(map[string]string)
 	n.users.apply(config.Users)
 	active := n.users.active()

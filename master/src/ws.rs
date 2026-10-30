@@ -168,7 +168,7 @@ async fn serve(app: Arc<App>, node_id: i64, token: String, ip: String, socket: W
                                     let parsed = serde_json::from_value::<Report>(v).or_else(|_| {
                                         let mut v: Value = serde_json::from_str(&text).unwrap_or_default();
                                         if let Some(o) = v.as_object_mut() {
-                                            for k in ["system", "probes", "outbounds", "certs"] {
+                                            for k in ["system", "probes", "outbounds", "certs", "dest_probes"] {
                                                 o.remove(k);
                                             }
                                         }

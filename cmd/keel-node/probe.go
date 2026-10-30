@@ -39,6 +39,19 @@ const (
 
 var probeSpacing = 500 * time.Millisecond // a var so tests can shorten it
 
+// destProbeInterval: the REALITY dest candidates change rarely, and only
+// guide the admin's choice.
+const destProbeInterval = 10 * time.Minute
+
+// destTargets turns dest candidates into probe targets named by their host.
+func destTargets(hosts []string) []ProbeTarget {
+	targets := make([]ProbeTarget, 0, len(hosts))
+	for _, h := range hosts {
+		targets = append(targets, ProbeTarget{Name: h, Host: h})
+	}
+	return targets
+}
+
 // prober runs a TCPing round against every target each probeInterval and
 // keeps the latest result per target.
 type prober struct {

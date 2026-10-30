@@ -29,6 +29,9 @@ type Config struct {
 	Probes []ProbeTarget `json:"probes,omitempty"`
 	// ProbeInterval is the time between probe rounds; default 30s.
 	ProbeInterval Duration `json:"probe_interval,omitempty"`
+	// DestProbes are sites (host:port) a REALITY inbound could borrow, timed
+	// every destProbeInterval so the panel can offer the nearest.
+	DestProbes []string `json:"dest_probes,omitempty"`
 }
 
 // RouteConfig picks an outbound for each connection: the first rule whose

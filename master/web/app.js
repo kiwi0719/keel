@@ -622,6 +622,39 @@ function field(label, name, value, opts) {
   const ac = { cf_token: 'off', password: 'new-password', current_password: 'current-password', username: 'username' }[name] || 'off';
   return `<label class="field ${opts.full ? 'full' : ''}">${label}<input name="${esc(name)}" value="${esc(value)}" autocomplete="${ac}" ${name === 'cf_token' ? 'data-1p-ignore data-lpignore="true"' : 'data-1p-ignore'} ${opts.type ? `type="${opts.type}"` : ''} ${opts.placeholder ? `placeholder="${esc(opts.placeholder)}"` : ''} ${opts.inputmode ? `inputmode="${opts.inputmode}"` : ''}></label>`;
 }
+// The sites the entry timed for borrowing (every 10 minutes): one click puts
+// one in SNI, with dest following it.
+function destLine(n) {
+  const list = (n.dest_latency || []).slice().sort((a, b) => (a.loss_pct >= 100) - (b.loss_pct >= 100) || a.latency_ms - b.latency_ms);
+  if (!list.length) return n.online ? '<div class="field full small muted">伪装站延迟：节点还在测（每 10 分钟一轮）</div>' : '';
+  const chip = d => {
+    const down = d.loss_pct >= 100, name = destHost(d.host);
+    const label = `${esc(d.host.endsWith(':443') ? name : d.host)} <b>${down ? '不通' : Math.round(d.latency_ms) + ' ms'}</b>`;
+    return isName(name) && !down
+      ? `<button type="button" class="chip small-chip" data-act="dest-pick" data-v="${esc(d.host)}">${label}</button>`
+      : `<span class="chip small-chip" aria-disabled="true" style="opacity:.6">${label}</span>`;
+  };
+  return `<div class="field full">伪装站延迟（节点实测，点一下换成它；换了以后客户端要更新订阅）
+    <div class="chips" role="group" aria-label="伪装站延迟" style="margin-top:6px">${list.map(chip).join('')}</div></div>`;
+}
+function destHost(hostPort) { return hostPort.replace(/:\d+$/, '').replace(/^\[|\]$/g, ''); }
+function isName(host) { return /[a-z]/i.test(host) && !host.includes(':'); }
+// The fastest site the entry reached, as host:port; undefined if none.
+function fastestDest(n) {
+  const ok = (n.dest_latency || []).filter(d => d.loss_pct < 100 && isName(destHost(d.host)));
+  ok.sort((a, b) => a.latency_ms - b.latency_ms);
+  return ok.length ? ok[0].host : undefined;
+}
+// Puts a timed site in the drawer's SNI (alone: the names must be the
+// borrowed site's) and lets dest follow it on 443.
+function pickDest(hostPort) {
+  const form = document.getElementById('drawer-form');
+  const sni = form && form.querySelector('[name="reality_sni"]'), dest = form && form.querySelector('[name="reality_dest"]');
+  if (!sni || !dest) return;
+  sni.value = destHost(hostPort);
+  dest.value = hostPort.endsWith(':443') ? '' : hostPort;
+}
+
 function sw(name, on, label) {
   return `<button type="button" class="switch" data-act="switch" data-name="${esc(name)}" aria-pressed="${!!on}" aria-label="${esc(label)}"><i></i></button><input type="hidden" name="${esc(name)}" value="${on ? 1 : 0}">`;
 }
@@ -688,6 +721,7 @@ function nodeDrawer(d) {
         <div class="fields two proto-opts">
           ${field('SNI（多个用逗号隔开，第一个给订阅）', 'reality_sni', n.reality_sni, { full: true })}
           ${field('目标 dest', 'reality_dest', n.reality_dest, { placeholder: '留空自动' })}
+          ${destLine(n)}
           ${field('Short ID', 'reality_short_id', n.reality_short_id, { placeholder: '十六进制，逗号分隔' })}
           ${field('对外端口（NAT 映射才改）', 'vless_pub', n.vless_pub || n.vless_port, { inputmode: 'numeric' })}
           <div class="field full">客户端指纹
@@ -1080,7 +1114,13 @@ const actions = {
     el.setAttribute('aria-pressed', on);
     const input = el.parentElement.querySelector(`input[name="${el.dataset.name}"]`);
     if (input) input.value = on ? 1 : 0;
+    // VLESS turned on for the first time (no client uses its SNI yet):
+    // borrow the site the entry reaches fastest, unless SNI was edited.
+    const n = on && el.dataset.name === 'vless_on' && S.drawer && S.drawer.kind === 'node' ? node(S.drawer.id) : null;
+    const sni = document.querySelector('#drawer-form [name="reality_sni"]');
+    if (n && !n.vless_on && fastestDest(n) && sni && sni.value.trim() === (n.reality_sni || '')) pickDest(fastestDest(n));
   },
+  'dest-pick'(el) { pickDest(el.dataset.v); },
   async 'save-node'(el) {
     const n = node(+el.dataset.id), f = form();
     const patch = { name: f.name.trim(), ipv4_only: f.ipv4_only === '1' };
