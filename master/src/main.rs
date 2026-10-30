@@ -30,6 +30,14 @@ use tower::ServiceExt;
 use app::{App, TlsInfo};
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
+
+/// index.html with app.js tagged by its hash, so a cache in front (Cloudflare
+/// keeps it for hours whatever no-cache says) never serves a stale panel.
+static INDEX: std::sync::LazyLock<&'static str> = std::sync::LazyLock::new(|| {
+    use sha2::Digest;
+    let tag: String = sha2::Sha256::digest(APP_JS.as_bytes())[..6].iter().map(|b| format!("{b:02x}")).collect();
+    Box::leak(INDEX_HTML.replace("src=\"/app.js\"", &format!("src=\"/app.js?v={tag}\"")).into_boxed_str())
+});
 const APP_JS: &str = include_str!("../web/app.js");
 const APP_CSS: &str = include_str!("../web/app.css");
 const INSTALL_SH: &str = include_str!("../install.sh");
@@ -341,12 +349,12 @@ fn router(app: Arc<App>) -> Router {
             // The public probe page is opt-in: off, the root answers like an
             // empty server and says nothing about what runs here.
             if api::public_page(&app) {
-                static_file(INDEX_HTML, "text/html; charset=utf-8")
+                static_file(&INDEX, "text/html; charset=utf-8")
             } else {
                 StatusCode::NOT_FOUND.into_response()
             }
         }))
-        .route("/admin", get(|| async { static_file(INDEX_HTML, "text/html; charset=utf-8") }))
+        .route("/admin", get(|| async { static_file(&INDEX, "text/html; charset=utf-8") }))
         .route("/api/public", get(api::public_state))
         .route("/robots.txt", get(|| async { static_file("User-agent: *\nDisallow: /\n", "text/plain; charset=utf-8") }))
         .route("/app.js", get(|| async { static_file(APP_JS, "text/javascript; charset=utf-8") }))
