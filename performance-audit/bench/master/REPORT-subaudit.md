@@ -8,9 +8,9 @@ SubagentHandback was refused three times ("session is not in auto mode"), so thi
 - No repo files were edited.
 
 ## Which code was measured, and the line numbers
-**Measurements: snapshot `snap1`.** The working tree was copied at about 03:01 on 2026-10-30, before commit d36c59a (03:27), into `$SCR/snap1`. All numbers come from the release build of that copy (sha1 a510892a…). The one exception is the small-dataset HTTP table, which came from the 02:49 repo build; its perf-relevant code is the same.
+**Measurements: snapshot `snap1`.** The working tree was copied at about 03:01 on 2026-10-30, before commit 6671876 (03:27), into `$SCR/snap1`. All numbers come from the release build of that copy (sha1 a510892a…). The one exception is the small-dataset HTTP table, which came from the 02:49 repo build; its perf-relevant code is the same.
 
-**Line numbers: current HEAD df07256.** `master/` is clean against HEAD.
+**Line numbers: current HEAD 44b5fb9.** `master/` is clean against HEAD.
 - `ws.rs` and `util.rs` are byte-identical to the snapshot.
 - These hot paths are unchanged: `World::used`, the `sync` loop, `store_usage`, `load_world`, `state_value`, and the subscription path.
 - New on the hot paths in HEAD:

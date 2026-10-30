@@ -1,6 +1,6 @@
 # keel 安全审计报告
 
-- 审计对象：`main` 分支提交 `c201f07`（keel-master、keel-node、面板、install.sh、third_party、依赖）
+- 审计对象：`main` 分支提交 `8037faf`（keel-master、keel-node、面板、install.sh、third_party、依赖）
 - 日期：2026-10-29
 - 每条问题的原始验证记录（英文，含复现过程和输出）见 [EVIDENCE.md](EVIDENCE.md)，编号与本文一致。
 
@@ -27,7 +27,7 @@
 
 更新于 2026-10-30，修复在分支 `security-audit-fixes` 上。88 条全部已修复（L17、L32 之后也补完了，见下表）。
 
-部署到真实服务器（Ubuntu 26.04）后又发现并修复了 3 个这批修复本身带进来的问题：按包路由 UDP 时缓冲区没留头部空间会让节点崩溃、额度切断变慢、面板证书请求被 Let's Encrypt 拒绝（见 `dc1ed93`、`d214c0b`）。真实环境下已经测过：Xray、sing-box、mihomo 兼容性（`run.sh` 16/16、`limits.sh` 12/12）、安装脚本和收紧后的 systemd 单元、面板证书的 Let's Encrypt 实签。下文问题描述保留的是修复前的样子。
+部署到真实服务器（Ubuntu 26.04）后又发现并修复了 3 个这批修复本身带进来的问题：按包路由 UDP 时缓冲区没留头部空间会让节点崩溃、额度切断变慢、面板证书请求被 Let's Encrypt 拒绝（见 `3e77842`、`012ec53`）。真实环境下已经测过：Xray、sing-box、mihomo 兼容性（`run.sh` 16/16、`limits.sh` 12/12）、安装脚本和收紧后的 systemd 单元、面板证书的 Let's Encrypt 实签。下文问题描述保留的是修复前的样子。
 
 **还没验证的：**
 - 面板证书和真实 Let's Encrypt 的通信。只用本地测试 CA 验证过证书切换，以及节点能继续连上。
@@ -74,7 +74,7 @@
 | M21 | 已修复 | 先解码 NAT64、6to4 等前缀里的 IPv4 再判断 |
 | M22 | 已修复 | 状态行最多读 256 字节，错误信息截断 |
 | M23 | 已修复 | `GEOIP,CN` 加 `no-resolve` |
-| M24 | 已修复 | SS2022 的 4 处填充改用 `WriteZeroN` 写零（`2068450`，性能审计会话提交） |
+| M24 | 已修复 | SS2022 的 4 处填充改用 `WriteZeroN` 写零（`ef6e2a8`，性能审计会话提交） |
 | M25 | 已修复 | Vision 填充改为写零（VMess 客户端同样修了），加了测试 |
 | L1 | 已修复 | XFF 只取最右一项并解析成 IP |
 | L2 | 已修复 | 用户 id 不再复用 |
@@ -409,7 +409,7 @@
 - **M24. SS2022 的填充用的是没清零的池化缓冲，节点内存里的残留内容会被加密后发给对端**（第三方 SS2022 出口商家；默认部署下入口只连自己的出口，影响小）
   - **位置**：`third_party/sing-shadowsocks/shadowaead_2022/protocol.go:306`（TCP 客户端握手，初始负载小于 900 字节时每条连接都会带，最多 900 字节）、`protocol.go:519`、`protocol.go:752`（UDP 客户端）、`service.go:524`（服务端回包）。后三处在目的端口为 53 时会带。
   - **问题**：填充用 `buf.Extend(paddingLen)` 生成，它只移动缓冲区的结束位置，不清零；而 sing 的缓冲区用完会放回池里复用。所以填充字节是之前用过这块内存的内容，可能是别的连接的明文。上游 v0.2.8 也是这样写的。入口连第三方 SS2022 出口时，商家能解密并读到这些残留。这条由性能审计会话发现，我核对过代码。
-  - **修复**：4 处都改成 `WriteZeroN(paddingLen)`，写零（`2068450`）。
+  - **修复**：4 处都改成 `WriteZeroN(paddingLen)`，写零（`ef6e2a8`）。
 
 - **M25. Vision 的填充同样来自没清零的池化缓冲，任何 VLESS-Vision 用户都能收到节点内存里的残留内容**（订阅用户；开了 VLESS 的入口受影响）
   - **位置**：`third_party/sing-vmess/vless/vision.go` 的 `padding`（`newBuffer.Extend(paddingLen)`），以及 VMess 客户端 `client.go` 的请求头填充（keel 不用这个客户端）。

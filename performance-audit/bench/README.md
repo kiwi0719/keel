@@ -35,12 +35,12 @@ docker run --rm --ulimit nofile=200000:200000 --cpuset-cpus=0 -v "$PWD/bin":/b a
 两个版本背靠背比较（修复前后的数字就是这样测的）：
 
 ```sh
-performance-audit/bench/build-ref.sh /tmp/keel-bench 42014bf orig   # 任意提交，编成 bin/keel-node{,-pprof}-orig
+performance-audit/bench/build-ref.sh /tmp/keel-bench 6b8fe80 orig   # 任意提交，编成 bin/keel-node{,-pprof}-orig
 performance-audit/bench/build-ref.sh /tmp/keel-bench HEAD final
 /tmp/keel-bench/ab.sh orig final                                     # 吞吐、链路、新建连接、1000 条连接的内存
 ```
 
-`42014bf` 还带着 R1，所以 `ab.sh` 只跑 TCP。
+`6b8fe80` 还带着 R1，所以 `ab.sh` 只跑 TCP。
 
 微基准（`isPublic`、分流匹配、存盘、配置推送、上报体积）：
 

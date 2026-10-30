@@ -1,10 +1,10 @@
 # keel performance audit: evidence appendix
 
-Raw measurements behind [REPORT.md](REPORT.md), in English. Snapshots: node benchmarks used the working tree of 2026-10-30 02:54 (`c201f07` plus the uncommitted security fixes, committed at 03:27 as `4ce2f5c`…`df07256`); the master sub-audit used 02:49 and 03:01 copies; the library sub-audit used a copy from about 03:00 whose `third_party/` is byte-identical to `df07256`. R1 was reproduced on a build of the committed code (03:28).
+Raw measurements behind [REPORT.md](REPORT.md), in English. Snapshots: node benchmarks used the working tree of 2026-10-30 02:54 (`8037faf` plus the uncommitted security fixes, committed at 03:27 as `e9b7de4`…`44b5fb9`); the master sub-audit used 02:49 and 03:01 copies; the library sub-audit used a copy from about 03:00 whose `third_party/` is byte-identical to `44b5fb9`. R1 was reproduced on a build of the committed code (03:28).
 
 Scripts and tests are kept in [bench/](bench/README.md): the node harness (`bench.sh`, `churn.sh`, `hold.sh`, `prof.sh`, `udp-hol.sh`, `_go/`), the library tests (`_go/libtests/`), and the master sub-audit's tools and logs (`bench/master/`, full sub-audit report in `bench/master/REPORT-subaudit.md`).
 
-## R1. Per-packet UDP routing panics on SS2022 headers (committed in `03bb150`)
+## R1. Per-packet UDP routing panics on SS2022 headers (committed in `1e9c67f`)
 
 Build of the working tree at 03:28, same containers as below.
 
@@ -25,7 +25,7 @@ Build of the working tree at 03:28, same containers as below.
 ## Node (keel-node): environment
 
 - Host: Apple M4 (10 cores), Docker Desktop 28.3.2, Linux VM 6.10.14-linuxkit arm64, 6 vCPU.
-- keel-node built from the working tree snapshot taken 2026-10-30 02:54 AEDT (`c201f07` plus the uncommitted changes at that time), `CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -tags anytls,vless,with_utls,ss`. The pprof variant adds `bench/_go/nodetests/zz_pprof.go` (build tag `pprof`, listens only when `KEEL_PPROF` is set).
+- keel-node built from the working tree snapshot taken 2026-10-30 02:54 AEDT (`8037faf` plus the uncommitted changes at that time), `CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -tags anytls,vless,with_utls,ss`. The pprof variant adds `bench/_go/nodetests/zz_pprof.go` (build tag `pprof`, listens only when `KEEL_PPROF` is set).
 - Containers share one network namespace: `kp-srv` (cpuset 0: the keel-node under test, so `GOMAXPROCS=1`), `kp-exit` (cpuset 1: a second keel-node as SS2022 exit), `kp-cli` (cpuset 2-5: clients, the HTTP source `blast serve`, the Reality dest `test/compat/helper dest`).
 - Clients: sing-box 1.14 dev (the user's AnyTLS-only build, `~/Documents/sing-box/bin/sing-box-linux-arm64`) for AnyTLS; `bench/_go/benchcli` (sing-shadowsocks client; a port of sing-box's Reality client on metacubex/utls with sing-vmess VLESS) for SS2022 and VLESS Reality.
 - CPU per GB = (utime+stime of the server process over the run) / bytes moved. Throughput is bounded by the server core: CPU-s/GB × GB/s ≈ 1.0 in every saturated row.
@@ -194,7 +194,7 @@ Written and run by the library sub-audit against a copy of the tree taken around
 
 ## Master (keel-master) — from the master sub-audit
 
-Release builds of the 02:49 and 03:01 working trees (hot paths identical to `df07256`), Apple M4, loopback, TLS 1.2, 20-50% run-to-run noise from other jobs. Datasets from `bench/master/seed.py DB ENTRIES EXIT_NODES USERS PERIODS` (every user on every entry, 90% with a quota, 12 periods of history):
+Release builds of the 02:49 and 03:01 working trees (hot paths identical to `44b5fb9`), Apple M4, loopback, TLS 1.2, 20-50% run-to-run noise from other jobs. Datasets from `bench/master/seed.py DB ENTRIES EXIT_NODES USERS PERIODS` (every user on every entry, 90% with a quota, 12 periods of history):
 
 | Dataset | Nodes | Users | Usage rows (table / loaded) |
 |---|---|---|---|
@@ -235,10 +235,10 @@ python3 -I performance-audit/bench/master/mon.py <PID> 5 205 label   # macOS (li
 
 ### Node: audit-time code against the final build, back to back
 
-`bench/build-ref.sh` for `42014bf` (the audit commit; it still has R1, so TCP only) and `e06be4d`, then `bench/ab.sh` (entry and exit swapped together, same containers, node on CPU 0), and `bench.sh keel` once more for each.
+`bench/build-ref.sh` for `6b8fe80` (the audit commit; it still has R1, so TCP only) and `5a6fa4f`, then `bench/ab.sh` (entry and exit swapped together, same containers, node on CPU 0), and `bench.sh keel` once more for each.
 
 ```
-=== orig (42014bf)
+=== orig (6b8fe80)
 keel anytls x1                       2384 MB/s  srv  0.33 cpu-s/GB
 keel anytls x8                       2616 MB/s  srv  0.38 cpu-s/GB
 keel ss2022 x1                       4328 MB/s  srv  0.23 cpu-s/GB
@@ -257,7 +257,7 @@ anytls(1 session)   1000 conns entry RSS= 103.3MB heapInuse= 48.6MB | closed RSS
 ss2022              1000 conns entry RSS= 268.8MB heapInuse=178.9MB | closed RSS= 247.4MB
 vless-reality       1000 conns entry RSS=  83.3MB heapInuse= 45.0MB | closed RSS=  78.0MB
 anytls->ss2022 exit 1000 conns entry RSS= 313.9MB heapInuse=223.1MB exit RSS= 271.1MB | closed entry RSS= 285.4MB
-=== final (e06be4d)
+=== final (5a6fa4f)
 keel anytls x1                       2614 MB/s  srv  0.27 cpu-s/GB
 keel anytls x8                       2902 MB/s  srv  0.34 cpu-s/GB
 keel ss2022 x1                       3951 MB/s  srv  0.25 cpu-s/GB
@@ -313,7 +313,7 @@ t=15s ok=14335 lost=0 worst_rtt=241µs
 ### Master
 
 - `/api/state`, large (2000 users, 50 nodes, 164k usage rows in the 70-day window), idle: rebuild 48-50 ms to first byte once warm (75-100 ms the first time), a shared copy 3 ms. The rebuild is SQLite stepping through the usage rows; JSON is about 5%.
-- Two tabs polling `/api/state` for 60 s with 16 simulated nodes reporting (large): previous build (`6677c52`) p50 0.17 s, max 0.22 s, `/api/session` p90 37 ms, p99 124 ms, master CPU 13.4%; final p50 0.11 s, max 0.12 s, `/api/session` p90 1.5 ms, p99 84 ms, CPU 8.2%. State and public JSON identical between the two builds.
+- Two tabs polling `/api/state` for 60 s with 16 simulated nodes reporting (large): previous build (`5186ce0`) p50 0.17 s, max 0.22 s, `/api/session` p90 37 ms, p99 124 ms, master CPU 13.4%; final p50 0.11 s, max 0.12 s, `/api/session` p90 1.5 ms, p99 84 ms, CPU 8.2%. State and public JSON identical between the two builds.
 - Subscriptions, large: 80.2 ms -> 1.1 ms median (60 sequential requests); 65 users x 6 formats compared with the previous build, identical except Surge's own URL, which carried each test master's port.
 - Control channel, medium (20 nodes, 1000 users, 20% of users active per report), 210 s, old-style nodes vs new nodes on the same master: config re-pushes 30 (7.65 MB) vs usage messages 70 (1.97 MB); reports 41.2 MB (479 users each) vs 15.8 MB (179 users each); master CPU 3.65 s vs 2.65 s; disk written 129 vs 131 MB (0.6 MB/s; the sub-audit measured 7.95 MB/s for medium before the per-frame transaction).
 - Panel, users page with 1000 users in a hidden browser pane (no layout): full redraw 9-20 ms; a poll whose markup is unchanged 0.8 ms; a poll with 100 changed users 2.5-3 ms. Polls are one at a time, every 2 s, and with 3 s answers spaced 9.3 s apart.
