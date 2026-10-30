@@ -373,6 +373,9 @@ impl App {
             l.conns.retain(|name, _| allowed.contains(name));
         }
         l.outbounds = report.outbounds.iter().map(|o| (o.tag.clone(), o.clone())).collect();
+        if !report.dest_probes.is_empty() {
+            l.record_dest_probes(&report, ts);
+        }
         // Bounded: the panel turns these into dates, and the node picks them.
         let latest = ts + 20 * 365 * 86_400;
         l.certs = report

@@ -77,7 +77,7 @@ func sendJSON(t *testing.T, conn *websocket.Conn, v any) {
 // startNode runs a node with no inbounds plus the part of main's loop that
 // applies master configs.
 func startNode(t *testing.T, m *fakeMaster, pin []byte, configPath string) (*node, context.CancelFunc) {
-	n := &node{users: newRegistry(""), running: make(map[string]*runningInbound), prober: newProber()}
+	n := &node{users: newRegistry(""), running: make(map[string]*runningInbound), prober: newProber(), destProber: newProber()}
 	n.handler = &handler{users: n.users}
 	if err := n.reload(&Config{}); err != nil {
 		t.Fatal(err)
@@ -301,7 +301,7 @@ func TestRevokedTokenStopsServing(t *testing.T) {
 	if err := os.WriteFile(configPath, []byte(`{"users":[{"name":"u1","anytls_password":"x"}]}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	n := &node{users: newRegistry(""), running: make(map[string]*runningInbound), prober: newProber()}
+	n := &node{users: newRegistry(""), running: make(map[string]*runningInbound), prober: newProber(), destProber: newProber()}
 	n.handler = &handler{users: n.users}
 	if err := n.reload(&Config{Users: []UserConfig{{Name: "u1", AnyTLSPassword: "x"}}}); err != nil {
 		t.Fatal(err)

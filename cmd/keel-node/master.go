@@ -52,6 +52,9 @@ type masterClient struct {
 	// probesSent is the newest probe round already sent; reports only carry
 	// rounds finished after it.
 	probesSent int64
+	// destSent is the same for dest probe rounds; it starts over with each
+	// connection, those rounds being minutes apart.
+	destSent int64
 	// delta: the master on this connection takes reports that only carry
 	// the users whose figures changed (it says so with each config and
 	// usage message). sent holds what this connection last reported for
@@ -115,6 +118,8 @@ type reportMessage struct {
 	// Probes holds results of probe rounds finished since the previous
 	// report, so each round is sent once; omitted when there is none.
 	Probes []ProbeResult `json:"probes,omitempty"`
+	// DestProbes: the REALITY dest candidates' latest round, once.
+	DestProbes []ProbeResult `json:"dest_probes,omitempty"`
 }
 
 type appliedMessage struct {
@@ -181,6 +186,7 @@ func (m *masterClient) session(ctx context.Context) error {
 	defer cancel()
 	m.delta.Store(false)
 	m.sent, m.lastFull = nil, time.Time{} // a new connection starts with a full report
+	m.destSent = 0
 	dialCtx, dialCancel := context.WithTimeout(ctx, 15*time.Second)
 	transport := &http.Transport{Proxy: nil, TLSClientConfig: m.tlsConfig()}
 	conn, resp, err := websocket.Dial(dialCtx, m.url, &websocket.DialOptions{
@@ -318,17 +324,27 @@ func (m *masterClient) report() reportMessage {
 		}
 	}
 	m.probesSent = newest
+	var destProbes []ProbeResult
+	newest = m.destSent
+	for _, r := range m.node.destProber.latest() {
+		if r.At > m.destSent {
+			destProbes = append(destProbes, r)
+			newest = max(newest, r.At)
+		}
+	}
+	m.destSent = newest
 	users, full := m.reportUsers(time.Now())
 	return reportMessage{
-		Type:      "report",
-		TS:        time.Now().Unix(),
-		ConfigRev: m.node.rev(),
-		Users:     users,
-		Full:      full,
-		System:    m.sampler.sample(),
-		Outbounds: currentRouter.Load().outboundStatus(),
-		Certs:     certStatuses(),
-		Probes:    probes,
+		Type:       "report",
+		TS:         time.Now().Unix(),
+		ConfigRev:  m.node.rev(),
+		Users:      users,
+		Full:       full,
+		System:     m.sampler.sample(),
+		Outbounds:  currentRouter.Load().outboundStatus(),
+		Certs:      certStatuses(),
+		Probes:     probes,
+		DestProbes: destProbes,
 	}
 }
 

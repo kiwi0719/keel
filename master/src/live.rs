@@ -101,7 +101,24 @@ pub struct Report {
     pub probes: Vec<ProbeReport>,
     pub outbounds: Vec<OutboundHealth>,
     pub certs: Vec<CertStatus>,
+    /// The REALITY dest candidates' latest round, in the first report after
+    /// it (and again after a reconnect).
+    pub dest_probes: Vec<ProbeReport>,
 }
+
+/// A REALITY dest candidate (host:port) as the node last timed it; shown to
+/// the admin only.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct DestLatency {
+    pub host: String,
+    pub latency_ms: f64,
+    pub loss_pct: f64,
+    pub at: i64,
+}
+
+/// At most this many dest candidates are kept per node; the master sends
+/// fewer.
+const MAX_DESTS: usize = 16;
 
 fn full_by_default() -> bool {
     true
@@ -176,6 +193,8 @@ pub struct NodeLive {
     pub sent_hash: String,
     pub sent_shape: String,
     pub sent_at: i64,
+    /// The REALITY dest candidates' latest round.
+    pub dest_latency: Vec<DestLatency>,
     /// Each user's (used_base, used_self) as this connection last sent them,
     /// for a node that takes usage messages.
     pub sent_usage: HashMap<String, (i64, i64)>,
@@ -184,6 +203,24 @@ pub struct NodeLive {
 impl NodeLive {
     pub fn online(&self) -> bool {
         self.conn.is_some()
+    }
+
+    /// Keeps the dest round a report brought: a few host:port names with
+    /// figures in range, whatever the node sends.
+    pub fn record_dest_probes(&mut self, report: &Report, now: i64) {
+        let at = |t: i64| if t > 0 && t <= now + 60 { t } else { now };
+        self.dest_latency = report
+            .dest_probes
+            .iter()
+            .filter(|p| p.host.len() <= 261 && p.host.contains(':') && p.latency_ms.is_finite() && p.loss_pct.is_finite())
+            .take(MAX_DESTS)
+            .map(|p| DestLatency {
+                host: p.host.clone(),
+                latency_ms: p.latency_ms.clamp(0.0, 60_000.0),
+                loss_pct: p.loss_pct.clamp(0.0, 100.0),
+                at: at(p.at),
+            })
+            .collect();
     }
 
     pub fn record_probes(&mut self, report: &Report, now: i64) {
@@ -235,6 +272,19 @@ impl Live {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dest_probes_are_bounded() {
+        let probe = |host: &str, latency: f64, at: i64| ProbeReport { host: host.into(), latency_ms: latency, loss_pct: 250.0, at, ..Default::default() };
+        let mut report = Report::default();
+        report.dest_probes = vec![probe("www.apple.com:443", 38.5, 90), probe("no-port", 1.0, 90), probe("big.example:443", f64::NAN, 90), probe("far.example:443", 1e12, 10_000)];
+        report.dest_probes.extend((0..40).map(|i| probe(&format!("h{i}.example:443"), 1.0, 90)));
+        let mut l = NodeLive::default();
+        l.record_dest_probes(&report, 100);
+        assert_eq!(l.dest_latency.len(), MAX_DESTS);
+        assert_eq!((l.dest_latency[0].host.as_str(), l.dest_latency[0].latency_ms, l.dest_latency[0].loss_pct, l.dest_latency[0].at), ("www.apple.com:443", 38.5, 100.0, 90));
+        assert_eq!((l.dest_latency[1].host.as_str(), l.dest_latency[1].latency_ms, l.dest_latency[1].at), ("far.example:443", 60_000.0, 100));
+    }
 
     #[test]
     fn reports_are_full_unless_marked() {

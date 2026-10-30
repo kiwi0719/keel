@@ -61,7 +61,7 @@ async def node(nid, role, token):
             await ws.send(json.dumps({"type": "hello", "node_version": "sim", "protocols": ["anytls", "vless", "ss2022"],
                                       "hostname": f"sim{nid}", "os": "linux", "arch": "amd64", "config_rev": 0,
                                       "features": ["spki_pin", "usage_msg"] if a.node == "new" else []}))
-            state = {"users": [], "rev": 0, "outbounds": [], "counters": {}, "delta": False}
+            state = {"users": [], "rev": 0, "outbounds": [], "counters": {}, "delta": False, "dests": []}
             got_config = asyncio.Event()
 
             async def reader():
@@ -82,6 +82,7 @@ async def node(nid, role, token):
                         state["users"] = users
                         state["rev"] = v["rev"]
                         state["outbounds"] = [o["tag"] for o in cfg.get("outbounds", [])]
+                        state["dests"] = cfg.get("dest_probes", [])
                         state["delta"] = a.node == "new" and bool(v.get("report_delta"))
                         got_config.set()
                         await ws.send(json.dumps({"type": "applied", "rev": v["rev"]}))
@@ -124,6 +125,12 @@ async def node(nid, role, token):
                                       "net_rx": net[0], "net_tx": net[1], "rx_rate": random.uniform(1e5, 1e7), "tx_rate": random.uniform(1e5, 1e7),
                                       "tcp_conns": 100, "udp_conns": 10, "uptime_s": 86400, "rss": 20 << 20, "tcp_retrans_pct": 0.3},
                            "outbounds": [{"tag": t, "alive": True, "latency_ms": random.uniform(50, 300), "checked_at": int(time.time())} for t in state["outbounds"]]}
+                    if role == "entry" and n == 2 and state["dests"]:
+                        # Made-up figures for the REALITY dest candidates; the last is unreachable.
+                        at = int(time.time())
+                        rep["dest_probes"] = [{"name": h, "host": h, "latency_ms": 0 if i == len(state["dests"]) - 1 else random.uniform(20, 200),
+                                               "loss_pct": 100 if i == len(state["dests"]) - 1 else 0, "samples": 10, "at": at}
+                                              for i, h in enumerate(state["dests"])]
                     if role == "entry" and n % 6 == 1:
                         at = int(time.time())
                         rep["probes"] = [{"name": p, "host": "203.0.113.1:80", "latency_ms": random.uniform(20, 80), "jitter_ms": 2.0,

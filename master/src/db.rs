@@ -273,7 +273,7 @@ pub fn set_setting(conn: &Connection, key: &str, value: &str) -> rusqlite::Resul
     Ok(())
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct Node {
     pub id: i64,
     pub code: String,
@@ -773,8 +773,7 @@ pub fn insert_node(conn: &Connection, role: &str, code: &str, name: &str, now: i
         let (private, public) = crate::util::reality_keypair();
         // Different entries borrow different sites, so the same camouflage
         // does not mark every keel entry. All serve TLS 1.3 with X25519.
-        const DESTS: &[&str] = &["www.apple.com", "www.microsoft.com", "www.amazon.com", "www.cloudflare.com", "www.samsung.com", "www.nvidia.com"];
-        let dest = DESTS[crate::util::random_bytes(1)[0] as usize % DESTS.len()];
+        let dest = REALITY_DESTS[crate::util::random_bytes(1)[0] as usize % REALITY_DESTS.len()];
         let anytls_port = crate::util::random_port(&[]);
         let vless_port = crate::util::random_port(&[anytls_port]);
         conn.execute(
@@ -790,6 +789,10 @@ pub fn insert_node(conn: &Connection, role: &str, code: &str, name: &str, now: i
     }
     Ok(id)
 }
+
+/// Sites a new entry's REALITY inbound borrows (one at random), and the
+/// candidates entries time so the panel can offer the nearest.
+pub const REALITY_DESTS: &[&str] = &["www.apple.com", "www.microsoft.com", "www.amazon.com", "www.cloudflare.com", "www.samsung.com", "www.nvidia.com"];
 
 /// A new user never gets a deleted user's id: usage is stored by the
 /// counter name u<id>, which would carry over.
