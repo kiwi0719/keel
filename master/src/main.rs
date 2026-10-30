@@ -13,6 +13,7 @@ mod nodecfg;
 mod panel_cert;
 mod period;
 mod sub;
+mod sysinfo;
 mod util;
 mod ws;
 
@@ -564,6 +565,7 @@ async fn main() {
 
     {
         let app = app.clone();
+        let data = o.data.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(5));
             // After a stall, carry on from now instead of catching up.
@@ -572,6 +574,7 @@ async fn main() {
             loop {
                 tick.tick().await;
                 app.live().sample_speed();
+                sysinfo::sample(&data);
                 n += 1;
                 if n % 6 == 0 {
                     app.sync();

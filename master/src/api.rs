@@ -577,6 +577,7 @@ fn state_value(app: &App, headers: &HeaderMap) -> Result<Value, Response> {
         "exits": exits,
         "rulesets": w.rulesets,
         "users": users,
+        "master": crate::sysinfo::current(),
         "summary": {
             "speed": live.speed.iter().map(|(rx, tx)| [rx.round(), tx.round()]).collect::<Vec<_>>(),
             "online": online,

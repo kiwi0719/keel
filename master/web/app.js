@@ -256,13 +256,41 @@ function probePage() {
         ${d.users ? `<div><div class="small muted">用户</div><div class="v">${d.users.length}</div></div>` : ''}
       </div>
     </section>`;
+  const master = ADMIN && d.master ? `<div class="section-head probe-head"><h2>主控机</h2></div><div class="grid probe">${masterCard(d.master, d)}</div>` : '';
   if (!nodes.length) {
-    return hero + `<div class="empty">还没有节点。去「线路」页点「添加节点」，在服务器上运行给出的那一行命令。</div>`;
+    return hero + master + `<div class="empty">还没有节点。去「线路」页点「添加节点」，在服务器上运行给出的那一行命令。</div>`;
   }
   const ext = d.exits ? d.exits.filter(isExternal) : [];
   const ins = nodes.filter(n => n.role === 'entry'), outs = nodes.filter(n => n.role !== 'entry');
   const group = (title, cards) => cards.length ? `<div class="section-head probe-head"><h2>${title}</h2></div><div class="grid probe">${cards.join('')}</div>` : '';
-  return hero + group('入口', ins.map(probeCard)) + group('出口', outs.map(probeCard).concat(ext.map(extCard)));
+  return hero + master + group('入口', ins.map(probeCard)) + group('出口', outs.map(probeCard).concat(ext.map(extCard)));
+}
+
+// The machine the master runs on (admin only): same meters as a node card.
+function masterCard(m, d) {
+  const st = nodeStatus({ online: true, system: m });
+  const meter = (label, p, text) => `<div><div class="small muted">${label}</div><div style="font-size:14px">${text}</div><div class="meter"><i style="width:${p.toFixed(0)}%;background:${p >= 80 ? C.red : C.ink}"></i></div></div>`;
+  const mem = m.mem_total ? `${Math.round(m.mem_used / 1048576)}/${Math.round(m.mem_total / 1048576)}` : '—';
+  const disk = m.disk_total ? `${(m.disk_used / GB).toFixed(1)}/${(m.disk_total / GB).toFixed(0)}` : '—';
+  const host = (d.settings && d.settings.base_url || '').replace(/^https?:\/\//, '');
+  return `<div class="card"><div class="probe-btn">
+      <div class="row">
+        <span class="code" style="flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(host || '主控')}</span>
+        <span style="flex:1 1 auto"></span>
+        ${statusMark(st.kind)}
+        <span style="font-size:13px;color:${C.muted}">${st.kind === 'ok' ? '正常' : esc(st.text)}</span>
+      </div>
+      <div class="three">
+        ${meter('CPU', m.cpu_pct || 0, m.mem_total ? Math.round(m.cpu_pct || 0) + '%' : '—')}
+        ${meter('内存 MB', pct(m.mem_used, m.mem_total), mem)}
+        ${meter('硬盘 G', pct(m.disk_used, m.disk_total), disk)}
+      </div>
+      <div class="three" style="font-size:14px">
+        <div><div class="small muted">进程 / 数据库</div>${m.rss ? bytes(m.rss) : '—'} / ${bytes(m.db_bytes || 0)}</div>
+        <div><div class="small muted">在线节点</div>${d.summary.online}/${d.nodes.length}</div>
+        <div><div class="small muted">开机</div>${m.uptime_s ? duration(m.uptime_s) : '—'}</div>
+      </div>
+    </div></div>`;
 }
 
 function probeCard(n) {

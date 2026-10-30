@@ -28,6 +28,7 @@ argon2 = { version = "0.5", default-features = false, features = ["alloc", "pass
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 instant-acme = { version = "0.8", default-features = false, features = ["ring", "hyper-rustls"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+libc = "0.2"
 
 [profile.release]
 opt-level = "s"
