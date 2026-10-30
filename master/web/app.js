@@ -381,8 +381,10 @@ function checkCard(title, sub, cs, foot, off) {
   const kind = off || !cs.length ? 'off' : dead ? 'bad' : some ? 'warn' : 'ok';
   return `<div class="card ${off || dead ? 'off' : ''}" style="padding:20px;display:flex;flex-direction:column;gap:12px">
     <div class="row">
-      <span class="code" style="flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(title)}</span>
-      <span class="muted" style="font-size:14px;flex:1 1 auto">${esc(sub)}</span>
+      <div style="flex:1 1 auto;min-width:0">
+        <div class="code" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(title)}</div>
+        <div class="small muted" style="margin-top:4px">${esc(sub)}</div>
+      </div>
       ${off || cs.length ? statusMark(kind) : ''}
     </div>
     <div class="checks">${cs.length ? cs.map(c => `<div><span class="muted">${esc(c.name)}</span><b style="${c.alive ? '' : 'color:' + C.danger}">${checkText(c)}</b></div>`).join('') : '<span class="small muted">还没有入口检测过</span>'}</div>
