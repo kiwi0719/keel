@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"log"
 	"net"
 	"time"
@@ -59,8 +60,15 @@ func newSSInbound(config InboundConfig, h *handler) (inbound, error) {
 }
 
 func (in *ssInbound) serve(conn net.Conn) {
+	defer recoverConn("ss2022", conn)
 	source := M.SocksaddrFromNet(conn.RemoteAddr()).Unwrap()
-	if err := in.service.NewConnection(context.Background(), conn, M.Metadata{Source: source}); err != nil {
+	ctx := withHandshakeDeadline(context.Background(), conn)
+	if err := in.service.NewConnection(ctx, conn, M.Metadata{Source: source}); err != nil {
+		// Whatever was wrong (too short, unknown key, replayed salt), take
+		// what the client sends until it gives up or the handshake deadline
+		// passes, then close: closing at once, and how, would tell a prober
+		// how many bytes the server wanted and that it is Shadowsocks.
+		io.Copy(io.Discard, conn)
 		conn.Close()
 		if verbose {
 			log.Print("ss2022: connection from ", source, ": ", err)

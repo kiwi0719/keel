@@ -80,14 +80,23 @@ function polyline(values, w, h, pad) {
 
 // ---------- data access ----------
 
-function node(id) { return S.data.nodes.find(n => n.id === id); }
-function exit(id) { return S.data.exits.find(e => e.id === id); }
+// By id, rebuilt with each state: pages look nodes up per user and card.
+let NODES = new Map(), EXITS = new Map();
+function index() {
+  NODES = new Map(S.data.nodes.map(n => [n.id, n]));
+  EXITS = new Map((S.data.exits || []).map((e, i) => [e.id, { e, i }]));
+}
+function node(id) { return NODES.get(id); }
+function exit(id) { const x = EXITS.get(id); return x && x.e; }
 function exitStyle(id) {
-  const i = S.data.exits.findIndex(e => e.id === id);
-  return i < 0 ? { color: C.faint, shape: 'circle' } : EXIT_STYLE[i % EXIT_STYLE.length];
+  const x = EXITS.get(id);
+  return x ? EXIT_STYLE[x.i % EXIT_STYLE.length] : { color: C.faint, shape: 'circle' };
 }
 function isExternal(e) { return e.kind && e.kind !== 'ss'; }
-function extProto(e) { return e.kind === 'vless' ? 'VLESS' : 'SS ' + e.method; }
+function extProto(e) {
+  if (e.kind !== 'vless') return 'SS ' + e.method;
+  return { reality: 'VLESS Reality', tls: 'VLESS TLS', plain: 'VLESS 明文（不加密）' }[e.transport] || 'VLESS';
+}
 function entries() { return S.data.nodes.filter(n => n.role === 'entry'); }
 function exitNodes() { return S.data.nodes.filter(n => n.role === 'exit'); }
 function nodeStatus(n) {
@@ -108,7 +117,7 @@ function statusMark(kind) {
 async function api(method, path, body) {
   const res = await fetch(path, {
     method, credentials: 'same-origin',
-    headers: body ? { 'content-type': 'application/json' } : {},
+    headers: body ? { 'content-type': 'application/json', 'x-keel': '1' } : { 'x-keel': '1' },
     body: body ? JSON.stringify(body) : undefined
   });
   let json = {};
@@ -118,16 +127,24 @@ async function api(method, path, body) {
   return json;
 }
 
-async function refresh() {
+// One state request at a time. A poll joins the one in flight; anything
+// else (after an edit) waits for it and asks again, so it sees its change.
+// With draw false the caller renders.
+let inflight = null;
+async function refresh(opts = {}) {
+  if (inflight && opts.poll) return inflight;
+  while (inflight) await inflight;
+  inflight = fetchState(opts.draw !== false, opts.poll).finally(() => { inflight = null; });
+  return inflight;
+}
+
+async function fetchState(draw, poll) {
   try {
     const data = await api('GET', ADMIN ? '/api/state' : '/api/public');
-    // Unchanged data (most polls when idle) needs no re-render.
-    const sig = JSON.stringify(data);
-    const same = sig === S.sig;
-    S.sig = sig;
     S.data = data;
+    index();
     if (ADMIN) S.loggedIn = true;
-    if (!same && !busy()) render();
+    if (draw && !busy()) render(poll);
   } catch (e) { /* shown via login or kept stale */ }
 }
 
@@ -150,7 +167,7 @@ async function act(fn, okMsg) {
   try {
     await fn();
     if (okMsg) flash(okMsg);
-    await refresh();
+    await refresh({ draw: false });
     render();
     return true;
   } catch (e) {
@@ -162,17 +179,31 @@ async function act(fn, okMsg) {
 
 // ---------- pages ----------
 
-function render() {
+// The markup on screen, and the users page's parts, from the last render.
+let shown = '', shownUsers = null;
+
+// A poll's render (poll true) leaves the page alone when its markup is the
+// same, and on the users page redraws only the rows that changed: traffic
+// moves a few figures, and the page can hold thousands of elements. Other
+// renders redraw everything, which also resets what the user left in the
+// main area.
+function render(poll) {
   const root = document.getElementById('app');
   if (!ADMIN) {
-    root.innerHTML = S.data ? `<main class="public">${probePage()}</main>` : '';
+    const html = S.data ? `<main class="public">${probePage()}</main>` : '';
+    if (!poll || html !== shown) root.innerHTML = html;
+    shown = html;
     return;
   }
-  if (S.loggedIn === false) { root.innerHTML = loginPage(); S.drawer = null; renderDrawer(); return; }
-  if (!S.data) { root.innerHTML = ''; return; }
+  if (S.loggedIn === false || !S.data) {
+    shown = ''; shownUsers = null;
+    if (S.loggedIn === false) { root.innerHTML = loginPage(); S.drawer = null; renderDrawer(); } else root.innerHTML = '';
+    return;
+  }
   const t = S.tab;
   const tab = (id, label, mark) => `<button class="tab" data-act="tab" data-tab="${id}" aria-current="${t === id ? 'page' : 'false'}">${t === id ? mark : '<span class="mark"></span>'}${label}</button>`;
-  root.innerHTML = `
+  const users = t !== 'probe' && t !== 'lines' ? usersParts() : null;
+  const html = `
     <header class="top">
       <nav aria-label="主导航">
         ${tab('probe', '探针', shape({ color: C.blue, shape: 'circle' }, 10))}
@@ -181,7 +212,11 @@ function render() {
       </nav>
       <button class="icon-btn" data-act="settings" aria-label="设置" title="设置"><svg width="20" height="20" viewBox="0 0 20 20" aria-hidden="true"><path d="M2 5h16M2 10h16M2 15h16" stroke="currentColor" stroke-width="1.4"/><rect x="5" y="3" width="4" height="4" fill="var(--ground)" stroke="currentColor" stroke-width="1.4"/><rect x="11" y="8" width="4" height="4" fill="var(--ground)" stroke="currentColor" stroke-width="1.4"/><rect x="7" y="13" width="4" height="4" fill="var(--ground)" stroke="currentColor" stroke-width="1.4"/></svg></button>
     </header>
-    <main>${t === 'probe' ? probePage() : t === 'lines' ? linesPage() : usersPage()}</main>`;
+    <main>${t === 'probe' ? probePage() : t === 'lines' ? linesPage() : users.head + usersList(users.rows)}</main>`;
+  if (poll && html === shown) return;
+  if (!(poll && users && patchUsers(users))) root.innerHTML = html;
+  shown = html;
+  shownUsers = users;
   // The drawer is left alone here so typing in it survives the 2 s refresh.
 }
 
@@ -495,31 +530,52 @@ function exitNodeCard(x) {
 
 const USTATUS = { ok: '正常', warn: '将满', over: '超额停用', expired: '已过期', disabled: '已停用' };
 
-function usersPage() {
+// The users page in parts: the head, and one [id, markup] per user, so a
+// poll can redraw only the rows that changed.
+function usersParts() {
   const all = entries().map(n => n.id);
-  const list = S.data.users.map(u => {
-    const p = pct(u.used, u.quota_bytes), bad = ['over', 'expired', 'disabled'].includes(u.status);
-    const barColor = p >= 100 ? C.red : p >= 90 ? C.amber : C.ink;
-    const nodesText = !u.entries.length ? '没有入口' : (all.length && all.every(id => u.entries.includes(id))) ? '全部入口'
-      : u.entries.map(id => node(id)).filter(Boolean).map(nm).join(' · ');
-    const online = u.conns ? ` · ${u.conns} 个连接` : '';
-    return `<button class="user" data-act="user" data-id="${u.id}">
-      <span class="n">${esc(u.name)}</span>
-      <span class="bar">
-        <span style="display:flex;justify-content:space-between;font-size:14px"><span>${gib(u.used)} / ${u.quota_bytes ? gib(u.quota_bytes) + ' GB' : '不限'}</span><span style="color:${bad ? C.danger : C.muted}">${USTATUS[u.status]}${online}</span></span>
-        <span style="display:block;height:3px;background:#D6D1C6;margin-top:6px"><span style="display:block;height:100%;width:${u.quota_bytes ? p.toFixed(0) : 0}%;background:${barColor}"></span></span>
-      </span>
-      <span class="meta">到期 ${u.expire_date || '不限'} · ${u.reset_day} 号重置 · ${esc(nodesText)}</span>
-    </button>`;
-  }).join('');
+  return { head: usersHead(), rows: S.data.users.map(u => [u.id, userRow(u, all)]) };
+}
+
+function usersHead() {
   return `
     <div class="section-head" style="margin-bottom:20px">
       <h2>用户</h2>
-      <button class="btn solid" data-act="new-user">添加用户</button>
+      <span>${S.data.users.some(u => !u.per_entry) ? '<button class="btn" data-act="users-per-entry">每个入口用不同凭据</button> ' : ''}<button class="btn solid" data-act="new-user">添加用户</button></span>
     </div>
-    ${S.toast ? `<div class="toast" role="status">${shape({ color: C.blue, shape: 'circle' }, 8)}<span>${esc(S.toast)}</span></div>` : ''}
-    <div class="users">${list || '<div class="empty">还没有用户。</div>'}</div>
-    `;
+    ${S.toast ? `<div class="toast" role="status">${shape({ color: C.blue, shape: 'circle' }, 8)}<span>${esc(S.toast)}</span></div>` : ''}`;
+}
+
+function userRow(u, all) {
+  const p = pct(u.used, u.quota_bytes), bad = ['over', 'expired', 'disabled'].includes(u.status);
+  const barColor = p >= 100 ? C.red : p >= 90 ? C.amber : C.ink;
+  const nodesText = !u.entries.length ? '没有入口' : (all.length && all.every(id => u.entries.includes(id))) ? '全部入口'
+    : u.entries.map(id => node(id)).filter(Boolean).map(nm).join(' · ');
+  const online = u.conns ? ` · ${u.conns} 个连接` : '';
+  return `<button class="user" data-act="user" data-id="${u.id}">
+    <span class="n">${esc(u.name)}</span>
+    <span class="bar">
+      <span style="display:flex;justify-content:space-between;font-size:14px"><span>${gib(u.used)} / ${u.quota_bytes ? gib(u.quota_bytes) + ' GB' : '不限'}</span><span style="color:${bad ? C.danger : C.muted}">${USTATUS[u.status]}${online}</span></span>
+      <span style="display:block;height:3px;background:#D6D1C6;margin-top:6px"><span style="display:block;height:100%;width:${u.quota_bytes ? p.toFixed(0) : 0}%;background:${barColor}"></span></span>
+    </span>
+    <span class="meta">到期 ${u.expire_date || '不限'} · ${u.reset_day} 号重置 · ${esc(nodesText)}</span>
+  </button>`;
+}
+
+function usersList(rows) {
+  return `<div class="users">${rows.map(r => r[1]).join('') || '<div class="empty">还没有用户。</div>'}</div>`;
+}
+
+// Redraws the rows whose markup changed, when the users page on screen has
+// the same head and the same users in the same order; false otherwise.
+function patchUsers(users) {
+  const box = document.querySelector('#app .users');
+  if (!box || !shownUsers || !users.rows.length || users.head !== shownUsers.head || box.children.length !== users.rows.length) return false;
+  if (users.rows.some(([id], i) => box.children[i].dataset.id !== String(id))) return false;
+  users.rows.forEach(([, html], i) => {
+    if (html !== shownUsers.rows[i][1]) box.children[i].outerHTML = html;
+  });
+  return true;
 }
 
 // ---------- drawers ----------
@@ -563,10 +619,44 @@ function renderDrawer(focus) {
 
 function field(label, name, value, opts) {
   opts = opts || {};
-  return `<label class="field ${opts.full ? 'full' : ''}">${label}<input name="${name}" value="${esc(value)}" autocomplete="off" data-1p-ignore ${opts.type ? `type="${opts.type}"` : ''} ${opts.placeholder ? `placeholder="${esc(opts.placeholder)}"` : ''} ${opts.inputmode ? `inputmode="${opts.inputmode}"` : ''}></label>`;
+  const ac = { cf_token: 'off', password: 'new-password', current_password: 'current-password', username: 'username' }[name] || 'off';
+  return `<label class="field ${opts.full ? 'full' : ''}">${label}<input name="${esc(name)}" value="${esc(value)}" autocomplete="${ac}" ${name === 'cf_token' ? 'data-1p-ignore data-lpignore="true"' : 'data-1p-ignore'} ${opts.type ? `type="${opts.type}"` : ''} ${opts.placeholder ? `placeholder="${esc(opts.placeholder)}"` : ''} ${opts.inputmode ? `inputmode="${opts.inputmode}"` : ''}></label>`;
 }
+// The sites the entry timed for borrowing (every 10 minutes): one click puts
+// one in SNI, with dest following it.
+function destLine(n) {
+  const list = (n.dest_latency || []).slice().sort((a, b) => (a.loss_pct >= 100) - (b.loss_pct >= 100) || a.latency_ms - b.latency_ms);
+  if (!list.length) return n.online ? '<div class="field full small muted">伪装站延迟：节点还在测（每 10 分钟一轮）</div>' : '';
+  const chip = d => {
+    const down = d.loss_pct >= 100, name = destHost(d.host);
+    const label = `${esc(d.host.endsWith(':443') ? name : d.host)} <b>${down ? '不通' : Math.round(d.latency_ms) + ' ms'}</b>`;
+    return isName(name) && !down
+      ? `<button type="button" class="chip small-chip" data-act="dest-pick" data-v="${esc(d.host)}">${label}</button>`
+      : `<span class="chip small-chip" aria-disabled="true" style="opacity:.6">${label}</span>`;
+  };
+  return `<div class="field full">伪装站延迟（节点实测，点一下换成它；换了以后客户端要更新订阅）
+    <div class="chips" role="group" aria-label="伪装站延迟" style="margin-top:6px">${list.map(chip).join('')}</div></div>`;
+}
+function destHost(hostPort) { return hostPort.replace(/:\d+$/, '').replace(/^\[|\]$/g, ''); }
+function isName(host) { return /[a-z]/i.test(host) && !host.includes(':'); }
+// The fastest site the entry reached, as host:port; undefined if none.
+function fastestDest(n) {
+  const ok = (n.dest_latency || []).filter(d => d.loss_pct < 100 && isName(destHost(d.host)));
+  ok.sort((a, b) => a.latency_ms - b.latency_ms);
+  return ok.length ? ok[0].host : undefined;
+}
+// Puts a timed site in the drawer's SNI (alone: the names must be the
+// borrowed site's) and lets dest follow it on 443.
+function pickDest(hostPort) {
+  const form = document.getElementById('drawer-form');
+  const sni = form && form.querySelector('[name="reality_sni"]'), dest = form && form.querySelector('[name="reality_dest"]');
+  if (!sni || !dest) return;
+  sni.value = destHost(hostPort);
+  dest.value = hostPort.endsWith(':443') ? '' : hostPort;
+}
+
 function sw(name, on, label) {
-  return `<button type="button" class="switch" data-act="switch" data-name="${name}" aria-pressed="${!!on}" aria-label="${esc(label)}"><i></i></button><input type="hidden" name="${name}" value="${on ? 1 : 0}">`;
+  return `<button type="button" class="switch" data-act="switch" data-name="${esc(name)}" aria-pressed="${!!on}" aria-label="${esc(label)}"><i></i></button><input type="hidden" name="${esc(name)}" value="${on ? 1 : 0}">`;
 }
 
 // The node's address is read-only (detected from its connection) and stays
@@ -631,6 +721,7 @@ function nodeDrawer(d) {
         <div class="fields two proto-opts">
           ${field('SNI（多个用逗号隔开，第一个给订阅）', 'reality_sni', n.reality_sni, { full: true })}
           ${field('目标 dest', 'reality_dest', n.reality_dest, { placeholder: '留空自动' })}
+          ${destLine(n)}
           ${field('Short ID', 'reality_short_id', n.reality_short_id, { placeholder: '十六进制，逗号分隔' })}
           ${field('对外端口（NAT 映射才改）', 'vless_pub', n.vless_pub || n.vless_port, { inputmode: 'numeric' })}
           <div class="field full">客户端指纹
@@ -736,7 +827,7 @@ function newEntryProtos(d) {
         <p class="small muted" style="margin:0">端口随机生成，证书、Short ID 等创建后点开节点再改。</p>`;
 }
 
-const EXT_HELP = `<p class="small muted" style="margin:0">一行一条：<b>vless://</b>（明文 TCP，不带 TLS / Reality）、<b>ss://</b>（SS-2022 或 aes-gcm / chacha20，不带插件）。也可以粘贴 3x-ui / Xray 的出站 JSON，或整份 Xray 配置，会取出里面的 vless 和 shadowsocks 出站。名称取链接 # 后面的备注。</p>`;
+const EXT_HELP = `<p class="small muted" style="margin:0">一行一条：<b>vless://</b>（Reality、TLS 或明文 TCP，可带 xtls-rprx-vision；明文的话 UUID、目的地和内容在路上都看得见，尽量用 Reality 或 TLS）、<b>ss://</b>（SS-2022 或 aes-gcm / chacha20，不带插件）。也可以粘贴 3x-ui / Xray 的出站 JSON，或整份 Xray 配置，会取出里面的 vless 和 shadowsocks 出站。名称取链接 # 后面的备注。</p>`;
 
 function extImportDrawer(d) {
   return {
@@ -842,6 +933,12 @@ function settingsDrawer() {
       </div></section>
       <section class="sec"><h3>三网测速目标</h3><div class="fields">${targets}</div>
         <p class="small muted" style="margin:0">默认是上海三网（Zstatic 公开的 TCPing 节点，地址由对方自动更新）。换省份就把 sh 改成对应代号。节点每 30 秒对每个目标 TCP 连 10 次，算延迟、波动和重传。留空就不测。</p></section>
+      ${st.panel_acme_available ? `<section class="sec"><h3>面板证书</h3><div class="fields"><div class="field">向 Let's Encrypt 申请面板证书${sw('panel_acme', st.panel_acme, '自动申请面板证书')}</div></div>
+        <p class="small muted" style="margin:0">要先在下面填好 https:// 开头的面板域名。有 Cloudflare 令牌就用 DNS 验证，否则要能从外面访问本机 80 端口。证书沿用主控原来的密钥，节点不用重装，但要先把每个节点升级（agent update），全部升级后才会申请。${st.panel_cert ? (st.panel_cert.error ? `<br><b>${esc(st.panel_cert.error)}</b>` : (st.panel_cert.not_after ? `<br>已签发 ${esc(st.panel_cert.domain)}，${new Date(st.panel_cert.not_after * 1000).toISOString().slice(0, 10)} 到期，自动续期。` : '')) : ''}</p></section>` : ''}
+      <section class="sec"><h3>公开探针页</h3><div class="fields"><div class="field">在 / 显示节点状态（不用登录）${sw('public_page', st.public_page, '公开探针页')}</div></div>
+        <p class="small muted" style="margin:0">打开后任何人都能看到节点名字、在线状态和流量，也能由此认出这是 keel 面板。关着时 / 返回 404。</p></section>
+      <section class="sec"><h3>面板地址</h3><div class="fields">${field('节点和订阅用的地址', 'panel_url', st.panel_url || '', { full: true, placeholder: st.base_url })}</div>
+        <p class="small muted" style="margin:0">留空就用浏览器当前访问的地址。放在反向代理后面时请填 https:// 开头的地址，否则安装命令和订阅可能变成明文 http://。${(st.panel_url || st.base_url || '').startsWith('http://') ? '<b>现在是 http://，节点令牌和用户凭据会明文传输。</b>' : ''}</p></section>
       ${st.fingerprint ? `<section class="sec"><h3>主控证书指纹</h3><div class="mono small" style="word-break:break-all">${esc(st.fingerprint)}</div></section>` : ''}
       <section class="sec"><h3>证书自动申请</h3><div class="fields two">
         ${field('邮箱（证书到期提醒，可不填）', 'acme_email', st.acme_email || '')}
@@ -994,7 +1091,7 @@ const actions = {
     catch (e) { drawerError(e.message); }
   },
   async token(el) {
-    if (!confirm('换令牌后旧令牌立即失效，节点会断开，要用新命令重装一次。继续？')) return;
+    if (!confirm('换令牌后旧令牌立即失效，节点会断开，10 分钟后停止服务，要用新命令重装一次。继续？')) return;
     try { const r = await api('POST', `/api/nodes/${el.dataset.id}/token`); await refresh(); openDrawer({ kind: 'install', id: +el.dataset.id, install: r.install, rotated: true }); }
     catch (e) { drawerError(e.message); }
   },
@@ -1017,7 +1114,13 @@ const actions = {
     el.setAttribute('aria-pressed', on);
     const input = el.parentElement.querySelector(`input[name="${el.dataset.name}"]`);
     if (input) input.value = on ? 1 : 0;
+    // VLESS turned on for the first time (no client uses its SNI yet):
+    // borrow the site the entry reaches fastest, unless SNI was edited.
+    const n = on && el.dataset.name === 'vless_on' && S.drawer && S.drawer.kind === 'node' ? node(S.drawer.id) : null;
+    const sni = document.querySelector('#drawer-form [name="reality_sni"]');
+    if (n && !n.vless_on && fastestDest(n) && sni && sni.value.trim() === (n.reality_sni || '')) pickDest(fastestDest(n));
   },
+  'dest-pick'(el) { pickDest(el.dataset.v); },
   async 'save-node'(el) {
     const n = node(+el.dataset.id), f = form();
     const patch = { name: f.name.trim(), ipv4_only: f.ipv4_only === '1' };
@@ -1051,12 +1154,12 @@ const actions = {
         }
       }
       flash(`${patch.name || nm(n)} 已保存并热更新。`);
-      closeDrawer(); await refresh(); render();
+      closeDrawer(); await refresh({ draw: false }); render();
     } catch (e) { drawerError(e.message); }
   },
   async 'node-del'(el) {
     const n = node(+el.dataset.id);
-    if (!confirm(`删除 ${nm(n)}？节点会断开，用它的线路改回直连。`)) return;
+    if (!confirm(`删除 ${nm(n)}？节点会断开，10 分钟后停止服务（服务器上的程序要自己卸载），用它的线路改回直连。`)) return;
     closeDrawer();
     act(() => api('DELETE', `/api/nodes/${n.id}`), `已删除 ${nm(n)}。`);
   },
@@ -1068,7 +1171,7 @@ const actions = {
     const e = exit(+el.dataset.exit);
     if (!confirm(`删除出口「${e.name}」？走它的入口和分流会改回默认或直连。`)) return;
     if (isExternal(e)) closeDrawer();
-    try { await api('DELETE', `/api/exits/${e.id}`); await refresh(); renderDrawer(); render(); }
+    try { await api('DELETE', `/api/exits/${e.id}`); await refresh({ draw: false }); renderDrawer(); render(); }
     catch (err) { drawerError(err.message); }
   },
   'ext-import'() { openDrawer({ kind: 'ext-import' }); },
@@ -1089,7 +1192,7 @@ const actions = {
     try {
       await api('PATCH', `/api/exits/${e.id}`, { name: f.name, link: f.link });
       flash(`「${f.name || e.name}」已保存并热更新。`);
-      closeDrawer(); await refresh(); render();
+      closeDrawer(); await refresh({ draw: false }); render();
     } catch (err) { drawerError(err.message); }
   },
   user(el) { openDrawer({ kind: 'user', id: +el.dataset.id }); },
@@ -1110,18 +1213,18 @@ const actions = {
     try {
       if (id) await api('PATCH', `/api/users/${id}`, body); else await api('POST', '/api/users', body);
       flash(id ? `${f.name} 已保存。` : `已添加 ${f.name}。`);
-      closeDrawer(); await refresh(); render();
+      closeDrawer(); await refresh({ draw: false }); render();
     } catch (e) { drawerError(e.message); }
   },
   async 'user-reset'(el) {
     const u = S.data.users.find(x => x.id === +el.dataset.id);
     if (!confirm(`把 ${u.name} 本期流量清零？`)) return;
-    try { await api('POST', `/api/users/${u.id}/reset`); flash(`${u.name} 的流量已清零。`); await refresh(); renderDrawer(); render(); }
+    try { await api('POST', `/api/users/${u.id}/reset`); flash(`${u.name} 的流量已清零。`); await refresh({ draw: false }); renderDrawer(); render(); }
     catch (e) { drawerError(e.message); }
   },
   async 'user-toggle'(el) {
     const u = S.data.users.find(x => x.id === +el.dataset.id);
-    try { await api('PATCH', `/api/users/${u.id}`, { enabled: !u.enabled }); flash(`${u.name} 已${u.enabled ? '停用' : '启用'}。`); await refresh(); renderDrawer(); render(); }
+    try { await api('PATCH', `/api/users/${u.id}`, { enabled: !u.enabled }); flash(`${u.name} 已${u.enabled ? '停用' : '启用'}。`); await refresh({ draw: false }); renderDrawer(); render(); }
     catch (e) { drawerError(e.message); }
   },
   async 'user-del'(el) {
@@ -1130,8 +1233,13 @@ const actions = {
     closeDrawer();
     act(() => api('DELETE', `/api/users/${u.id}`), `已删除 ${u.name}。`);
   },
+  async 'users-per-entry'() {
+    const old = S.data.users.filter(u => !u.per_entry).length;
+    if (!confirm(`让 ${old} 个老用户在每个入口用不同的密码和 UUID？一个入口泄露的配置就开不了别的入口。切换后这些用户要刷新订阅（客户端一般 12 小时内自动刷新），刷新前连不上。继续？`)) return;
+    act(() => api('POST', '/api/users/per-entry'), '已切换，让用户刷新一下订阅。');
+  },
   async 'sub-rotate'(el) {
-    if (!confirm('重置后旧订阅链接立即失效，要把新链接重新发给这个用户。继续？')) return;
+    if (!confirm('重置后旧订阅链接和代理密码都立即失效，要把新链接重新发给这个用户，他的客户端要重新导入。继续？')) return;
     try { await api('POST', `/api/users/${el.dataset.id}/sub`); flash('订阅已重置，点复制订阅拿新链接。'); await refresh(); keepUserDraft(); renderDrawer(); }
     catch (e) { drawerError(e.message); }
   },
@@ -1142,10 +1250,13 @@ const actions = {
       probe_targets: st.probe_targets.map(t => ({ name: t.name, label: t.label, host: (f['probe_' + t.name] || '').trim() }))
     };
     body.acme_email = (f.acme_email || '').trim();
+    body.panel_url = (f.panel_url || '').trim();
+    body.public_page = f.public_page === '1';
+    if (st.panel_acme_available) body.panel_acme = f.panel_acme === '1';
     if (f.cf_token) body.cf_token = f.cf_token.trim();
     body.username = f.username.trim(); body.current_password = f.current_password;
     if (f.password) body.password = f.password;
-    try { await api('PATCH', '/api/settings', body); flash('设置已保存。'); closeDrawer(); await refresh(); render(); }
+    try { await api('PATCH', '/api/settings', body); flash('设置已保存。'); closeDrawer(); await refresh({ draw: false }); render(); }
     catch (e) { drawerError(e.message); }
   },
   async 'cf-clear'() {
@@ -1208,7 +1319,7 @@ document.addEventListener('submit', async e => {
     const pw = e.target.password.value, user = e.target.username.value;
     try {
       await api('POST', '/api/login', { username: user, password: pw });
-      S.loggedIn = true; await refresh(); render();
+      S.loggedIn = true; await refresh({ draw: false }); render();
     } catch (err) {
       const box = document.getElementById('login-err');
       if (box) box.textContent = err.message;
@@ -1224,9 +1335,17 @@ document.addEventListener('submit', async e => {
       S.loggedIn = s.logged_in;
     } catch (e) { S.loggedIn = false; }
   }
-  if (S.loggedIn || !ADMIN) await refresh();
+  if (S.loggedIn || !ADMIN) await refresh({ draw: false });
   render();
-  // No polling while the tab is in the background.
-  setInterval(() => { if ((S.loggedIn || !ADMIN) && !document.hidden) refresh(); }, ADMIN ? 2000 : 3000);
-  document.addEventListener('visibilitychange', () => { if (!document.hidden && (S.loggedIn || !ADMIN)) refresh(); });
+  // No polling while the tab is in the background. The next poll waits at
+  // least twice as long as the last answer took, so a slow master is asked
+  // less often instead of piling requests up.
+  const every = ADMIN ? 2000 : 3000;
+  const poll = async () => {
+    const start = Date.now();
+    if ((S.loggedIn || !ADMIN) && !document.hidden) await refresh({ poll: true });
+    setTimeout(poll, Math.max(every, 2 * (Date.now() - start)));
+  };
+  setTimeout(poll, every);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden && (S.loggedIn || !ADMIN)) refresh({ poll: true }); });
 })();

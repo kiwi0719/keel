@@ -1,0 +1,18 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/sagernet/sing-shadowsocks/shadowaead_2022
+cpu: Apple M4
+BenchmarkTCPHandshakeServer/users=1/firstWrite=false-10         	  100000	     13477 ns/op	   76221 B/op	      23 allocs/op
+BenchmarkTCPHandshakeServer/users=1/firstWrite=true-10          	  100000	     25723 ns/op	  151515 B/op	      34 allocs/op
+BenchmarkTCPHandshakeServer/users=1000/firstWrite=false-10      	  100000	     14308 ns/op	   76219 B/op	      23 allocs/op
+BenchmarkTCPHandshakeServer/users=1000/firstWrite=true-10       	  100000	     25600 ns/op	  151510 B/op	      34 allocs/op
+BenchmarkTCPHandshakeServer/users=100000/firstWrite=false-10    	  100000	     18357 ns/op	   76207 B/op	      23 allocs/op
+BenchmarkTCPHandshakeServer/users=100000/firstWrite=true-10     	  100000	     25436 ns/op	  151488 B/op	      34 allocs/op
+BenchmarkUDPServerInbound/users=1/1200B-10                      	  100000	      2057 ns/op	     237 B/op	      10 allocs/op
+BenchmarkUDPServerInbound/users=1000/1200B-10                   	  100000	      2175 ns/op	     203 B/op	      10 allocs/op
+BenchmarkUDPServerOutbound-10                                   	  100000	      1007 ns/op	     216 B/op	       9 allocs/op
+--- BENCH: BenchmarkUDPServerOutbound-10
+    perf_test.go:406: server reply headroom front=1194 rear=16
+    perf_test.go:406: server reply headroom front=1194 rear=16
+PASS
+ok  	github.com/sagernet/sing-shadowsocks/shadowaead_2022	23.518s

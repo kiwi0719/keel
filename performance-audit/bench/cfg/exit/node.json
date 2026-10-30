@@ -1,0 +1,3 @@
+{"route": {"allow_private": true},
+ "inbounds": [{"type": "ss2022", "listen": "127.0.0.1:20101", "method": "2022-blake3-aes-128-gcm", "password": "aMACsktAq3rW3WoYP8aPbA=="}],
+ "users": [{"name": "n1x1", "ss_key": "P9jV5FlpdIv3IRqhtEhI5A=="}]}

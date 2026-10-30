@@ -18,6 +18,10 @@ import (
 	"github.com/sagernet/sing/common/logger"
 )
 
+// MaxStreams caps the open streams of one session; a client past it is
+// cut off, so one user cannot pile up goroutines without limit.
+var MaxStreams = 1024
+
 type Session struct {
 	conn     net.Conn
 	connLock sync.Mutex
@@ -25,6 +29,9 @@ type Session struct {
 	streams    map[uint32]*Stream
 	streamId   atomic.Uint32
 	streamLock sync.RWMutex
+
+	queued atomic.Int64  // unread data of its streams (see StreamBuffer)
+	space  chan struct{} // a reader of one of its streams took data
 
 	dieOnce sync.Once
 	die     chan struct{}
@@ -39,7 +46,7 @@ type Session struct {
 	padding   *atomic.TypedValue[*padding.PaddingFactory]
 	logger    logger.Logger
 
-	peerVersion byte
+	peerVersion atomic.Uint32 // set by the receive loop, read by OpenStream on other goroutines
 
 	// client
 	isClient    bool
@@ -61,6 +68,7 @@ func NewClientSession(conn net.Conn, _padding *atomic.TypedValue[*padding.Paddin
 		logger:      logger,
 	}
 	s.die = make(chan struct{})
+	s.space = make(chan struct{}, 1)
 	s.streams = make(map[uint32]*Stream)
 	return s
 }
@@ -73,6 +81,7 @@ func NewServerSession(conn net.Conn, onNewStream func(stream *Stream), _padding 
 		logger:      logger,
 	}
 	s.die = make(chan struct{})
+	s.space = make(chan struct{}, 1)
 	s.streams = make(map[uint32]*Stream)
 	return s
 }
@@ -138,7 +147,7 @@ func (s *Session) OpenStream() (*Stream, error) {
 	sid := s.streamId.Add(1)
 	stream := newStream(sid, s)
 
-	if sid >= 2 && s.peerVersion >= 2 {
+	if sid >= 2 && s.peerVersion.Load() >= 2 {
 		s.synDoneLock.Lock()
 		if s.synDone != nil {
 			s.synDone()
@@ -187,18 +196,19 @@ func (s *Session) recvLoop() error {
 			switch hdr.Cmd() {
 			case cmdPSH:
 				if hdr.Length() > 0 {
-					buffer := buf.Get(int(hdr.Length()))
-					if _, err := io.ReadFull(s.conn, buffer); err == nil {
-						s.streamLock.RLock()
-						stream, ok := s.streams[sid]
-						s.streamLock.RUnlock()
-						if ok {
-							stream.pipeW.Write(buffer)
-						}
-						buf.Put(buffer)
-					} else {
-						buf.Put(buffer)
+					// The stream's reader gets this buffer itself.
+					buffer := buf.NewSize(int(hdr.Length()))
+					if _, err := buffer.ReadFullFrom(s.conn, int(hdr.Length())); err != nil {
+						buffer.Release()
 						return err
+					}
+					s.streamLock.RLock()
+					stream, ok := s.streams[sid]
+					s.streamLock.RUnlock()
+					if ok {
+						stream.push(buffer)
+					} else {
+						buffer.Release()
 					}
 				}
 			case cmdSYN: // should be server only
@@ -209,6 +219,13 @@ func (s *Session) recvLoop() error {
 					return nil
 				}
 				s.streamLock.Lock()
+				if len(s.streams) >= MaxStreams {
+					s.streamLock.Unlock()
+					f := newFrame(cmdAlert, 0)
+					f.data = []byte("too many streams")
+					s.writeControlFrame(f)
+					return nil
+				}
 				if _, ok := s.streams[sid]; !ok {
 					stream := newStream(sid, s)
 					s.streams[sid] = stream
@@ -282,7 +299,7 @@ func (s *Session) recvLoop() error {
 						}
 						// check client's version
 						if v, err := strconv.Atoi(m["v"]); err == nil && v >= 2 {
-							s.peerVersion = byte(v)
+							s.peerVersion.Store(uint32(v))
 							// send cmdServerSettings
 							f := newFrame(cmdServerSettings, 0)
 							f.data = util.StringMap{
@@ -343,7 +360,7 @@ func (s *Session) recvLoop() error {
 						// check server's version
 						m := util.StringMapFromBytes(buffer)
 						if v, err := strconv.Atoi(m["v"]); err == nil {
-							s.peerVersion = byte(v)
+							s.peerVersion.Store(uint32(v))
 						}
 					}
 					buf.Put(buffer)
@@ -368,21 +385,29 @@ func (s *Session) streamClosed(sid uint32) error {
 	return err
 }
 
+// writeDataFrame sends data in frames of at most maxFrameData bytes: the
+// length field has 16 bits, and a longer write used to be cut to them.
 func (s *Session) writeDataFrame(sid uint32, data []byte) (int, error) {
-	dataLen := len(data)
-
-	buffer := buf.NewSize(dataLen + headerOverHeadSize)
-	buffer.WriteByte(cmdPSH)
-	binary.BigEndian.PutUint32(buffer.Extend(4), sid)
-	binary.BigEndian.PutUint16(buffer.Extend(2), uint16(dataLen))
-	buffer.Write(data)
-	_, err := s.writeConn(buffer.Bytes())
-	buffer.Release()
-	if err != nil {
-		return 0, err
+	var n int
+	for first := true; first || len(data) > 0; first = false {
+		chunk := data
+		if len(chunk) > maxFrameData {
+			chunk = chunk[:maxFrameData]
+		}
+		buffer := buf.NewSize(len(chunk) + headerOverHeadSize)
+		buffer.WriteByte(cmdPSH)
+		binary.BigEndian.PutUint32(buffer.Extend(4), sid)
+		binary.BigEndian.PutUint16(buffer.Extend(2), uint16(len(chunk)))
+		buffer.Write(chunk)
+		_, err := s.writeConn(buffer.Bytes())
+		buffer.Release()
+		if err != nil {
+			return n, err
+		}
+		n += len(chunk)
+		data = data[len(chunk):]
 	}
-
-	return dataLen, nil
+	return n, nil
 }
 
 func (s *Session) writeControlFrame(frame frame) (int, error) {

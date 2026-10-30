@@ -1,0 +1,21 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/anytls/sing-anytls/session
+cpu: Apple M4
+BenchmarkStreamWrite/1KiB-10             	13530439	        95.38 ns/op	10735.57 MB/s	      64 B/op	       1 allocs/op
+BenchmarkStreamWrite/16KiB-10            	 2916868	       437.4 ns/op	37460.06 MB/s	      64 B/op	       1 allocs/op
+BenchmarkStreamWrite/32KiB-10            	 1735302	       699.2 ns/op	46862.01 MB/s	      64 B/op	       1 allocs/op
+BenchmarkStreamWrite/65535B-10           	  906632	      1218 ns/op	53817.44 MB/s	      64 B/op	       1 allocs/op
+BenchmarkStreamWriteBufferHeadroom/1KiB-10         	27191898	        42.31 ns/op	24204.54 MB/s	      64 B/op	       1 allocs/op
+BenchmarkStreamWriteBufferHeadroom/16KiB-10        	30587665	        38.80 ns/op	422228.35 MB/s	      64 B/op	       1 allocs/op
+BenchmarkStreamWriteBufferHeadroom/32KiB-10        	31265401	        50.94 ns/op	643323.28 MB/s	      64 B/op	       1 allocs/op
+BenchmarkStreamWriteBufferHeadroom/65535B-10       	27925728	        47.71 ns/op	1373613.36 MB/s	      64 B/op	       1 allocs/op
+BenchmarkCopyLoopWriteToStream-10                  	 2020843	       620.7 ns/op	52795.54 MB/s	     128 B/op	       2 allocs/op
+BenchmarkRecvLoopToStream/1KiB-10                  	 1925678	       683.3 ns/op	1498.68 MB/s	       0 B/op	       0 allocs/op
+BenchmarkRecvLoopToStream/16KiB-10                 	 1000000	      1224 ns/op	13381.49 MB/s	       0 B/op	       0 allocs/op
+BenchmarkPipeHandoff/1KiB-10                       	 2169868	       556.8 ns/op	1839.24 MB/s	       0 B/op	       0 allocs/op
+BenchmarkPipeHandoff/16KiB-10                      	 1000000	      1088 ns/op	15057.88 MB/s	       0 B/op	       0 allocs/op
+BenchmarkChanHandoffBuffered/1KiB-10               	 7654209	       139.2 ns/op	7358.82 MB/s	      64 B/op	       1 allocs/op
+BenchmarkChanHandoffBuffered/16KiB-10              	 8422350	       126.3 ns/op	129741.96 MB/s	      64 B/op	       1 allocs/op
+PASS
+ok  	github.com/anytls/sing-anytls/session	22.124s

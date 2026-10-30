@@ -1,0 +1,2 @@
+nodes=2 elapsed=90.0s first_config: n=2 min=0.007s median=0.013s max=0.018s
+configs_received=4 bytes=0.21MB size_min=56053 size_max=56084 reports_sent=36 report_bytes=0.71MB errors=0

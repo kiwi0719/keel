@@ -21,16 +21,25 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(15);
 const PING_INTERVAL: Duration = Duration::from_secs(20);
 /// A node that sent nothing for this long is treated as gone.
 const IDLE_LIMIT: i64 = 60;
+/// Messages queued for one node; a full queue disconnects it.
+const QUEUE: usize = 16;
+/// A node must take a message within this, or it is disconnected.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The client's address. Behind -no-tls it is the last X-Forwarded-For
+/// entry, the one the reverse proxy appended; earlier entries come from the
+/// client and can say anything.
 pub fn client_ip(app: &App, headers: &HeaderMap, peer: SocketAddr) -> String {
     if app.trust_proxy {
-        if let Some(v) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-            if let Some(first) = v.split(',').next() {
-                let ip = first.trim();
-                if !ip.is_empty() {
-                    return ip.to_string();
-                }
-            }
+        let last = headers
+            .get_all("x-forwarded-for")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .last()
+            .and_then(|ip| ip.trim().parse::<std::net::IpAddr>().ok());
+        if let Some(ip) = last {
+            return ip.to_canonical().to_string();
         }
     }
     peer.ip().to_canonical().to_string()
@@ -49,16 +58,23 @@ pub async fn handler(
         .unwrap_or("")
         .trim()
         .to_string();
-    let node = if token.is_empty() { None } else { db::node_by_token(&app.db(), &token).ok().flatten() };
+    let node = if token.is_empty() {
+        None
+    } else {
+        let app = app.clone();
+        tokio::task::spawn_blocking(move || db::node_by_token(&app.reader(), &token).ok().flatten()).await.ok().flatten()
+    };
     let Some(node) = node else {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        return (StatusCode::UNAUTHORIZED, "bad token").into_response();
+        // Close it: a rejected node would otherwise keep the socket alive.
+        return (StatusCode::UNAUTHORIZED, [(axum::http::header::CONNECTION, "close")], "bad token").into_response();
     };
     let ip = client_ip(&app, &headers, peer);
-    ws.max_message_size(4 << 20).on_upgrade(move |socket| serve(app, node.id, ip, socket))
+    let token = node.token.clone();
+    ws.max_message_size(4 << 20).max_frame_size(4 << 20).on_upgrade(move |socket| serve(app, node.id, token, ip, socket))
 }
 
-async fn serve(app: Arc<App>, node_id: i64, ip: String, socket: WebSocket) {
+async fn serve(app: Arc<App>, node_id: i64, token: String, ip: String, socket: WebSocket) {
     let (mut sink, mut stream) = socket.split();
 
     let hello = match tokio::time::timeout(HELLO_TIMEOUT, stream.next()).await {
@@ -68,54 +84,123 @@ async fn serve(app: Arc<App>, node_id: i64, ip: String, socket: WebSocket) {
         },
         _ => return,
     };
-    eprintln!("node {node_id} connected from {ip} (keel-node {}, config rev {})", hello.node_version, hello.config_rev);
+    // Node-supplied text is quoted, so it cannot forge log lines.
+    let version: String = hello.node_version.chars().take(64).collect();
+    eprintln!("node {node_id} connected from {ip} (keel-node {version:?}, config rev {})", hello.config_rev);
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-    let conn_id = {
-        let mut live = app.live();
-        live.next_conn += 1;
-        let id = live.next_conn;
-        let l = live.nodes.entry(node_id).or_default();
-        if let Some(old) = l.conn.replace(Conn { id, tx: tx.clone() }) {
-            let _ = old.tx.send(Message::Close(None));
-        }
-        l.connected_at = now();
-        l.last_seen = now();
-        id
+    let (tx, mut rx) = mpsc::channel::<Message>(QUEUE);
+    let stop = Arc::new(tokio::sync::Notify::new());
+    // Database work runs on the blocking pool, here and for every message.
+    let registered = {
+        let (app, tx, stop) = (app.clone(), tx.clone(), stop.clone());
+        tokio::task::spawn_blocking(move || {
+            let conn_id = {
+                // The token was checked before the upgrade; check it again,
+                // holding the database lock, so a rotation or deletion that
+                // happened since (or happens now) cannot miss this connection.
+                let db = app.db();
+                let current = db::node_by_token(&db, &token).ok().flatten().is_some_and(|n| n.id == node_id);
+                if !current {
+                    return None;
+                }
+                let mut live = app.live();
+                live.next_conn += 1;
+                let id = live.next_conn;
+                let l = live.nodes.entry(node_id).or_default();
+                if let Some(old) = l.conn.replace(Conn { id, tx, stop }) {
+                    old.stop.notify_one();
+                }
+                l.connected_at = now();
+                l.last_seen = now();
+                id
+            };
+            Some((conn_id, app.on_hello(node_id, hello, &ip)))
+        })
+        .await
+        .ok()
+        .flatten()
     };
-    app.on_hello(node_id, hello, &ip);
-    crate::dns::spawn_sync(app.clone());
+    let Some((conn_id, moved)) = registered else { return };
+    // Cloudflare is only called when the node's address actually changed:
+    // reconnecting in a loop must not make the master hammer the API.
+    if moved {
+        crate::dns::spawn_sync(app.clone());
+    }
 
-    let writer = tokio::spawn(async move {
+    let mut writer = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             let close = matches!(msg, Message::Close(_));
-            if sink.send(msg).await.is_err() || close {
+            if !matches!(tokio::time::timeout(WRITE_TIMEOUT, sink.send(msg)).await, Ok(Ok(()))) || close {
                 break;
             }
         }
-        let _ = sink.close().await;
+        let _ = tokio::time::timeout(WRITE_TIMEOUT, sink.close()).await;
     });
 
-    app.sync();
+    app.sync_node(node_id);
 
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.tick().await;
     let mut last = now();
     loop {
         tokio::select! {
+            _ = stop.notified() => break,
             msg = stream.next() => {
                 let Some(Ok(msg)) = msg else { break };
                 last = now();
                 match msg {
                     Message::Text(text) => {
                         let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
-                        match v["type"].as_str() {
-                            Some("report") => {
-                                if let Ok(r) = serde_json::from_value::<Report>(v) {
-                                    app.on_report(node_id, r);
+                        let kind = v["type"].as_str().unwrap_or("").to_owned();
+                        match kind.as_str() {
+                            "report" => {
+                                // Only the node's current connection may report.
+                                let current = app.live().nodes.get(&node_id).and_then(|l| l.conn.as_ref()).is_some_and(|c| c.id == conn_id);
+                                if !current {
+                                    break;
                                 }
+                                // Awaited, so reports are stored in order and a
+                                // node cannot queue up work.
+                                let app = app.clone();
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    // A malformed system/probe/health section must not
+                                    // drop the usage counters in the same report.
+                                    let parsed = serde_json::from_value::<Report>(v).or_else(|_| {
+                                        let mut v: Value = serde_json::from_str(&text).unwrap_or_default();
+                                        if let Some(o) = v.as_object_mut() {
+                                            for k in ["system", "probes", "outbounds", "certs", "dest_probes"] {
+                                                o.remove(k);
+                                            }
+                                        }
+                                        serde_json::from_value::<Report>(v)
+                                    });
+                                    if let Ok(r) = parsed {
+                                        app.on_report(node_id, r);
+                                    }
+                                })
+                                .await;
                             }
-                            Some("applied") => app.on_applied(node_id, &v),
+                            "applied" => {
+                                let app = app.clone();
+                                let _ = tokio::task::spawn_blocking(move || app.on_applied(node_id, &v)).await;
+                            }
+                            "acme_dns" => {
+                                let app = app.clone();
+                                tokio::spawn(async move {
+                                    let res = crate::dns::acme_challenge(
+                                        &app,
+                                        node_id,
+                                        v["op"].as_str().unwrap_or(""),
+                                        v["domain"].as_str().unwrap_or(""),
+                                        v["value"].as_str().unwrap_or(""),
+                                    )
+                                    .await;
+                                    let reply = serde_json::json!({"type": "acme_dns_done", "id": v["id"].as_i64().unwrap_or(0), "error": res.err().unwrap_or_default()});
+                                    if let Some(c) = app.live().nodes.get(&node_id).and_then(|l| l.conn.as_ref()) {
+                                        c.send(Message::Text(reply.to_string().into()));
+                                    }
+                                });
+                            }
                             _ => {}
                         }
                     }
@@ -127,7 +212,7 @@ async fn serve(app: Arc<App>, node_id: i64, ip: String, socket: WebSocket) {
                 if now() - last > IDLE_LIMIT {
                     break;
                 }
-                if tx.send(Message::Text(r#"{"type":"ping"}"#.into())).is_err() {
+                if tx.try_send(Message::Text(r#"{"type":"ping"}"#.into())).is_err() {
                     break;
                 }
             }
@@ -144,8 +229,11 @@ async fn serve(app: Arc<App>, node_id: i64, ip: String, socket: WebSocket) {
             }
         }
     }
-    let _ = tx.send(Message::Close(None));
+    let _ = tx.try_send(Message::Close(None));
     drop(tx);
-    let _ = writer.await;
+    // A writer stuck on a node that does not read is not waited for.
+    if tokio::time::timeout(WRITE_TIMEOUT, &mut writer).await.is_err() {
+        writer.abort();
+    }
     eprintln!("node {node_id} disconnected");
 }

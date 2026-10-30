@@ -10,7 +10,13 @@ pub fn random_bytes(n: usize) -> Vec<u8> {
 }
 
 pub fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        s.push(DIGITS[usize::from(b >> 4)] as char);
+        s.push(DIGITS[usize::from(b & 0xf)] as char);
+    }
+    s
 }
 
 pub fn random_hex(n: usize) -> String {
@@ -56,8 +62,15 @@ pub fn reality_keypair() -> (String, String) {
 
 /// The SS 2022 user key an entry uses on one exit port. Derived from the
 /// master secret so nothing has to be stored per pair.
-pub fn exit_key(secret: &str, entry: i64, exit: i64) -> String {
-    let d = sha256(format!("keel exit key\0{secret}\0{entry}\0{exit}").as_bytes());
+/// The key entry uses on exit port exit. salt is the entry's key_salt (empty
+/// until its token is first rotated, which keeps older keys valid).
+pub fn exit_key(secret: &str, salt: &str, entry: i64, exit: i64) -> String {
+    let mut input = format!("keel exit key\0{secret}\0{entry}\0{exit}");
+    if !salt.is_empty() {
+        input.push('\0');
+        input.push_str(salt);
+    }
+    let d = sha256(input.as_bytes());
     STANDARD.encode(&d[..16])
 }
 
@@ -71,4 +84,15 @@ pub fn percent_encode(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_matches_format() {
+        let all: Vec<u8> = (0..=255).collect();
+        assert_eq!(hex(&all), all.iter().map(|b| format!("{b:02x}")).collect::<String>());
+    }
 }

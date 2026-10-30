@@ -5,10 +5,12 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -75,7 +77,7 @@ func sendJSON(t *testing.T, conn *websocket.Conn, v any) {
 // startNode runs a node with no inbounds plus the part of main's loop that
 // applies master configs.
 func startNode(t *testing.T, m *fakeMaster, pin []byte, configPath string) (*node, context.CancelFunc) {
-	n := &node{users: newRegistry(""), running: make(map[string]*runningInbound), prober: newProber()}
+	n := &node{users: newRegistry(""), running: make(map[string]*runningInbound), prober: newProber(), destProber: newProber()}
 	n.handler = &handler{users: n.users}
 	if err := n.reload(&Config{}); err != nil {
 		t.Fatal(err)
@@ -283,5 +285,104 @@ func TestAnyTLSCert(t *testing.T) {
 	certDir = ""
 	if _, err = anytlsCert(InboundConfig{}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRevokedTokenStopsServing(t *testing.T) {
+	revokeAfter = 0
+	t.Cleanup(func() { revokeAfter = 10 * time.Minute })
+	master := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "bad token", http.StatusUnauthorized)
+	}))
+	defer master.Close()
+
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "node.json")
+	if err := os.WriteFile(configPath, []byte(`{"users":[{"name":"u1","anytls_password":"x"}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	n := &node{users: newRegistry(""), running: make(map[string]*runningInbound), prober: newProber(), destProber: newProber()}
+	n.handler = &handler{users: n.users}
+	if err := n.reload(&Config{Users: []UserConfig{{Name: "u1", AnyTLSPassword: "x"}}}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	configs := make(chan masterConfig)
+	wsURL, _ := masterWebSocketURL(master.URL)
+	go (&masterClient{url: wsURL, token: "old", node: n, configs: configs}).run(ctx)
+	select {
+	case mc := <-configs:
+		if !mc.revoke {
+			t.Fatal("got a config, want a revocation")
+		}
+		n.revoke(configPath)
+		mc.result <- nil
+	case <-ctx.Done():
+		t.Fatal("no revocation after repeated 401s")
+	}
+	if len(n.users.active()) != 0 {
+		t.Error("users still active after revocation")
+	}
+	if _, err := os.Stat(configPath); !os.IsNotExist(err) {
+		t.Error("cached config kept after revocation")
+	}
+}
+
+func TestMasterPinBySPKI(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer server.Close()
+	leaf := server.Certificate()
+	spki := sha256.Sum256(leaf.RawSubjectPublicKeyInfo)
+	whole := sha256.Sum256(leaf.Raw)
+	wrong := sha256.Sum256([]byte("other"))
+	try := func(pin []byte, pushed string) error {
+		n := &node{}
+		n.config.Store(&Config{MasterSPKI: pushed})
+		c := &masterClient{pin: pin, node: n}
+		client := &http.Client{Transport: &http.Transport{TLSClientConfig: c.tlsConfig()}}
+		resp, err := client.Get(server.URL)
+		if err == nil {
+			resp.Body.Close()
+		}
+		return err
+	}
+	if err := try(whole[:], ""); err != nil {
+		t.Errorf("certificate pin: %v", err)
+	}
+	if err := try(spki[:], ""); err != nil {
+		t.Errorf("public key pin: %v", err)
+	}
+	if err := try(wrong[:], hex.EncodeToString(spki[:])); err != nil {
+		t.Errorf("pushed public key: %v", err)
+	}
+	if err := try(wrong[:], ""); err == nil {
+		t.Error("a wrong pin was accepted")
+	}
+}
+
+func TestReportUsersOnlyChangedWhenDelta(t *testing.T) {
+	n := &node{users: newRegistry("")}
+	n.users.apply([]UserConfig{{Name: "a", Period: "p"}, {Name: "b", Period: "p"}})
+	m := &masterClient{node: n}
+	now := time.Now()
+	if users, full := m.reportUsers(now); !full || len(users) != 2 {
+		t.Fatalf("without report_delta: full=%v users=%d", full, len(users))
+	}
+	m.delta.Store(true)
+	m.sent = nil // a new connection
+	if users, full := m.reportUsers(now); !full || len(users) != 2 {
+		t.Fatalf("first report on a connection: full=%v users=%d", full, len(users))
+	}
+	if users, full := m.reportUsers(now.Add(5 * time.Second)); full || len(users) != 0 {
+		t.Fatalf("nothing changed: full=%v users=%d", full, len(users))
+	}
+	n.users.lookup("b").down.Add(10)
+	users, full := m.reportUsers(now.Add(10 * time.Second))
+	if full || len(users) != 1 || users[0].Name != "b" || users[0].Down != 10 {
+		t.Fatalf("one user changed: full=%v %+v", full, users)
+	}
+	if users, full := m.reportUsers(now.Add(fullReportInterval + time.Second)); !full || len(users) != 2 {
+		t.Fatalf("after fullReportInterval: full=%v users=%d", full, len(users))
 	}
 }

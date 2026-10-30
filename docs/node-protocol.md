@@ -11,15 +11,15 @@ keel-node -master https://panel.example:8443 -token <节点令牌> \
 ```
 
 - `-token` 也可以用环境变量 `KEEL_TOKEN` 给，免得出现在 `ps` 里。
-- `-master` 只写到端口时，地址是 `wss://host:port/api/node/ws`；写了路径就用那个路径。`http://` 对应 `ws://`，只建议本机调试用。
-- 请求头 `Authorization: Bearer <token>`。令牌不对主控直接回 401，节点会按退避重连。
+- `-master` 只写到端口时，地址是 `wss://host:port/api/node/ws`；写了路径就用那个路径。`http://` 对应 `ws://`，只允许主控在本机（回环地址）时使用。
+- 请求头 `Authorization: Bearer <token>`。令牌不对主控直接回 401，节点会按退避重连；连续被拒 10 分钟（令牌换了或节点被删了），节点停止所有入站、清掉用户和缓存配置，要用新令牌重装才能恢复。
 - `-fingerprint`：主控证书（叶子证书 DER）的 SHA-256，十六进制，大小写和冒号都无所谓。给了它就只认这个指纹，不再做 CA 校验，所以主控可以用自签证书；不给就按系统 CA 正常校验。生成方法：`openssl x509 -in cert.pem -outform der | sha256sum`。
 - `-c` 是主控下发配置的缓存。有 `-master` 时文件不存在也能启动（空配置，等主控下发）。缓存文件被手动改了照样会自动重新加载，但主控下次下发会覆盖它。
 - 节点不走 `HTTP(S)_PROXY` 环境变量。
 
 ## 消息
 
-全部是 WebSocket 文本帧，每帧一个 JSON 对象，用 `type` 区分。单帧最大 16 MiB。节点每 30 秒发一次 WebSocket ping，主控的 WebSocket 库正常回 pong 就行。
+全部是 WebSocket 文本帧，每帧一个 JSON 对象，用 `type` 区分。主控发给节点的单帧最大 16 MiB，节点发给主控的最大 4 MiB。节点每 30 秒发一次 WebSocket ping，主控的 WebSocket 库正常回 pong 就行。
 
 ### 节点 → 主控：`hello`
 
@@ -27,21 +27,34 @@ keel-node -master https://panel.example:8443 -token <节点令牌> \
 
 ```json
 {"type":"hello","node_version":"v0.3.0","protocols":["anytls","vless","ss2022"],
- "hostname":"jp-1","os":"linux","arch":"amd64","config_rev":12}
+ "hostname":"jp-1","os":"linux","arch":"amd64","config_rev":12,"features":["spki_pin","usage_msg"]}
 ```
 
 - `protocols`：这个二进制编进了哪些协议。主控别给节点下发它没有的协议，否则整份配置会被拒。
 - `config_rev`：节点当前在用的配置版本，没有配置时是 0。和主控的最新版本不一样就下发一次。
+- `features`：节点支持的可选功能，主控只对声明了的节点用。`spki_pin`：接受配置里的 `master_spki`；`usage_msg`：接受 `usage` 消息。老节点没有这个字段，按都不支持处理。
 
 ### 主控 → 节点：`config`
 
 ```json
-{"type":"config","rev":13,"config":{ ...完整的节点配置... }}
+{"type":"config","rev":13,"report_delta":true,"config":{ ...完整的节点配置... }}
 ```
 
 - `config` 是完整配置，格式和 [examples/entry.json](../examples/entry.json)、[examples/exit.json](../examples/exit.json) 一样，不支持增量。节点会和当前配置比较，只动有变化的部分：设置没变的监听不重启，用户表原子替换，已有连接不断（删掉的用户除外）。
 - `rev` 必须是正数且单调递增。节点以消息里的 `rev` 为准（覆盖 `config.rev`），并把它写进缓存，重启后 `hello` 里报的还是它。
 - 主控下发时字段宽松解析：不认识的字段会被忽略，方便主控先加字段、节点后升级。本地手写的配置文件则严格解析，拼错字段名会报错。
+- `report_delta`：主控接受只列变化用户的 `report`（见 `report` 的 `full`）。`config` 和 `usage` 都带它，只对当前这条连接有效：节点每次重连后先按完整上报，收到带它的消息才开始发增量。
+
+### 主控 → 节点：`usage`
+
+```json
+{"type":"usage","rev":13,"report_delta":true,"users":{"u7":[5368709120,123456],"u9":[0,0]}}
+```
+
+- 只发给 `hello` 里声明了 `usage_msg` 的节点。一份配置和上次发给这条连接的相比只有 `used_base` / `used_self` 变了时，主控不再整份重推，只发数字变了的用户：`[used_base, used_self]`，含义和配置里的同名字段一样（配置里没有就是 0）。
+- 只对 `rev` 那一版配置生效，节点当前在用的不是这一版就丢掉。配置里没有的用户忽略；`used_self` 照旧只会把计数往上抬。节点不回 `applied`。
+- 每次连上后，主控先把所有用户的数字发一遍（它不知道节点手里是哪一份），之后只发变化。
+- 节点把收到的 `used_base` 记进用量文件。重启后缓存的如果还是这一版配置，就用记下的数字，主控连不上时也按最新的用量卡额度；收到主控的新配置后清掉。
 
 ### 节点 → 主控：`applied`
 
@@ -62,7 +75,7 @@ keel-node -master https://panel.example:8443 -token <节点令牌> \
 每 5 秒一帧。
 
 ```json
-{"type":"report","ts":1761100000,"config_rev":13,
+{"type":"report","ts":1761100000,"config_rev":13,"full":true,
  "users":[{"name":"u7","period":"2026-10","up":123456,"down":9876543,"conns":3,"blocked":false}],
  "system":{"cpu_pct":3.2,"load1":0.08,"mem_total":1003520000,"mem_used":312000000,
            "swap_total":0,"swap_used":0,"disk_total":20000000000,"disk_used":4100000000,
@@ -73,7 +86,9 @@ keel-node -master https://panel.example:8443 -token <节点令牌> \
            {"name":"cm","host":"203.0.113.3:80","latency_ms":61.4,"jitter_ms":8.9,"loss_pct":0,"samples":10,"at":1761099990}]}
 ```
 
-`users`（配置里的每个用户一条）：
+`users`（完整的帧里，配置里的每个用户一条）：
+
+- `full`：`true` 表示这一帧列了配置里的每个用户，没列出的用户主控当作没有连接；`false` 表示只列了自上一帧以来 `up`、`down`、`conns`、`blocked` 或 `period` 有变化的用户，主控按用户合并。节点只在配置带了 `report_delta` 时才发 `false`，而且每次连上后的第一帧和之后每 5 分钟发一帧完整的。老节点不带这个字段，按 `true` 处理。
 
 - `up` / `down` 是这个用户在**这个节点**、**这个 `period`** 里的累计字节数（绝对值，不是增量），重启后接着算。主控每次直接用最新值覆盖，不用自己累加，丢几帧也不会少算。
 - `period` 是用户配置里的 `period` 原样带回。主控改了 `period`（比如每月 1 号换成 `2026-11`），节点上这个用户的计数归零重新开始；主控看到新 `period` 的数据才算换月成功。
@@ -84,6 +99,7 @@ keel-node -master https://panel.example:8443 -token <节点令牌> \
 
 - `net_rx` / `net_tx` 是开机以来除 `lo` 外所有网卡的累计字节；`rx_rate` / `tx_rate` 是和上一帧相比的每秒字节数。
 - `rss` 是 keel-node 自己的内存。
+- `tcp_conns` / `udp_conns`：整机正在使用的 TCP / UDP socket 数（IPv4 加 IPv6），取自 `/proc/net/sockstat{,6}` 的 `inuse`，不含 TIME_WAIT。
 - `tcp_retrans_pct`：和上一帧相比，整机重传的 TCP 段占发出段的百分比（来自 `/proc/net/snmp`）。
 - 非 Linux 系统上大部分字段是 0。
 
@@ -107,6 +123,8 @@ keel-node -master https://panel.example:8443 -token <节点令牌> \
 
 - `issuer`：`acme` 表示已经在用 CA 签的证书，`self-signed` 表示还没申请下来、在用自签证书。
 - `error` / `next_try`：最近一次申请失败的原因和下次重试时间，成功后清空。
+
+`dest_probes`（Reality 伪装站候选的延迟，入口节点才有）：格式和 `probes` 一样，`name` 和 `host` 都是候选的 `host:端口`。一轮测完后的第一帧带上，每次重连后再带一次（一轮相隔 10 分钟）。主控最多留 16 个，只给面板看，不进公开页。
 
 `probes`（三网 TCPing）：
 
@@ -132,8 +150,10 @@ keel-node -master https://panel.example:8443 -token <节点令牌> \
 
 - `probes`：探测目标，`host` 必须是 `IP:端口` 或 `域名:端口`，TCP 可达。不给就不测。`route.ipv4_only` 打开时域名只解析 IPv4。
 - `probe_interval`：两轮之间的间隔，默认 `30s`，最小 `5s`。
-- `quota_bytes`：0 表示不限。判断条件是 `used_base + up + down >= quota_bytes`，每秒检查一次，超了就断开这个用户所有连接并拒绝新连接（所以会多跑约 1 秒的流量）。
-- `used_base`：这个用户本期在**其他节点**上已经用掉的流量，由主控算好下发。一个用户能连多个入口时，靠它让每个节点都按全局用量卡额度。主控更新它不需要很频繁，误差就是两次下发之间其他节点上新增的流量。
+- `dest_probes`：Reality 可以借用的站点（`host:端口`），节点每 10 分钟按三网探测的方式测一轮，结果在 `report.dest_probes` 里，面板据此给出最近的。主控给入口发常用的几个，加上当前的第一个 SNI 和 dest。名字解析到内网地址的不拨。
+- `quota_bytes`：0 表示不限。判断条件是 `used_base + up + down >= quota_bytes`，每 0.25 秒检查一次，超了就断开这个用户所有连接并拒绝新连接（所以会多跑约 0.25 秒的流量）。
+- `used_self`：主控记录的这个用户本期在**这个节点**上的用量。节点自己的计数不会低于它，崩溃前没来得及存盘的用量因此不会丢；主控在同一周期内也只接受变大的计数。
+- `used_base`：这个用户本期在**其他节点**上已经用掉的流量，由主控算好下发。一个用户能连多个入口时，靠它让每个节点都按全局用量卡额度。误差就是两次更新之间其他节点上新增的流量：主控每 30 秒检查一次，对支持 `usage` 消息的节点变了就发；老节点要整份重推配置，最多每 60 秒一次。
 - `expire_at`：unix 秒，0 表示不过期。到期即断开并拒绝。
 - 删用户：下发的配置里不再有这个用户，节点立刻断开他所有连接。
 - 恢复被封的用户：提高 `quota_bytes`、`used_base` 改小、改 `expire_at` 或换 `period`，下发后 1 秒内恢复。

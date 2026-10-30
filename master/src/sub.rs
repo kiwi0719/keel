@@ -41,7 +41,9 @@ struct Proxy {
 
 enum Kind {
     // verify: the entry uses a real certificate, so clients check it.
-    AnyTls { password: String, sni: String, verify: bool },
+    // pin: otherwise, the master-made self-signed certificate clients pin
+    // instead (PEM and SHA-256 of its DER).
+    AnyTls { password: String, sni: String, verify: bool, pin: Option<(String, String)> },
     Reality { uuid: String, sni: String, public_key: String, short_id: String, fp: String },
 }
 
@@ -59,18 +61,29 @@ fn proxies(user: &User, entries: &[&Node], trusted: &[i64]) -> Vec<Proxy> {
         if server.is_empty() {
             continue;
         }
+        let (password, uuid) = user.credentials_for(n.id);
         let label = if n.name.is_empty() { n.code.clone() } else { n.name.clone() };
         // Both protocols on one entry get a suffix; a lone one keeps the
         // entry's own name.
         let both = n.vless_on && n.vless_port > 0 && n.anytls_on && n.anytls_port > 0;
         let named = |proto: &str| if both { format!("{label} · {proto}") } else { label.clone() };
-        if n.anytls_on && n.anytls_port > 0 {
+        let verify = if n.anytls_acme { trusted.contains(&n.id) } else { !n.anytls_cert.is_empty() && !n.anytls_key.is_empty() };
+        let pin = if verify || !n.anytls_self_signed() {
+            None
+        } else {
+            crate::db::cert_sha256(&n.anytls_self_cert).map(|fp| (n.anytls_self_cert.clone(), fp))
+        };
+        // An entry whose certificate clients can neither verify nor pin (ACME
+        // not issued yet) is left out rather than handed out unverified: the
+        // AnyTLS password goes to whoever answers the connection.
+        if n.anytls_on && n.anytls_port > 0 && (verify || pin.is_some()) {
             list.push(Proxy {
                 name: named("AnyTLS"),
                 kind: Kind::AnyTls {
-                    password: user.anytls_password.clone(),
+                    password,
                     sni: n.anytls_sni.clone(),
-                    verify: if n.anytls_acme { trusted.contains(&n.id) } else { !n.anytls_cert.is_empty() && !n.anytls_key.is_empty() },
+                    verify,
+                    pin,
                 },
                 server: server.clone(),
                 port: if n.anytls_pub > 0 { n.anytls_pub } else { n.anytls_port },
@@ -80,7 +93,7 @@ fn proxies(user: &User, entries: &[&Node], trusted: &[i64]) -> Vec<Proxy> {
             list.push(Proxy {
                 name: named("Reality"),
                 kind: Kind::Reality {
-                    uuid: user.uuid.clone(),
+                    uuid,
                     sni: n.reality_names().into_iter().next().unwrap_or_default(),
                     public_key: n.reality_public.clone(),
                     short_id: n.reality_short_ids().into_iter().next().unwrap_or_default(),
@@ -119,8 +132,12 @@ fn cidr_rule(c: &str, group: &str) -> String {
     format!("{},{c},{group},no-resolve", if c.contains(':') { "IP-CIDR6" } else { "IP-CIDR" })
 }
 
-const BM: &str = "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule";
-const META: &str = "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat";
+// Third-party rule lists, pinned to commits: a branch head would let
+// whoever controls those repositories change, for every subscriber, what goes
+// direct and past the proxy. Bump the commits deliberately to refresh them.
+const BM: &str = "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/0b6897dc17e0c513d25449c935a9694818e32f0c/rule";
+const META_RULES: &str = "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/74246501fd12b938b73482f406a6163d1e4a460f";
+const SING_RULES: &str = "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/608341f98813a26bcaa12ae19f017195a3274b2d";
 
 const PRIVATE_V4: [&str; 6] = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "100.64.0.0/10", "169.254.0.0/16"];
 const PRIVATE_V6: [&str; 3] = ["::1/128", "fc00::/7", "fe80::/10"];
@@ -191,8 +208,11 @@ fn clash(plan: &Plan, stash: bool) -> String {
                     q(uuid), q(sni), q(sni), q(fp), q(public_key), q(short_id)
                 );
             }
-            Kind::AnyTls { password, sni, verify } => {
-                let _ = write!(y, "    type: anytls\n    password: {}\n    skip-cert-verify: {}\n", q(password), !verify);
+            Kind::AnyTls { password, sni, verify, pin } => {
+                let _ = write!(y, "    type: anytls\n    password: {}\n    skip-cert-verify: false\n", q(password));
+                if let (false, Some((_, fp))) = (verify, pin) {
+                    let _ = writeln!(y, "    fingerprint: {}", q(fp));
+                }
                 if !sni.is_empty() {
                     let _ = writeln!(y, "    sni: {}", q(sni));
                 }
@@ -207,7 +227,7 @@ fn clash(plan: &Plan, stash: bool) -> String {
     }
     y.push_str("rule-providers:\n");
     for (name, path) in CLASH_SETS {
-        let url = if path.is_empty() { format!("{META}/meta/geo/geosite/classical/category-ai-%21cn.list") } else { format!("{BM}/{path}") };
+        let url = if path.is_empty() { format!("{META_RULES}/geo/geosite/classical/category-ai-%21cn.list") } else { format!("{BM}/{path}") };
         let _ = write!(y, "  {name}:\n    type: http\n    behavior: classical\n    format: text\n    url: {}\n    path: ./ruleset/{name}.list\n    interval: 86400\n", q(&url));
         // Fetch through the proxy: raw.githubusercontent.com is unreliable
         // from the mainland. Stash has no such option.
@@ -228,7 +248,10 @@ fn clash(plan: &Plan, stash: bool) -> String {
     for c in PRIVATE_V6 {
         let _ = writeln!(y, "  - IP-CIDR6,{c},DIRECT,no-resolve");
     }
-    let _ = write!(y, "  - RULE-SET,ChinaMax,DIRECT\n  - GEOIP,CN,DIRECT\n  - MATCH,{PROXY}\n");
+    // no-resolve: a domain is not looked up just to test GEOIP, which would
+    // send every foreign site the user visits to the domestic resolvers.
+    // China domains are matched by ChinaMax above; GEOIP covers bare IPs.
+    let _ = write!(y, "  - RULE-SET,ChinaMax,DIRECT\n  - GEOIP,CN,DIRECT,no-resolve\n  - MATCH,{PROXY}\n");
     y
 }
 
@@ -240,8 +263,11 @@ fn singbox(plan: &Plan) -> String {
     for p in &plan.proxies {
         names.push(p.name.clone());
         outbounds.push(match &p.kind {
-            Kind::AnyTls { password, sni, verify } => {
-                let mut tls = json!({"enabled": true, "insecure": !verify});
+            Kind::AnyTls { password, sni, verify, pin } => {
+                let mut tls = json!({"enabled": true, "insecure": false});
+                if let (false, Some((pem, _))) = (verify, pin) {
+                    tls["certificate"] = json!(pem);
+                }
                 if !sni.is_empty() {
                     tls["server_name"] = json!(sni);
                 }
@@ -267,7 +293,7 @@ fn singbox(plan: &Plan) -> String {
     outbounds.push(json!({"type": "direct", "tag": "direct"}));
 
     let set = |tag: &str, path: &str| {
-        json!({"type": "remote", "tag": tag, "format": "binary", "url": format!("{META}/sing/geo/{path}.srs"), "download_detour": PROXY})
+        json!({"type": "remote", "tag": tag, "format": "binary", "url": format!("{SING_RULES}/geo/{path}.srs"), "download_detour": PROXY})
     };
     let mut rules = vec![
         json!({"action": "sniff"}),
@@ -330,14 +356,16 @@ fn surge(plan: &Plan) -> String {
     );
     let mut names = Vec::new();
     for p in &list {
-        if let Kind::AnyTls { password, sni, verify } = &p.kind {
+        if let Kind::AnyTls { password, sni, verify, pin } = &p.kind {
             let name = surge_name(&p.name);
             let _ = write!(s, "{name} = anytls, {}, {}, password=\"{}\"", p.server, p.port, password.replace('"', ""));
             if !sni.is_empty() {
                 let _ = write!(s, ", sni={sni}");
             }
             if !verify {
-                s.push_str(", skip-cert-verify=true");
+                if let Some((_, fp)) = pin {
+                    let _ = write!(s, ", server-cert-fingerprint-sha256={fp}");
+                }
             }
             s.push('\n');
             names.push(name);
@@ -359,7 +387,7 @@ fn surge(plan: &Plan) -> String {
     for set in ["OpenAI", "Claude", "Gemini", "Copilot"] {
         let _ = writeln!(s, "RULE-SET,{BM}/Surge/{set}/{set}.list,{AI}");
     }
-    let _ = write!(s, "RULE-SET,LAN,DIRECT\nDOMAIN-SET,{BM}/Surge/ChinaMax/ChinaMax_Domain.list,DIRECT\nGEOIP,CN,DIRECT\nFINAL,{PROXY},dns-failed\n");
+    let _ = write!(s, "RULE-SET,LAN,DIRECT\nDOMAIN-SET,{BM}/Surge/ChinaMax/ChinaMax_Domain.list,DIRECT\nGEOIP,CN,DIRECT,no-resolve\nFINAL,{PROXY},dns-failed\n");
     s
 }
 
@@ -367,7 +395,9 @@ fn surge(plan: &Plan) -> String {
 
 fn share_links(list: &[Proxy]) -> String {
     let mut out = Vec::new();
-    for p in list {
+    // anytls:// links cannot pin a certificate: only entries clients can
+    // verify are listed, never one marked insecure.
+    for p in list.iter().filter(|p| !matches!(p.kind, Kind::AnyTls { verify: false, .. })) {
         let host = if p.server.contains(':') { format!("[{}]", p.server) } else { p.server.clone() };
         let tag = percent_encode(&p.name);
         out.push(match &p.kind {
@@ -379,9 +409,10 @@ fn share_links(list: &[Proxy]) -> String {
                 percent_encode(public_key),
                 percent_encode(short_id)
             ),
-            Kind::AnyTls { password, sni, verify } => {
+            Kind::AnyTls { password, sni, verify, .. } => {
                 let sni = if sni.is_empty() { String::new() } else { format!("&sni={}", percent_encode(sni)) };
-                format!("anytls://{}@{host}:{}?insecure={}{sni}#{tag}", percent_encode(password), p.port, if *verify { 0 } else { 1 })
+                let _ = verify;
+                format!("anytls://{}@{host}:{}?insecure=0{sni}#{tag}", percent_encode(password), p.port)
             }
         });
     }
@@ -440,11 +471,19 @@ pub async fn subscription(
     Query(query): Query<SubQuery>,
     headers: HeaderMap,
 ) -> Response {
-    let conn = app.db();
-    let Some(user) = db::user_by_sub(&conn, &token).ok().flatten() else {
+    // The database reads and the rendering run off the async workers.
+    tokio::task::spawn_blocking(move || render(&app, &token, query, &headers))
+        .await
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn render(app: &App, token: &str, query: SubQuery, headers: &HeaderMap) -> Response {
+    let conn = app.reader();
+    let Some(user) = db::user_by_sub(&conn, token).ok().flatten() else {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     };
-    let Ok(world) = db::load_world(&conn) else {
+    // Only this user's entries and usage, not the whole world.
+    let Ok(world) = db::load_user_world(&conn, &user) else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     drop(conn);
@@ -467,7 +506,7 @@ pub async fn subscription(
 
     let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("").to_lowercase();
     let format = query.format.as_deref().and_then(Format::parse).unwrap_or_else(|| Format::from_agent(&ua));
-    let plan = Plan { proxies: list, url: format!("{}/s/{token}?format=surge", api::base_url(&app, &headers)) };
+    let plan = Plan { proxies: list, url: format!("{}/s/{token}?format=surge", api::base_url(app, headers)) };
 
     let used = nodecfg::user_used(&world, &user, now());
     let mut info = format!("upload=0; download={used}; total={}", user.quota_bytes);
@@ -506,7 +545,7 @@ mod tests {
             proxies: vec![
                 Proxy {
                     name: "东京 · AnyTLS".into(),
-                    kind: Kind::AnyTls { password: "pw".into(), sni: "a.example.com".into(), verify: true },
+                    kind: Kind::AnyTls { password: "pw".into(), sni: "a.example.com".into(), verify: true, pin: None },
                     server: "a.example.com".into(),
                     port: 443,
                 },

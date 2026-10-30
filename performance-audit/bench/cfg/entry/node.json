@@ -1,0 +1,12 @@
+{"route": {"allow_private": true,
+   "rules": [{"name": "chain", "domains": ["127.0.0.2/32"], "outbound": "x1"}]},
+ "outbounds": [{"tag": "x1", "type": "ss2022", "server": "127.0.0.1:20101", "password": "aMACsktAq3rW3WoYP8aPbA==:P9jV5FlpdIv3IRqhtEhI5A=="}],
+ "inbounds": [
+  {"type": "anytls", "listen": "127.0.0.1:20001", "cert": "/w/cfg/cert.pem", "key": "/w/cfg/key.pem"},
+  {"type": "ss2022", "listen": "127.0.0.1:20002", "method": "2022-blake3-aes-128-gcm", "password": "aMACsktAq3rW3WoYP8aPbA=="},
+  {"type": "vless", "listen": "127.0.0.1:20003", "reality": {"dest": "127.0.0.1:20443", "server_names": ["dest.test"], "private_key": "aNMmXzNyWZbuLfHye7yaWyPIpkxNW8I_GVPYQctm3kk", "short_ids": ["0123456789abcdef"]}}
+ ],
+ "users": [
+  {"name": "u1", "anytls_password": "pw", "uuid": "80cc6a3a-1514-4342-af5b-78008172e101", "flow": "xtls-rprx-vision", "ss_key": "Dx4NiV8victJxIdnEHdBVA=="},
+  {"name": "u2", "uuid": "745d5d92-0765-4259-825c-c3902a0ddfa2"}
+ ]}

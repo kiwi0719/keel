@@ -13,11 +13,13 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::app::App;
-use crate::db;
+use crate::db::{self, World};
+use crate::live::Live;
 use crate::link;
 use crate::nodecfg::{self, ProbeTarget};
 use crate::period::{format_date_end, month_label, now, parse_date_end, period_end};
@@ -38,7 +40,12 @@ fn ok(v: Value) -> ApiResult {
     Ok(Json(v).into_response())
 }
 
-const SESSION_COOKIE: &str = "keel_session";
+// __Host-: only this exact origin can set it, so a sibling subdomain cannot
+// plant a session cookie that shadows the admin's.
+const SESSION_COOKIE: &str = "__Host-keel_session";
+/// Marks a browser that has logged in before; it may still log in while the
+/// global failure limit is hit, so a flood cannot lock the admin out.
+const DEVICE_COOKIE: &str = "__Host-keel_device";
 const SESSION_DAYS: i64 = 30;
 
 // ---------- auth ----------
@@ -46,10 +53,6 @@ const SESSION_DAYS: i64 = 30;
 pub fn hash_password(pw: &str) -> String {
     let salt = SaltString::encode_b64(&crate::util::random_bytes(16)).expect("salt");
     Argon2::default().hash_password(pw.as_bytes(), &salt).expect("hash").to_string()
-}
-
-fn verify_password(conn: &Connection, pw: &str) -> bool {
-    db::get_setting(conn, "admin_hash").ok().flatten().is_some_and(|stored| password_matches(&stored, pw))
 }
 
 fn password_matches(stored: &str, pw: &str) -> bool {
@@ -63,24 +66,58 @@ fn tail(s: &str, n: usize) -> String {
     s.chars().skip(skip).collect()
 }
 
-fn session_token(headers: &HeaderMap) -> Option<String> {
+fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
     let cookies = headers.get(header::COOKIE)?.to_str().ok()?;
     cookies.split(';').find_map(|c| {
         let (k, v) = c.trim().split_once('=')?;
-        (k == SESSION_COOKIE).then(|| v.to_string())
+        (k == name).then(|| v.to_string())
     })
 }
 
-pub fn logged_in(app: &App, headers: &HeaderMap) -> bool {
-    let Some(token) = session_token(headers) else { return false };
-    let conn = app.db();
-    conn.query_row("SELECT 1 FROM sessions WHERE token=?1 AND expires>?2", params![token, now()], |_| Ok(()))
-        .is_ok()
+/// The session as stored: a hash of the cookie, so a copy of the database
+/// does not hand out live sessions.
+fn session_token(headers: &HeaderMap) -> Option<String> {
+    cookie(headers, SESSION_COOKIE).map(|t| session_key(&t))
 }
 
+fn session_key(token: &str) -> String {
+    crate::util::hex(&crate::util::sha256(token.as_bytes()))
+}
+
+fn device_value(app: &App) -> String {
+    crate::util::hex(&crate::util::sha256(format!("device:{}", app.secret).as_bytes()))
+}
+
+/// Whether the request carries a live session. Looked up on the read
+/// connection, on the blocking pool: every panel request asks.
+pub async fn logged_in(app: &Arc<App>, headers: &HeaderMap) -> bool {
+    let Some(token) = session_token(headers) else { return false };
+    let app = app.clone();
+    tokio::task::spawn_blocking(move || {
+        app.reader().query_row("SELECT 1 FROM sessions WHERE token=?1 AND expires>?2", params![token, now()], |_| Ok(())).is_ok()
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// Counts requests that may have changed something, so the next panel poll
+/// builds a new state instead of serving a copy from before the change.
+static EDITS: AtomicU64 = AtomicU64::new(0);
+
 pub async fn require_login(State(app): State<Arc<App>>, req: Request, next: Next) -> Response {
-    if logged_in(&app, req.headers()) {
-        next.run(req).await
+    // Changes need a header a form or a cross-site fetch cannot send without
+    // a CORS preflight (which the master never answers). SameSite alone
+    // still lets same-site pages, e.g. on a node's AnyTLS name, post here.
+    let safe = matches!(*req.method(), axum::http::Method::GET | axum::http::Method::HEAD);
+    if !safe && req.headers().get("x-keel").is_none_or(|v| v != "1") {
+        return (StatusCode::FORBIDDEN, Json(json!({"error": "请求来源不对"}))).into_response();
+    }
+    if logged_in(&app, req.headers()).await {
+        let resp = next.run(req).await;
+        if !safe {
+            EDITS.fetch_add(1, Ordering::Relaxed);
+        }
+        resp
     } else {
         (StatusCode::UNAUTHORIZED, Json(json!({"error": "请先登录"}))).into_response()
     }
@@ -113,12 +150,26 @@ const FAIL_WINDOW: i64 = 600;
 /// logins waits here instead of exhausting the box.
 static VERIFYING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
-fn locked_out(ip: &str) -> bool {
+/// Whether logins from ip are refused. The global limit does not apply to a
+/// browser that logged in before (known_device).
+fn locked_out(ip: &str, known_device: bool) -> bool {
     let t = now();
     let mut f = FAILS.lock().unwrap_or_else(|e| e.into_inner());
     let map = f.get_or_insert_with(HashMap::new);
     map.retain(|_, (_, start)| t - *start < FAIL_WINDOW);
-    map.get(ip).is_some_and(|(n, _)| *n >= FAIL_LIMIT) || map.get(GLOBAL).is_some_and(|(n, _)| *n >= GLOBAL_FAIL_LIMIT)
+    map.get(ip).is_some_and(|(n, _)| *n >= FAIL_LIMIT) || (!known_device && map.get(GLOBAL).is_some_and(|(n, _)| *n >= GLOBAL_FAIL_LIMIT))
+}
+
+/// The key failures are counted under: the address, or for IPv6 its /64,
+/// which one subscriber line usually has whole.
+fn fail_key(ip: &str) -> String {
+    match ip.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(v6)) => {
+            let s = v6.segments();
+            format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+        }
+        _ => ip.to_string(),
+    }
 }
 
 fn record_failure(ip: &str) {
@@ -136,9 +187,10 @@ pub async fn login(
     headers: HeaderMap,
     Json(body): Json<Login>,
 ) -> ApiResult {
-    let ip = crate::ws::client_ip(&app, &headers, peer);
+    let ip = fail_key(&crate::ws::client_ip(&app, &headers, peer));
+    let known_device = cookie(&headers, DEVICE_COOKIE).is_some_and(|v| v == device_value(&app));
     let too_many = || (StatusCode::TOO_MANY_REQUESTS, Json(json!({"error": "试错太多次，10 分钟后再试"}))).into_response();
-    if locked_out(&ip) {
+    if locked_out(&ip, known_device) {
         return Err(too_many());
     }
     let (stored, user) = {
@@ -148,7 +200,7 @@ pub async fn login(
     let good = {
         let _permit = VERIFYING.acquire().await.map_err(internal)?;
         // Requests that queued up behind the permit count against the limit too.
-        if locked_out(&ip) {
+        if locked_out(&ip, known_device) {
             return Err(too_many());
         }
         let password = body.password;
@@ -165,15 +217,17 @@ pub async fn login(
     }
     let token = random_hex(24);
     app.db()
-        .execute("INSERT INTO sessions(token,expires) VALUES(?1,?2)", params![token, now() + SESSION_DAYS * 86_400])
+        .execute("INSERT INTO sessions(token,expires) VALUES(?1,?2)", params![session_key(&token), now() + SESSION_DAYS * 86_400])
         .map_err(internal)?;
     // Behind -no-tls the reverse proxy terminates HTTPS, so the cookie is still secure-only.
     let secure = if app.tls.is_some() || app.trust_proxy { "; Secure" } else { "" };
-    let cookie = format!(
+    let session = format!(
         "{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{secure}",
         SESSION_DAYS * 86_400
     );
-    Ok(([(header::SET_COOKIE, cookie)], Json(json!({"ok": true}))).into_response())
+    let device = format!("{DEVICE_COOKIE}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{secure}", device_value(&app), 400 * 86_400);
+    let cookies = axum::response::AppendHeaders([(header::SET_COOKIE, session), (header::SET_COOKIE, device)]);
+    Ok((cookies, Json(json!({"ok": true}))).into_response())
 }
 
 pub async fn logout(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult {
@@ -188,14 +242,24 @@ pub async fn logout(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResul
 
 /// The URL nodes and subscription clients use for this master.
 pub fn base_url(app: &App, headers: &HeaderMap) -> String {
-    if let Some(u) = db::get_setting(&app.db(), "panel_url").ok().flatten().filter(|u| !u.is_empty()) {
+    if let Some(u) = db::get_setting(&app.reader(), "panel_url").ok().flatten().filter(|u| !u.is_empty()) {
         return u.trim_end_matches('/').to_string();
     }
-    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("localhost");
+    // The host ends up in a shell command run as root: plain host[:port] only.
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .filter(|h| !h.is_empty() && h.bytes().all(|b| b.is_ascii_alphanumeric() || b".-:[]".contains(&b)))
+        .unwrap_or("localhost");
+    // Behind a reverse proxy assume HTTPS unless it says plain http: falling
+    // back to http would send node tokens and configs in the clear.
     let scheme = if app.tls.is_some() {
         "https"
     } else {
-        headers.get("x-forwarded-proto").and_then(|v| v.to_str().ok()).unwrap_or("http")
+        match headers.get("x-forwarded-proto").and_then(|v| v.to_str().ok()).map(str::trim) {
+            Some("http") => "http",
+            _ => "https",
+        }
     };
     format!("{scheme}://{host}")
 }
@@ -206,9 +270,13 @@ pub fn install_command(app: &App, base: &str, token: &str) -> String {
         Some(p) => format!("curl -fsSLk --pinnedpubkey 'sha256//{p}'"),
         None => "curl -fsSL".to_string(),
     };
-    let mut cmd = format!("{curl} {base}/install.sh | sh -s -- --master {base} --token {token}");
+    // The token goes in the environment of sh, not its arguments: other users
+    // can list arguments while the installer runs, not another user's environment.
+    let mut cmd = format!("{curl} '{base}/install.sh' | KEEL_TOKEN='{token}' sh -s -- --master '{base}'");
     if let (Some(p), Some(t)) = (pin, &app.tls) {
-        cmd.push_str(&format!(" --fingerprint {} --pin '{p}'", t.cert_sha256));
+        // Nodes pin the key, not the certificate, so the panel can later get a
+        // CA certificate for the same key without reinstalling them.
+        cmd.push_str(&format!(" --fingerprint {} --pin '{p}'", t.spki_sha256));
     }
     cmd
 }
@@ -248,14 +316,81 @@ fn exists(conn: &Connection, table: &str, id: i64) -> bool {
 // ---------- state ----------
 
 pub async fn state(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult {
-    ok(state_value(&app, &headers)?)
+    // Every open panel asks every 2 s. The state is built off the async
+    // workers, at most once a second (or after an edit), and polls that come
+    // together get the same copy. Only logged-in requests get here.
+    struct Copy {
+        at: Instant,
+        edits: u64,
+        key: String,
+        body: bytes::Bytes,
+    }
+    static CACHE: tokio::sync::Mutex<Option<Copy>> = tokio::sync::Mutex::const_new(None);
+    const FRESH: Duration = Duration::from_secs(1);
+    // What base_url takes from the request.
+    let key = [header::HOST.as_str(), "x-forwarded-proto"].map(|h| headers.get(h).and_then(|v| v.to_str().ok()).unwrap_or("")).join("|");
+    let edits = EDITS.load(Ordering::Relaxed);
+    let mut cache = CACHE.lock().await;
+    if let Some(c) = cache.as_ref().filter(|c| c.at.elapsed() < FRESH && c.edits == edits && c.key == key) {
+        return Ok(json_body(c.body.clone()));
+    }
+    let body = tokio::task::spawn_blocking(move || {
+        let v = state_value(&app, &headers)?;
+        serde_json::to_vec(&v).map(bytes::Bytes::from).map_err(internal)
+    })
+    .await
+    .map_err(internal)??;
+    *cache = Some(Copy { at: Instant::now(), edits, key, body: body.clone() });
+    Ok(json_body(body))
+}
+
+fn json_body(body: bytes::Bytes) -> Response {
+    ([(header::CONTENT_TYPE, "application/json")], body).into_response()
 }
 
 /// The public status page at /: per-node health and probes only. No
 /// addresses, ports, tokens, users, routes or exits, so it is safe to show
 /// without logging in.
-pub async fn public_state(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult {
-    let full = state_value(&app, &headers)?;
+/// Whether the anonymous probe page at / is on (a setting, off by default).
+pub fn public_page(app: &App) -> bool {
+    db::get_setting(&app.reader(), "public_page").ok().flatten().is_some_and(|v| v == "1")
+}
+
+pub async fn public_state(State(app): State<Arc<App>>) -> ApiResult {
+    if !public_page(&app) {
+        return Err(StatusCode::NOT_FOUND.into_response());
+    }
+    // Anyone may ask, so the answer is built at most once per interval, by
+    // one request at a time and off the async workers; everyone else gets
+    // the copy.
+    static CACHE: tokio::sync::Mutex<Option<(std::time::Instant, Value)>> = tokio::sync::Mutex::const_new(None);
+    const FRESH: Duration = Duration::from_secs(2);
+    let mut cache = CACHE.lock().await;
+    if let Some((_, v)) = cache.as_ref().filter(|(at, _)| at.elapsed() < FRESH) {
+        return ok(v.clone());
+    }
+    let v = tokio::task::spawn_blocking(move || public_value(&app)).await.map_err(internal)??;
+    *cache = Some((std::time::Instant::now(), v.clone()));
+    ok(v)
+}
+
+/// Built from the nodes and exits alone: users and their usage never enter
+/// it.
+fn public_value(app: &App) -> Result<Value, Response> {
+    let ts = now();
+    let (w, months, targets) = {
+        let conn = app.reader();
+        let mut w = World::default();
+        w.tz = tz_of(&conn);
+        w.nodes = db::load_nodes(&conn).map_err(internal)?;
+        w.exits = db::load_exits(&conn).map_err(internal)?;
+        let months = db::node_months(&conn, &month_label(ts, w.tz)).map_err(internal)?;
+        (w, months, App::probe_targets(&conn))
+    };
+    let live = app.live();
+    let (nodes, online, month) = node_values(&w, &live, &months, &targets);
+    let speed: Vec<_> = live.speed.iter().map(|(rx, tx)| [rx.round(), tx.round()]).collect();
+    drop(live);
     const KEEP: &[&str] = &["id", "name", "role", "online", "last_seen", "month_rx", "month_tx", "probes", "checks"];
     const SYSTEM: &[&str] = &["cpu_pct", "mem_total", "mem_used", "disk_total", "disk_used", "rx_rate", "tx_rate", "uptime_s", "tcp_retrans_pct"];
     let pick = |v: &Value, keys: &[&str]| -> Value {
@@ -267,35 +402,22 @@ pub async fn public_state(State(app): State<Arc<App>>, headers: HeaderMap) -> Ap
         }
         Value::Object(o)
     };
-    let nodes: Vec<Value> = full["nodes"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .map(|n| {
-                    let mut o = pick(n, KEEP);
-                    if n["system"].is_object() {
-                        o["system"] = pick(&n["system"], SYSTEM);
-                    }
-                    o
-                })
-                .collect()
+    let nodes: Vec<Value> = nodes
+        .iter()
+        .map(|n| {
+            let mut o = pick(n, KEEP);
+            if n["system"].is_object() {
+                o["system"] = pick(&n["system"], SYSTEM);
+            }
+            o
         })
-        .unwrap_or_default();
-    ok(json!({"now": full["now"], "nodes": nodes, "summary": full["summary"]}))
+        .collect();
+    Ok(json!({"now": ts, "nodes": nodes, "summary": {"speed": speed, "online": online, "month": month}}))
 }
 
-fn state_value(app: &Arc<App>, headers: &HeaderMap) -> Result<Value, Response> {
-    let ts = now();
-    let base = base_url(&app, &headers);
-    let conn = app.db();
-    let w = db::load_world(&conn).map_err(internal)?;
-    let months = db::node_months(&conn, &month_label(ts, w.tz)).map_err(internal)?;
-    let targets = App::probe_targets(&conn);
-    let panel_url = db::get_setting(&conn, "panel_url").ok().flatten().unwrap_or_default();
-    let username = admin_user(&conn);
-    drop(conn);
-    let live = app.live();
-
+/// Every node as the panel shows it, the number online and this month's
+/// traffic of all nodes.
+fn node_values(w: &World, live: &Live, months: &HashMap<i64, (i64, i64)>, targets: &[ProbeTarget]) -> (Vec<Value>, i64, i64) {
     let mut month_total = 0i64;
     let mut online = 0;
     let nodes: Vec<Value> = w
@@ -338,6 +460,9 @@ fn state_value(app: &Arc<App>, headers: &HeaderMap) -> Result<Value, Response> {
                 o.insert("apply_error".into(), json!(l.apply_error));
                 o.insert("health".into(), json!(l.outbounds));
                 o.insert("certs".into(), json!(l.certs));
+                if n.is_entry() {
+                    o.insert("dest_latency".into(), json!(l.dest_latency));
+                }
                 let probes: Vec<Value> = targets
                     .iter()
                     .filter_map(|t| {
@@ -376,6 +501,30 @@ fn state_value(app: &Arc<App>, headers: &HeaderMap) -> Result<Value, Response> {
             v
         })
         .collect();
+    (nodes, online, month_total)
+}
+
+fn state_value(app: &App, headers: &HeaderMap) -> Result<Value, Response> {
+    let ts = now();
+    let base = base_url(app, headers);
+    let conn = app.reader();
+    let w = db::load_world_summed(&conn).map_err(internal)?;
+    let months = db::node_months(&conn, &month_label(ts, w.tz)).map_err(internal)?;
+    let targets = App::probe_targets(&conn);
+    let panel_url = db::get_setting(&conn, "panel_url").ok().flatten().unwrap_or_default();
+    let username = admin_user(&conn);
+    let public_page = db::get_setting(&conn, "public_page").ok().flatten().is_some_and(|v| v == "1");
+    let panel_acme = db::get_setting(&conn, "panel_acme").ok().flatten().is_some_and(|v| v == "1");
+    drop(conn);
+    let live = app.live();
+    let (nodes, online, month_total) = node_values(&w, &live, &months, &targets);
+    // Open connections per counter, summed over the nodes once.
+    let mut conns: HashMap<&str, i64> = HashMap::new();
+    for l in live.nodes.values() {
+        for (name, n) in &l.conns {
+            *conns.entry(name.as_str()).or_default() += n;
+        }
+    }
 
     let exits: Vec<Value> = w
         .exits
@@ -385,6 +534,7 @@ fn state_value(app: &Arc<App>, headers: &HeaderMap) -> Result<Value, Response> {
             let o = v.as_object_mut().expect("object");
             o.insert("used".into(), json!(nodecfg::exit_used(&w, e, ts)));
             o.insert("period_end".into(), json!(period_end(ts, w.tz, e.reset_day as u32)));
+            o.insert("transport".into(), json!(e.transport()));
             v
         })
         .collect();
@@ -406,9 +556,10 @@ fn state_value(app: &Arc<App>, headers: &HeaderMap) -> Result<Value, Response> {
                 "ok"
             };
             let counter = nodecfg::user_counter(u.id);
-            let conns: i64 = live.nodes.values().filter_map(|l| l.conns.get(&counter)).sum();
+            let conns = conns.get(counter.as_str()).copied().unwrap_or(0);
             let mut v = serde_json::to_value(u).unwrap_or_default();
             let o = v.as_object_mut().expect("object");
+            o.insert("per_entry".into(), json!(u.per_entry));
             o.insert("used".into(), json!(used));
             o.insert("status".into(), json!(status));
             o.insert("conns".into(), json!(conns));
@@ -434,6 +585,10 @@ fn state_value(app: &Arc<App>, headers: &HeaderMap) -> Result<Value, Response> {
         "settings": {
             "username": username,
             "panel_url": panel_url,
+            "public_page": public_page,
+            "panel_acme": panel_acme,
+            "panel_acme_available": app.panel_tls.is_some(),
+            "panel_cert": crate::panel_cert::status(),
             "base_url": base,
             "tz_offset": w.tz,
             "probe_targets": targets,
@@ -633,11 +788,26 @@ pub async fn set_rules(State(app): State<Arc<App>>, Path(id): Path<i64>, Json(b)
 
 pub async fn rotate_token(State(app): State<Arc<App>>, headers: HeaderMap, Path(id): Path<i64>) -> ApiResult {
     let token = random_hex(24);
-    let n = app.db().execute("UPDATE nodes SET token=?1 WHERE id=?2", params![token, id]).map_err(internal)?;
+    // Everything the old token could fetch is replaced too: the entry's keys
+    // on every exit, and the PSKs of the exit ports this node runs.
+    let n = {
+        let conn = app.db();
+        let n = conn.execute("UPDATE nodes SET token=?1, key_salt=?2 WHERE id=?3", params![token, random_hex(16), id]).map_err(internal)?;
+        let ports: Vec<i64> = {
+            let mut st = conn.prepare("SELECT id FROM exits WHERE node_id=?1").map_err(internal)?;
+            let rows = st.query_map([id], |r| r.get(0)).map_err(internal)?;
+            rows.collect::<Result<_, _>>().map_err(internal)?
+        };
+        for e in ports {
+            conn.execute("UPDATE exits SET psk=?1 WHERE id=?2", params![random_b64(16), e]).map_err(internal)?;
+        }
+        n
+    };
     if n == 0 {
         return Err(bad("没有这个节点"));
     }
     app.kick(id);
+    app.sync();
     let base = base_url(&app, &headers);
     ok(json!({"install": install_command(&app, &base, &token)}))
 }
@@ -740,8 +910,8 @@ fn import_exits(conn: &mut Connection, text: &str, name: Option<&str>) -> Result
             _ => it.name.clone(),
         };
         tx.execute(
-            "INSERT INTO exits(id,node_id,name,kind,server,uuid,method,psk,sort) VALUES(?8,NULL,?1,?2,?3,?4,?5,?6,?7)",
-            params![name.chars().take(40).collect::<String>(), it.kind, it.server, it.uuid, it.method, it.password, sort, db::fresh_id(&tx, "exits").map_err(internal)?],
+            "INSERT INTO exits(id,node_id,name,kind,server,uuid,method,psk,sort,tls_sni,vless_opts) VALUES(?8,NULL,?1,?2,?3,?4,?5,?6,?7,?9,?10)",
+            params![name.chars().take(40).collect::<String>(), it.kind, it.server, it.uuid, it.method, it.password, sort, db::fresh_id(&tx, "exits").map_err(internal)?, it.tls_sni, it.vless_opts],
         )
         .map_err(internal)?;
         ids.push(tx.last_insert_rowid());
@@ -761,8 +931,8 @@ fn reimport_exit(conn: &Connection, id: i64, text: &str) -> Result<(), Response>
     let it = items.remove(0);
     let n = conn
         .execute(
-            "UPDATE exits SET kind=?1, server=?2, uuid=?3, method=?4, psk=?5 WHERE id=?6 AND node_id IS NULL",
-            params![it.kind, it.server, it.uuid, it.method, it.password, id],
+            "UPDATE exits SET kind=?1, server=?2, uuid=?3, method=?4, psk=?5, tls_sni=?7, vless_opts=?8 WHERE id=?6 AND node_id IS NULL",
+            params![it.kind, it.server, it.uuid, it.method, it.password, id, it.tls_sni, it.vless_opts],
         )
         .map_err(internal)?;
     if n == 0 {
@@ -917,9 +1087,8 @@ pub async fn update_user(State(app): State<Arc<App>>, Path(id): Path<i64>, Json(
 pub async fn reset_user(State(app): State<Arc<App>>, Path(id): Path<i64>) -> ApiResult {
     {
         let conn = app.db();
-        let w = db::load_world(&conn).map_err(internal)?;
-        let u = w.users.iter().find(|u| u.id == id).ok_or_else(|| bad("没有这个用户"))?;
-        let base = crate::period::period_label(now(), w.tz, u.reset_day as u32, 0);
+        let u = db::user_by_id(&conn, id).map_err(internal)?.ok_or_else(|| bad("没有这个用户"))?;
+        let base = crate::period::period_label(now(), tz_of(&conn), u.reset_day as u32, 0);
         let seq = if u.reset_period == base { u.reset_seq + 1 } else { 1 };
         conn.execute("UPDATE users SET reset_period=?1, reset_seq=?2 WHERE id=?3", params![base, seq, id]).map_err(internal)?;
     }
@@ -927,11 +1096,29 @@ pub async fn reset_user(State(app): State<Arc<App>>, Path(id): Path<i64>) -> Api
     ok(json!({"ok": true}))
 }
 
+/// Gives every user per-entry credentials (users from before keep one set
+/// for all entries until this or a subscription reset). Their clients need
+/// the refreshed subscription afterwards.
+pub async fn users_per_entry(State(app): State<Arc<App>>) -> ApiResult {
+    let n = app.db().execute("UPDATE users SET per_entry=1 WHERE per_entry=0", []).map_err(internal)?;
+    app.sync();
+    ok(json!({"ok": true, "changed": n}))
+}
+
+/// A new subscription link comes with new proxy credentials: a leaked link
+/// is only revoked if what it handed out stops working too.
 pub async fn rotate_sub(State(app): State<Arc<App>>, Path(id): Path<i64>) -> ApiResult {
-    let n = app.db().execute("UPDATE users SET sub_token=?1 WHERE id=?2", params![random_hex(16), id]).map_err(internal)?;
+    let n = app
+        .db()
+        .execute(
+            "UPDATE users SET sub_token=?1, anytls_password=?2, uuid=?3, ss_key=?4, per_entry=1 WHERE id=?5",
+            params![random_hex(16), random_hex(16), crate::util::random_uuid(), random_b64(16), id],
+        )
+        .map_err(internal)?;
     if n == 0 {
         return Err(bad("没有这个用户"));
     }
+    app.sync();
     ok(json!({"ok": true}))
 }
 
@@ -944,6 +1131,26 @@ pub async fn delete_user(State(app): State<Arc<App>>, Path(id): Path<i64>) -> Ap
 // ---------- settings ----------
 
 pub async fn update_settings(State(app): State<Arc<App>>, headers: HeaderMap, Json(b): Json<Map<String, Value>>) -> ApiResult {
+    // The current password (needed to change the name or password) counts
+    // against the same failure limit as logins, and is checked off the async
+    // workers without holding the database.
+    let current_ok = match b.get("current_password").and_then(Value::as_str).filter(|p| !p.is_empty()) {
+        None => false,
+        Some(pw) => {
+            let key = format!("settings:{}", session_token(&headers).unwrap_or_default());
+            if locked_out(&key, true) {
+                return Err((StatusCode::TOO_MANY_REQUESTS, Json(json!({"error": "试错太多次，10 分钟后再试"}))).into_response());
+            }
+            let stored = db::get_setting(&app.db(), "admin_hash").ok().flatten();
+            let pw = pw.to_string();
+            let _permit = VERIFYING.acquire().await.map_err(internal)?;
+            let good = tokio::task::spawn_blocking(move || stored.is_some_and(|h| password_matches(&h, &pw))).await.unwrap_or(false);
+            if !good {
+                record_failure(&key);
+            }
+            good
+        }
+    };
     {
         let conn = app.db();
         // A new name or password signs out every other session.
@@ -951,14 +1158,13 @@ pub async fn update_settings(State(app): State<Arc<App>>, headers: HeaderMap, Js
             let current = session_token(&headers).unwrap_or_default();
             conn.execute("DELETE FROM sessions WHERE token<>?1", [current]).map_err(internal)
         };
-        let current = b.get("current_password").and_then(Value::as_str).unwrap_or("");
         if let Some(v) = b.get("username") {
             let name = str_field(v, 40)?;
             if name.is_empty() {
                 return Err(bad("用户名不能为空"));
             }
             if name != admin_user(&conn) {
-                if !verify_password(&conn, current) {
+                if !current_ok {
                     return Err(bad("改用户名要填当前密码"));
                 }
                 db::set_setting(&conn, "admin_user", &name).map_err(internal)?;
@@ -967,7 +1173,7 @@ pub async fn update_settings(State(app): State<Arc<App>>, headers: HeaderMap, Js
         }
         if let Some(pw) = b.get("password") {
             let pw = pw.as_str().unwrap_or("");
-            if !verify_password(&conn, current) {
+            if !current_ok {
                 return Err(bad("当前密码不对"));
             }
             if pw.chars().count() < 8 {
@@ -978,8 +1184,10 @@ pub async fn update_settings(State(app): State<Arc<App>>, headers: HeaderMap, Js
         }
         if let Some(v) = b.get("panel_url") {
             let u = str_field(v, 255)?;
-            if !u.is_empty() && !u.starts_with("https://") && !u.starts_with("http://") {
-                return Err(bad("面板地址应以 https:// 开头"));
+            let rest = u.strip_prefix("https://").or_else(|| u.strip_prefix("http://"));
+            let plain = rest.is_some_and(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_alphanumeric() || b".-:[]/_~".contains(&b)));
+            if !u.is_empty() && !plain {
+                return Err(bad("面板地址应像 https://panel.example.com:8443"));
             }
             db::set_setting(&conn, "panel_url", u.trim_end_matches('/')).map_err(internal)?;
         }
@@ -999,12 +1207,25 @@ pub async fn update_settings(State(app): State<Arc<App>>, headers: HeaderMap, Js
                 db::set_setting(&conn, "cf_token", &s).map_err(internal)?;
             }
         }
+        if let Some(v) = b.get("panel_acme") {
+            db::set_setting(&conn, "panel_acme", if bool_field(v)? { "1" } else { "0" }).map_err(internal)?;
+        }
+        if let Some(v) = b.get("public_page") {
+            db::set_setting(&conn, "public_page", if bool_field(v)? { "1" } else { "0" }).map_err(internal)?;
+        }
         if let Some(v) = b.get("tz_offset") {
             db::set_setting(&conn, "tz_offset", &int_field(v, -720, 840)?.to_string()).map_err(internal)?;
         }
         if let Some(v) = b.get("probe_targets") {
             let targets: Vec<ProbeTarget> = serde_json::from_value(v.clone()).map_err(|_| bad("测速目标格式不对"))?;
+            if targets.len() > 8 {
+                return Err(bad("测速目标最多 8 个"));
+            }
             for t in &targets {
+                let short = |s: &str, n: usize| !s.is_empty() && s.len() <= n && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+                if !short(&t.name, 16) || t.label.chars().count() > 20 || t.host.len() > 255 {
+                    return Err(bad("测速目标的名字或地址不对"));
+                }
                 if !t.host.is_empty() && !t.host.contains(':') {
                     return Err(bad(format!("{} 的地址要带端口，比如 1.2.3.4:80", t.label)));
                 }
@@ -1014,5 +1235,6 @@ pub async fn update_settings(State(app): State<Arc<App>>, headers: HeaderMap, Js
     }
     app.sync();
     crate::dns::spawn_sync(app.clone());
+    crate::panel_cert::kick();
     ok(json!({"ok": true}))
 }

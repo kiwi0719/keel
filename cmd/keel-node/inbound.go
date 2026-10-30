@@ -6,6 +6,7 @@ import (
 	"net"
 	"sort"
 	"strings"
+	"time"
 )
 
 // inbound is one running listener of one protocol.
@@ -36,20 +37,29 @@ func builtProtocols() string {
 }
 
 // acceptLoop hands each accepted connection to serve in its own goroutine
-// until the listener is closed.
+// until the listener is closed. Other errors, such as running out of file
+// descriptors, are waited out: returning would leave the port bound but dead
+// while the process keeps running, so nothing would restart it.
 func acceptLoop(listener net.Listener, serve func(net.Conn)) {
+	var wait time.Duration
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
 			var ne net.Error
 			if errors.As(err, &ne) && ne.Timeout() {
 				continue
 			}
-			if !errors.Is(err, net.ErrClosed) {
+			wait = min(max(wait*2, 5*time.Millisecond), time.Second)
+			if wait == time.Second {
 				log.Print("accept on ", listener.Addr(), ": ", err)
 			}
-			return
+			time.Sleep(wait)
+			continue
 		}
+		wait = 0
 		go serve(conn)
 	}
 }

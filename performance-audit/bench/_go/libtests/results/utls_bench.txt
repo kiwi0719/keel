@@ -1,0 +1,22 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/metacubex/utls
+cpu: Apple M4
+BenchmarkRecordWrite/utls/1200B-10         	  256506	      4133 ns/op	 290.34 MB/s	       9 B/op	       0 allocs/op
+BenchmarkRecordWrite/utls/1200B-10         	  290416	      4880 ns/op	 245.88 MB/s	       9 B/op	       0 allocs/op
+BenchmarkRecordWrite/utls/1200B-10         	  297626	      5781 ns/op	 207.58 MB/s	       9 B/op	       0 allocs/op
+BenchmarkRecordWrite/utls/1200B-10         	  292531	      5204 ns/op	 230.57 MB/s	       9 B/op	       0 allocs/op
+BenchmarkRecordWrite/crypto-tls/1200B-10   	  291568	      4596 ns/op	 261.07 MB/s	       8 B/op	       0 allocs/op
+BenchmarkRecordWrite/crypto-tls/1200B-10   	  239030	      5699 ns/op	 210.57 MB/s	       9 B/op	       0 allocs/op
+BenchmarkRecordWrite/crypto-tls/1200B-10   	  374901	      5623 ns/op	 213.41 MB/s	       9 B/op	       0 allocs/op
+BenchmarkRecordWrite/crypto-tls/1200B-10   	  276116	      3980 ns/op	 301.53 MB/s	       9 B/op	       0 allocs/op
+BenchmarkRecordWrite/utls/32KiB-10         	   54052	     24027 ns/op	1363.82 MB/s	      30 B/op	       1 allocs/op
+BenchmarkRecordWrite/utls/32KiB-10         	   50415	     21299 ns/op	1538.47 MB/s	      31 B/op	       1 allocs/op
+BenchmarkRecordWrite/utls/32KiB-10         	   52615	     22624 ns/op	1448.37 MB/s	      31 B/op	       1 allocs/op
+BenchmarkRecordWrite/utls/32KiB-10         	   54236	     22194 ns/op	1476.45 MB/s	      31 B/op	       1 allocs/op
+BenchmarkRecordWrite/crypto-tls/32KiB-10   	   52822	     21296 ns/op	1538.67 MB/s	      27 B/op	       1 allocs/op
+BenchmarkRecordWrite/crypto-tls/32KiB-10   	   53218	     25563 ns/op	1281.87 MB/s	      28 B/op	       1 allocs/op
+BenchmarkRecordWrite/crypto-tls/32KiB-10   	   40226	     28610 ns/op	1145.35 MB/s	      29 B/op	       1 allocs/op
+BenchmarkRecordWrite/crypto-tls/32KiB-10   	   44313	     28167 ns/op	1163.33 MB/s	      28 B/op	       1 allocs/op
+PASS
+ok  	github.com/metacubex/utls	24.945s

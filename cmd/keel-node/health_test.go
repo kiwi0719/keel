@@ -1,8 +1,13 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net"
+	"net/url"
 	"testing"
 	"time"
 )
@@ -71,5 +76,33 @@ func TestFallbackOrder(t *testing.T) {
 	b3, _ := newRouter(config, r)
 	if !b3.health["b"].isAlive() {
 		t.Fatal("changed outbound must start fresh")
+	}
+}
+
+func TestHealthCheckBoundsStatusLine(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		chunk := bytes.Repeat([]byte{'x'}, 64<<10)
+		for i := 0; i < 64; i++ { // 4 MiB with no newline
+			if _, err := conn.Write(chunk); err != nil {
+				return
+			}
+		}
+	}()
+	target, _ := url.Parse("http://" + ln.Addr().String() + "/")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = checkOutbound(ctx, &directOutbound{allowPrivate: true}, target)
+	if err == nil || len(err.Error()) > 120 {
+		t.Fatalf("err = %.200v (len %d), want a short error", err, len(fmt.Sprint(err)))
 	}
 }

@@ -142,9 +142,6 @@ func (s *MultiService[U]) NewConnection0(ctx context.Context, conn net.Conn, met
 		return shadowaead.ErrBadHeader
 	}
 	requestSalt := requestHeader[:s.keySaltLength]
-	if !s.replayFilter.Check(requestSalt) {
-		return ErrSaltNotUnique
-	}
 
 	var _eiHeader [aes.BlockSize]byte
 	eiHeader := _eiHeader[:]
@@ -194,6 +191,11 @@ func (s *MultiService[U]) NewConnection0(ctx context.Context, conn net.Conn, met
 	err = reader.ReadExternalChunk(requestHeader[s.keySaltLength+aes.BlockSize:])
 	if err != nil {
 		return err
+	}
+	// The salt goes into the replay filter only once the first chunk
+	// authenticated: anonymous garbage must not fill the filter.
+	if !s.replayFilter.Check(requestSalt) {
+		return ErrSaltNotUnique
 	}
 
 	headerType, err := rw.ReadByte(reader)
@@ -298,21 +300,23 @@ func (s *MultiService[U]) newPacket(ctx context.Context, conn N.PacketConn, buff
 		return E.New("invalid request")
 	}
 
-	var sessionId, packetId uint64
-	err := binary.Read(buffer, binary.BigEndian, &sessionId)
+	sessionId, err := readUint64(buffer)
 	if err != nil {
 		return err
 	}
-	err = binary.Read(buffer, binary.BigEndian, &packetId)
+	packetId, err := readUint64(buffer)
 	if err != nil {
 		return err
 	}
 
 	buffer.Advance(aes.BlockSize)
 
-	session, loaded := s.udpSessions.LoadOrStore(sessionId, func() *serverUDPSession {
-		return s.newUDPSession(uPSK)
-	})
+	session, loaded := s.udpSessions.Load(sessionId)
+	if !loaded {
+		session, loaded = s.udpSessions.LoadOrStore(sessionId, func() *serverUDPSession {
+			return s.newUDPSession(uPSK)
+		})
+	}
 	if !loaded {
 		session.remoteSessionId = sessionId
 		key := SessionKey(uPSK, packetHeader[:8], s.keySaltLength)
@@ -359,7 +363,7 @@ process:
 	}
 
 	var epoch uint64
-	err = binary.Read(buffer, binary.BigEndian, &epoch)
+	epoch, err = readUint64(buffer)
 	if err != nil {
 		goto returnErr
 	}
@@ -370,7 +374,7 @@ process:
 	}
 
 	var paddingLen uint16
-	err = binary.Read(buffer, binary.BigEndian, &paddingLen)
+	paddingLen, err = readUint16(buffer)
 	if err != nil {
 		err = E.Cause(err, "read padding length")
 		goto returnErr
@@ -384,9 +388,11 @@ process:
 
 	metadata.Protocol = "shadowsocks"
 	metadata.Destination = destination
-	s.udpNat.NewContextPacket(ctx, sessionId, buffer, metadata, func(natConn N.PacketConn) (context.Context, N.PacketWriter) {
-		return auth.ContextWithUser(ctx, user), &serverPacketWriter{s.Service, conn, natConn, session, users.uCipher[user]}
-	})
+	if !s.udpNat.Push(sessionId, buffer, destination) {
+		s.udpNat.NewContextPacket(ctx, sessionId, buffer, metadata, func(natConn N.PacketConn) (context.Context, N.PacketWriter) {
+			return auth.ContextWithUser(ctx, user), &serverPacketWriter{s.Service, conn, natConn, session, users.uCipher[user], M.SocksaddrFromNet(natConn.LocalAddr())}
+		})
+	}
 	return nil
 }
 

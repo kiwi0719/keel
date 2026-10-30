@@ -23,6 +23,10 @@ func init() {
 	protocols["vless"] = newVLESSInbound
 }
 
+// realityFallbackLimit caps the Reality handshake and any fallback relay to
+// dest, longer than real web servers keep an idle connection.
+const realityFallbackLimit = 5 * time.Minute
+
 // vlessInbound serves VLESS (optionally with the xtls-rprx-vision flow) over
 // Reality. Clients that fail Reality authentication are passed through to the
 // real dest site by utls, so probes see that site's certificate.
@@ -104,7 +108,11 @@ func newRealityConfig(c *RealityConfig) (*utls.RealityConfig, error) {
 }
 
 func (in *vlessInbound) serve(conn net.Conn) {
+	defer recoverConn("vless", conn)
 	source := M.SocksaddrFromNet(conn.RemoteAddr()).Unwrap()
+	// Unauthenticated clients are relayed to dest and end when dest ends
+	// them; this only bounds a relay dest itself never closes.
+	conn.SetDeadline(time.Now().Add(realityFallbackLimit))
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	tlsConn, err := utls.RealityServer(ctx, conn, in.reality)
 	cancel()
@@ -115,8 +123,19 @@ func (in *vlessInbound) serve(conn net.Conn) {
 		}
 		return
 	}
-	wrapped := &realityConn{Conn: tlsConn}
-	if err = in.service.Load().NewConnection(context.Background(), wrapped, source, nil); err != nil {
+	ctx = withHandshakeDeadline(context.Background(), conn)
+	prefix, err := checkVLESSRequest(tlsConn)
+	if err != nil {
+		tlsConn.Close()
+		if verbose {
+			log.Print("vless: request from ", source, ": ", err)
+		}
+		return
+	}
+	wrapped := &realityConn{Conn: tlsConn, prefix: prefix}
+	ctx, sess := withSession(ctx, wrapped)
+	defer sess.end()
+	if err = in.service.Load().NewConnection(ctx, wrapped, source, nil); err != nil {
 		wrapped.Close()
 		if verbose {
 			log.Print("vless: connection from ", source, ": ", err)
@@ -148,11 +167,21 @@ func (in *vlessInbound) close() error {
 // server leaks memory on half-closed connections.
 type realityConn struct {
 	*utls.Conn
+	prefix []byte // request bytes checkVLESSRequest already read
+}
+
+func (c *realityConn) Read(p []byte) (int, error) {
+	if len(c.prefix) > 0 {
+		n := copy(p, c.prefix)
+		c.prefix = c.prefix[n:]
+		return n, nil
+	}
+	return c.Conn.Read(p)
 }
 
 func (c *realityConn) Upstream() any           { return c.Conn }
 func (c *realityConn) CloseWrite() error       { return c.Close() }
-func (c *realityConn) ReaderReplaceable() bool { return true }
+func (c *realityConn) ReaderReplaceable() bool { return len(c.prefix) == 0 }
 func (c *realityConn) WriterReplaceable() bool { return true }
 
 var _ N.ReaderWithUpstream = (*realityConn)(nil)

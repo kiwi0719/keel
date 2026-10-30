@@ -30,8 +30,10 @@ var verbose bool
 
 const (
 	configRecheck = 2 * time.Second
-	quotaRecheck  = time.Second
-	saveInterval  = 10 * time.Second
+	quotaRecheck  = 250 * time.Millisecond // over-quota traffic is cut within this
+	// Shorter than the service's restart delay, so a crash loop cannot
+	// keep throwing away usage.
+	saveInterval = 2 * time.Second
 )
 
 func main() {
@@ -53,9 +55,10 @@ func main() {
 	flag.BoolVar(&verbose, "v", false, "log every connection")
 	flag.Parse()
 	log.Print("keel-node ", version, " protocols: ", builtProtocols())
+	setMemoryLimit()
 
 	certDir = filepath.Dir(*configPath)
-	n := &node{users: newRegistry(*statePath), running: make(map[string]*runningInbound), prober: newProber(), started: time.Now()}
+	n := &node{users: newRegistry(*statePath), running: make(map[string]*runningInbound), prober: newProber(), destProber: newProber(), started: time.Now()}
 	n.handler = &handler{users: n.users}
 	config, err := loadConfig(*configPath, *master == "")
 	n.strict = *master == ""
@@ -67,6 +70,7 @@ func main() {
 	default:
 		log.Fatal(err)
 	}
+	n.users.restoreUsage(config)
 	if err = n.reload(config); err != nil {
 		log.Fatal(err)
 	}
@@ -75,6 +79,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go n.prober.run(ctx)
+	go n.destProber.run(ctx)
 	go runHealthChecks(ctx)
 	masterConfigs := make(chan masterConfig)
 	if *master != "" {
@@ -105,6 +110,22 @@ func main() {
 	configTicker := time.NewTicker(configRecheck)
 	quotaTicker := time.NewTicker(quotaRecheck)
 	saveTicker := time.NewTicker(saveInterval)
+	// Saving writes and syncs a file, which can take a while on slow disks;
+	// it runs beside this loop so quota checks are never held up by it.
+	saveNow := make(chan struct{}, 1)
+	go func() {
+		for range saveNow {
+			if err := n.users.save(); err != nil {
+				log.Print("save usage: ", err)
+			}
+		}
+	}()
+	requestSave := func() {
+		select {
+		case saveNow <- struct{}{}:
+		default: // one is already pending
+		}
+	}
 	for {
 		select {
 		case sig := <-signals:
@@ -113,14 +134,27 @@ func main() {
 				n.reloadFile(*configPath)
 				continue
 			case syscall.SIGUSR1:
-				if err := n.users.save(); err != nil {
-					log.Print("save usage: ", err)
-				}
+				requestSave()
 				continue
 			}
 			n.shutdown()
 			return
 		case mc := <-masterConfigs:
+			if mc.revoke {
+				n.revoke(*configPath)
+				mc.result <- nil
+				continue
+			}
+			if mc.usage != nil {
+				if n.users.applyUsage(n.rev(), *mc.usage) {
+					if n.users.check(time.Now()) {
+						n.pushUsers()
+					}
+					requestSave()
+				}
+				mc.result <- nil
+				continue
+			}
 			err := n.applyMaster(mc.content, mc.rev, *configPath)
 			if stat, statErr := os.Stat(*configPath); statErr == nil {
 				configStat = stat // our own write must not trigger a reload
@@ -136,11 +170,10 @@ func main() {
 		case now := <-quotaTicker.C:
 			if n.users.check(now) {
 				n.pushUsers()
+				requestSave()
 			}
 		case <-saveTicker.C:
-			if err := n.users.save(); err != nil {
-				log.Print("save usage: ", err)
-			}
+			requestSave()
 			if verbose {
 				for _, u := range n.users.usage() {
 					log.Printf("usage %s up=%d down=%d conns=%d blocked=%v", u.Name, u.Up, u.Down, u.Conns, u.Blocked)
@@ -172,6 +205,7 @@ func (n *node) applyMaster(content []byte, rev int64, path string) error {
 	if err = n.reload(config); err != nil {
 		return err
 	}
+	n.users.forgetUsage()
 	if err = writeFileAtomic(path, content, 0o600); err != nil {
 		log.Print("cache config: ", err)
 	}
@@ -182,15 +216,62 @@ func (n *node) applyMaster(content []byte, rev int64, path string) error {
 	return nil
 }
 
+// revoke stops every inbound and drops every user, and removes the cached
+// config so a restart does not bring them back: the master has disowned
+// this node, and users disabled since can no longer be pushed to it.
+func (n *node) revoke(path string) {
+	if err := n.reload(&Config{}); err != nil {
+		log.Print("revoke: ", err)
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		log.Print("revoke: ", err)
+	}
+	log.Print("master: token rejected for ", revokeAfter, "; stopped serving. Reinstall the node with a new token to bring it back.")
+}
+
+// writeFileAtomic replaces path with content: a new, uniquely named file in
+// the same directory (never an existing file or link someone left there),
+// flushed to disk before it takes the name, so a crash leaves either the old
+// file or the new one, never a truncated one.
 func writeFileAtomic(path string, content []byte, perm os.FileMode) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	return replaceFile(path, content, perm, true)
+}
+
+// replaceFile is writeFileAtomic; without durable it skips the two fsyncs,
+// for files that need not survive a crash (status.json).
+func replaceFile(path string, content []byte, perm os.FileMode, durable bool) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, content, perm); err != nil {
+	f, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	tmp := f.Name()
+	defer os.Remove(tmp) // no-op once renamed
+	if err = f.Chmod(perm); err == nil {
+		if _, err = f.Write(content); err == nil && durable {
+			err = f.Sync()
+		}
+	}
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	if err = os.Rename(tmp, path); err != nil {
+		return err
+	}
+	if !durable {
+		return nil
+	}
+	if d, err := os.Open(dir); err == nil {
+		d.Sync()
+		d.Close()
+	}
+	return nil
 }
 
 type node struct {
@@ -201,7 +282,9 @@ type node struct {
 	users   *registry
 	handler *handler
 	prober  *prober
-	config  atomic.Pointer[Config]
+	// destProber times the REALITY dest candidates of the config.
+	destProber *prober
+	config     atomic.Pointer[Config]
 	// masterState is the master connection, for the status file; nil
 	// without -master.
 	masterState atomic.Pointer[MasterState]
@@ -240,6 +323,7 @@ func (n *node) reloadFile(path string) {
 		log.Print("reload: ", err, " (keeping current config)")
 		return
 	}
+	n.users.restoreUsage(config)
 	if err = n.reload(config); err != nil {
 		log.Print("reload: ", err, " (keeping current config)")
 		return
@@ -260,6 +344,7 @@ func (n *node) reload(config *Config) error {
 	currentRouter.Store(r)
 	n.config.Store(config)
 	n.prober.setTargets(config.Probes, config.Route.IPv4Only, time.Duration(config.ProbeInterval))
+	n.destProber.setTargets(destTargets(config.DestProbes), config.Route.IPv4Only, destProbeInterval)
 	n.failed = make(map[string]string)
 	n.users.apply(config.Users)
 	active := n.users.active()

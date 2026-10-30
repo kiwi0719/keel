@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -14,16 +15,23 @@ import (
 // structure over its control connection.
 type Config struct {
 	// Rev is set by the master; a node reports the rev it runs.
-	Rev       int64            `json:"rev,omitempty"`
-	Route     RouteConfig      `json:"route"`
-	Outbounds []OutboundConfig `json:"outbounds,omitempty"`
-	Inbounds  []InboundConfig  `json:"inbounds"`
-	Users     []UserConfig     `json:"users"`
+	Rev int64 `json:"rev,omitempty"`
+	// MasterSPKI is the SHA-256 (hex) of the master's public key. The node
+	// accepts a master certificate with this key as well as the -fingerprint
+	// one, so the master can move to a CA certificate for the same key.
+	MasterSPKI string           `json:"master_spki,omitempty"`
+	Route      RouteConfig      `json:"route"`
+	Outbounds  []OutboundConfig `json:"outbounds,omitempty"`
+	Inbounds   []InboundConfig  `json:"inbounds"`
+	Users      []UserConfig     `json:"users"`
 	// Probes are TCPing targets (China Telecom / Unicom / Mobile) reported
 	// with latency, jitter and loss.
 	Probes []ProbeTarget `json:"probes,omitempty"`
 	// ProbeInterval is the time between probe rounds; default 30s.
 	ProbeInterval Duration `json:"probe_interval,omitempty"`
+	// DestProbes are sites (host:port) a REALITY inbound could borrow, timed
+	// every destProbeInterval so the panel can offer the nearest.
+	DestProbes []string `json:"dest_probes,omitempty"`
 }
 
 // RouteConfig picks an outbound for each connection: the first rule whose
@@ -100,8 +108,28 @@ type OutboundConfig struct {
 	// of SS 2022 UDP packets.
 	UDPOverTCP bool `json:"udp_over_tcp,omitempty"`
 
-	// vless: a third-party VLESS server over plain TCP (no TLS, no flow).
-	UUID string `json:"uuid,omitempty"`
+	// vless: a third-party VLESS server (no flow), over TLS when TLS is set,
+	// else plain TCP.
+	UUID    string                 `json:"uuid,omitempty"`
+	Flow    string                 `json:"flow,omitempty"` // "" or "xtls-rprx-vision"
+	TLS     *OutboundTLSConfig     `json:"tls,omitempty"`
+	Reality *OutboundRealityConfig `json:"reality,omitempty"`
+}
+
+// OutboundRealityConfig connects to a VLESS server behind REALITY: the
+// server's X25519 public key (base64url), a short ID, the borrowed site's
+// name and the TLS fingerprint to present.
+type OutboundRealityConfig struct {
+	ServerName  string `json:"server_name"`
+	PublicKey   string `json:"public_key"`
+	ShortID     string `json:"short_id,omitempty"`
+	Fingerprint string `json:"fingerprint,omitempty"`
+}
+
+// OutboundTLSConfig makes an outbound connect over TLS, verifying the
+// server's certificate (system roots) for ServerName.
+type OutboundTLSConfig struct {
+	ServerName string `json:"server_name"`
 }
 
 // InboundConfig describes one listener. Which fields apply depends on Type.
@@ -165,6 +193,9 @@ type UserConfig struct {
 	// UsedBase is traffic the master already knows about for this period
 	// (e.g. used on this node before a reinstall); counted toward the quota.
 	UsedBase int64 `json:"used_base,omitempty"`
+	// UsedSelf is what the master has recorded from this node for this
+	// period; the node's own counters never start below it.
+	UsedSelf int64 `json:"used_self,omitempty"`
 }
 
 // Key identifies a listener across reloads: the same key with the same
@@ -253,6 +284,8 @@ func (c *Config) validate() error {
 	}
 	if u := c.Route.HealthCheck.URL; u != "" && !strings.HasPrefix(u, "http://") {
 		return fmt.Errorf("route health_check url must be plain http://, got %q", u)
+	} else if parsed, err := url.Parse(u); u != "" && (err != nil || parsed.Host == "") {
+		return fmt.Errorf("route health_check url %q is not a valid URL", u)
 	}
 	keys := make(map[string]bool)
 	for _, inbound := range c.Inbounds {
@@ -264,6 +297,10 @@ func (c *Config) validate() error {
 		}
 		if inbound.ACME != nil && inbound.ServerName == "" {
 			return fmt.Errorf("inbound %s: acme needs server_name", inbound.Listen)
+		}
+		// The name becomes file names under the certificate directory.
+		if inbound.ACME != nil && !isDNSName(inbound.ServerName) {
+			return fmt.Errorf("inbound %s: acme server_name %q is not a domain name", inbound.Listen, inbound.ServerName)
 		}
 		if keys[inbound.ID()] {
 			return fmt.Errorf("duplicate inbound %s", inbound.ID())
@@ -301,4 +338,23 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 	}
 	*d = Duration(v)
 	return nil
+}
+
+// isDNSName reports a plain domain name: letters, digits, hyphens and dots,
+// no empty or leading-hyphen labels.
+func isDNSName(name string) bool {
+	if len(name) == 0 || len(name) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(name, ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' {
+			return false
+		}
+		for _, c := range label {
+			if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-') {
+				return false
+			}
+		}
+	}
+	return true
 }

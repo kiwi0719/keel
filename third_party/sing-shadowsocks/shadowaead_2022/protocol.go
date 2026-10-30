@@ -146,6 +146,16 @@ func New(method string, pskList [][]byte, timeFunc func() time.Time) (shadowsock
 		}
 	}
 
+	if m.blockConstructor != nil {
+		for _, psk := range pskList[:len(pskList)-1] {
+			b, err := m.blockConstructor(psk)
+			if err != nil {
+				return nil, err
+			}
+			m.identityCiphers = append(m.identityCiphers, b)
+		}
+	}
+
 	m.pskList = pskList
 	return m, nil
 }
@@ -186,6 +196,9 @@ type Method struct {
 	udpBlockDecryptCipher cipher.Block
 	pskList               [][]byte
 	pskHash               []byte
+	// identityCiphers[i] encrypts the i-th identity header of a UDP packet
+	// (keyed by pskList[i]); built once instead of per packet.
+	identityCiphers []cipher.Block
 }
 
 func (m *Method) Name() string {
@@ -220,6 +233,7 @@ type clientConn struct {
 	requestSalt []byte
 	reader      *shadowaead.Reader
 	writer      *shadowaead.Writer
+	readWait    N.ReadWaitOptions
 }
 
 func (m *Method) time() time.Time {
@@ -303,7 +317,7 @@ func (c *clientConn) writeRequest(payload []byte) error {
 	}
 	common.Must(binary.Write(variableLengthBuffer, binary.BigEndian, uint16(paddingLen)))
 	if paddingLen > 0 {
-		variableLengthBuffer.Extend(paddingLen)
+		common.Must(variableLengthBuffer.WriteZeroN(paddingLen))
 	}
 	if payloadLen > 0 {
 		common.Must1(variableLengthBuffer.Write(payload[:payloadLen]))
@@ -312,6 +326,7 @@ func (c *clientConn) writeRequest(payload []byte) error {
 	variableLengthBuffer.Release()
 
 	err = writer.BufferedWriter(header.Len()).Flush()
+	writer.Release()
 	if err != nil {
 		return E.Cause(err, "client handshake")
 	}
@@ -424,19 +439,36 @@ func (c *clientConn) Write(p []byte) (n int, err error) {
 	return c.writer.Write(p)
 }
 
-var _ N.VectorisedWriter = (*clientConn)(nil)
+func (c *clientConn) InitializeReadWaiter(options N.ReadWaitOptions) (needCopy bool) {
+	c.readWait = options
+	return false
+}
 
-func (c *clientConn) WriteVectorised(buffers []*buf.Buffer) error {
-	if c.writer != nil {
-		return c.writer.WriteVectorised(buffers)
+// WaitReadBuffer opens each chunk in a buffer of its own, so a copy needs no
+// buffer of its own while it waits.
+func (c *clientConn) WaitReadBuffer() (*buf.Buffer, error) {
+	if err := c.readResponse(); err != nil {
+		return nil, err
 	}
-	err := c.writeRequest(buffers[0].Bytes())
-	if err != nil {
-		buf.ReleaseMulti(buffers)
+	return c.reader.ReadBuffer(c.readWait)
+}
+
+// WriteBuffer seals in the caller's buffer once the request header is out.
+func (c *clientConn) WriteBuffer(buffer *buf.Buffer) error {
+	if c.writer == nil {
+		defer buffer.Release()
+		_, err := c.Write(buffer.Bytes())
 		return err
 	}
-	buffers[0].Release()
-	return c.writer.WriteVectorised(buffers[1:])
+	return c.writer.WriteBuffer(buffer)
+}
+
+func (c *clientConn) FrontHeadroom() int {
+	return shadowaead.PacketLengthBufferSize + shadowaead.Overhead
+}
+
+func (c *clientConn) RearHeadroom() int {
+	return shadowaead.Overhead
 }
 
 func (c *clientConn) NeedHandshake() bool {
@@ -506,17 +538,13 @@ func (c *clientPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksad
 	)
 
 	if c.udpCipher == nil && pskLen > 1 {
-		for i, psk := range c.pskList {
+		for i := range c.pskList {
 			dataIndex += aes.BlockSize
 			pskHash := c.pskHash[aes.BlockSize*i : aes.BlockSize*(i+1)]
 
 			identityHeader := header.Extend(aes.BlockSize)
 			xorWords(identityHeader, pskHash, header.To(aes.BlockSize))
-			b, err := c.blockConstructor(psk)
-			if err != nil {
-				return err
-			}
-			b.Encrypt(identityHeader, identityHeader)
+			c.identityCiphers[i].Encrypt(identityHeader, identityHeader)
 
 			if i == pskLen-2 {
 				break
@@ -530,7 +558,7 @@ func (c *clientPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksad
 	)
 
 	if paddingLen > 0 {
-		header.Extend(paddingLen)
+		common.Must(header.WriteZeroN(paddingLen))
 	}
 
 	err := M.SocksaddrSerializer.WriteAddrPort(header, destination)
@@ -739,17 +767,13 @@ func (c *clientPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	)
 
 	if c.udpCipher == nil && pskLen > 1 {
-		for i, psk := range c.pskList {
+		for i := range c.pskList {
 			dataIndex += aes.BlockSize
 			pskHash := c.pskHash[aes.BlockSize*i : aes.BlockSize*(i+1)]
 
 			identityHeader := buffer.Extend(aes.BlockSize)
 			xorWords(identityHeader, pskHash, buffer.To(aes.BlockSize))
-			b, err := c.blockConstructor(psk)
-			if err != nil {
-				return 0, err
-			}
-			b.Encrypt(identityHeader, identityHeader)
+			c.identityCiphers[i].Encrypt(identityHeader, identityHeader)
 
 			if i == pskLen-2 {
 				break
@@ -763,7 +787,7 @@ func (c *clientPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	)
 
 	if paddingLen > 0 {
-		buffer.Extend(paddingLen)
+		common.Must(buffer.WriteZeroN(paddingLen))
 	}
 
 	err = M.SocksaddrSerializer.WriteAddrPort(buffer, destination)

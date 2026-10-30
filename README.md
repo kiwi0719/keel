@@ -14,8 +14,8 @@
 | 协议 | 库 |
 | --- | --- |
 | AnyTLS | `third_party/sing-anytls`（改过的 sing-anytls，改动见其 MODIFICATIONS.md） |
-| VLESS + Vision | sing-vmess/vless |
-| Reality 服务端 | metacubex/utls（和 sing-box 用的是同一个） |
+| VLESS + Vision | `third_party/sing-vmess`（改过的 sing-vmess，修了几处会让进程崩溃的解析问题） |
+| Reality 服务端 | `third_party/utls`（改过的 metacubex/utls：回落连接转发关闭、补上 Go 的 KeyUpdate 修复） |
 | SS 2022 多用户服务端和客户端 | `third_party/sing-shadowsocks`（修了多用户表的并发问题） |
 
 ### 构建
@@ -73,7 +73,7 @@ keel-node  1a2b3c4 （2026-10-22 21:08 提交）
 
 - 配置文件改了会在 2 秒内自动重新加载，`kill -HUP` 可以立刻生效。设置没变的监听保持不动；改了或删掉的监听停止接新连接，已经建立的连接不受影响。
 - 每个用户可以有三种凭据（`anytls_password`、`uuid`+`flow`、`ss_key`），缺哪个就不能用哪个协议。SS 2022 客户端的密码写成 `服务端password:用户ss_key`。
-- `quota_bytes` 按上行加下行算，超额后 1 秒内断开并拒绝新连接；`expire_at` 是 unix 秒数。`period` 一变，这个用户的计数就从零开始（每月重置就靠主控下发新的 period）。
+- `quota_bytes` 按上行加下行算，超额后 0.25 秒内断开并拒绝新连接；`expire_at` 是 unix 秒数。`period` 一变，这个用户的计数就从零开始（每月重置就靠主控下发新的 period）。
 - 计数每 10 秒和退出时写入 `-state` 文件，重启后同一 period 的计数接着算；`kill -USR1` 立刻写一次。
 - 删除用户会断开他所有正在用的连接。
 - `outbounds` 里定义出口：`ss2022`（连出口节点，`password` 写 `出口password:入口的ss_key`；`method` 也可以是 aes-128/256-gcm、chacha20-ietf-poly1305 这类普通加密，连第三方 SS，`password` 就是普通密码；`udp_over_tcp` 让 UDP 走 TCP 连接，适合入口到出口之间 UDP 不稳的线路）、`socks`（比如本机 sslocal 走家宽落地）和 `vless`（第三方 VLESS 上游，明文 TCP、不带 TLS，只填 `server` 和 `uuid`，UDP 走 XUDP）。`direct` 是内置的直连。
@@ -113,7 +113,7 @@ Xray 的 Reality 服务端从 2026 年 9 月起要求客户端带 X25519MLKEM768
 
 ## keel-master
 
-一个进程：网页面板、SQLite、订阅链接、节点控制通道，全在同一个 HTTPS 端口上。release 构建 3.5 MB，带两个节点、面板每 2 秒刷新时常驻内存约 7 MB。
+一个进程：网页面板、SQLite、订阅链接、节点控制通道，全在同一个 HTTPS 端口上。release 构建 3.5 MB。常驻内存（macOS 上实测）：空闲约 5 MB；200 个用户、两个节点在线、面板每 2 秒刷新时约 27 MB；每次登录校验密码（argon2）要临时多用 19 MiB；2000 个用户、16 个节点在线、两个面板标签页在刷新时 130–150 MB。
 
 ### 构建和启动
 
@@ -123,7 +123,8 @@ keel-master -data /var/lib/keel-master -listen 0.0.0.0:8443
 ```
 
 - 面板用用户名 + 密码登录。第一次启动会在日志里打印 `admin` 和一个随机密码，进去后在「设置」里改；也可以在服务器上 `keel-master -data ... -user 用户名 -password -`（密码从标准输入读，不留在命令历史里）。改完所有已登录的会话都会失效。
-- 不给证书时会在 `数据目录/tls/` 生成自签证书，节点按指纹认它（安装命令里自动带上），浏览器会提示不安全。有域名证书就用 `-cert fullchain.pem -key key.pem`；放在 Caddy / nginx 后面就用 `-no-tls -listen 127.0.0.1:8080`（反代要转发 WebSocket）。
+- 不给证书时会在 `数据目录/tls/` 生成自签证书，节点按指纹认它（安装命令里自动带上），浏览器会提示不安全。这时第一次登录前请在浏览器的证书详情里核对 SHA-256 指纹，和启动日志里 `certificate SHA-256` 那一行一致才输入密码：自签证书挡不住路上的中间人，点过警告就等于把密码交给对方。长期使用建议换成受信任的证书：有域名证书就用 `-cert fullchain.pem -key key.pem`；放在 Caddy / nginx 后面就用 `-no-tls -listen 127.0.0.1:8080`（反代要转发 WebSocket，并设置 `X-Forwarded-Proto`，或者在「设置」里填面板地址）；也可以只让面板监听 127.0.0.1，用 `ssh -L` 隧道访问。
+- 用 systemd 跑主控可以参考 [master/keel-master.service](master/keel-master.service)：主控遇到任何 panic 都会直接退出，一定要有 `Restart=always` 这样的守护。
 - 数据库是 `数据目录/keel.db`（WAL 模式，备份时连 `-wal`、`-shm` 一起拷，或者先停服务）。
 - 节点安装脚本从主控下载 keel-node：把 `make node-linux` 编出来的文件改名放进 `数据目录/dist/`，叫 `keel-node-linux-amd64`、`keel-node-linux-arm64`。
 
@@ -143,4 +144,4 @@ keel-master -data /var/lib/keel-master -listen 0.0.0.0:8443
 
 ## 许可
 
-GPL-3.0，和所依赖的 sing 系列库一致。`third_party/` 下是改过的 sing-anytls 和 sing-shadowsocks，改动各见其 MODIFICATIONS.md。
+GPL-3.0，和所依赖的 sing 系列库一致。`third_party/` 下是改过的 sing-anytls、sing-shadowsocks、sing-vmess 和 utls，改动各见其 MODIFICATIONS.md。

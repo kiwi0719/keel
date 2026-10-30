@@ -8,13 +8,13 @@ import (
 	"net/netip"
 
 	"github.com/sagernet/sing-shadowsocks"
+	"github.com/sagernet/sing-shadowsocks/internal/udpnat"
 	"github.com/sagernet/sing/common/auth"
 	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/rw"
-	"github.com/sagernet/sing/common/udpnat"
 )
 
 var _ shadowsocks.MultiService[int] = (*MultiService[int])(nil)

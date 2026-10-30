@@ -33,11 +33,18 @@ type handler struct {
 }
 
 func (h *handler) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
+	defer recoverConn("handler", conn)
+	clearHandshakeDeadline(ctx)
 	user := h.user(ctx)
 	if user == nil {
 		N.CloseOnHandshakeFailure(conn, onClose, errUserInactive)
 		return
 	}
+	if user.full() {
+		N.CloseOnHandshakeFailure(conn, onClose, errTooManyConns)
+		return
+	}
+	trackSession(ctx, user)
 	untrack := user.track(conn)
 	defer untrack()
 	defer N.CloseOnHandshakeFailure(conn, onClose, nil)
@@ -62,11 +69,18 @@ func (h *handler) NewConnectionEx(ctx context.Context, conn net.Conn, source M.S
 }
 
 func (h *handler) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
+	defer recoverConn("handler", conn)
+	clearHandshakeDeadline(ctx)
 	user := h.user(ctx)
 	if user == nil {
 		N.CloseOnHandshakeFailure(conn, onClose, errUserInactive)
 		return
 	}
+	if user.full() {
+		N.CloseOnHandshakeFailure(conn, onClose, errTooManyConns)
+		return
+	}
+	trackSession(ctx, user)
 	untrack := user.track(conn)
 	defer untrack()
 	defer N.CloseOnHandshakeFailure(conn, onClose, nil)

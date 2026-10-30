@@ -21,6 +21,7 @@ const ( // cmds — standard anytls wire values (compatible with stock clients)
 
 const (
 	headerOverHeadSize = 1 + 4 + 2
+	maxFrameData       = 65535 // what a frame's 16-bit length allows
 )
 
 // frame defines a packet from or to be multiplexed into a single connection
