@@ -32,12 +32,16 @@ use app::{App, TlsInfo};
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
 
-/// index.html with app.js tagged by its hash, so a cache in front (Cloudflare
-/// keeps it for hours whatever no-cache says) never serves a stale panel.
+/// index.html with app.js and app.css tagged by their hashes, so a cache in
+/// front (Cloudflare keeps them for hours whatever no-cache says) never serves
+/// a stale panel.
 static INDEX: std::sync::LazyLock<&'static str> = std::sync::LazyLock::new(|| {
     use sha2::Digest;
-    let tag: String = sha2::Sha256::digest(APP_JS.as_bytes())[..6].iter().map(|b| format!("{b:02x}")).collect();
-    Box::leak(INDEX_HTML.replace("src=\"/app.js\"", &format!("src=\"/app.js?v={tag}\"")).into_boxed_str())
+    let tag = |s: &str| -> String { sha2::Sha256::digest(s.as_bytes())[..6].iter().map(|b| format!("{b:02x}")).collect() };
+    let html = INDEX_HTML
+        .replace("src=\"/app.js\"", &format!("src=\"/app.js?v={}\"", tag(APP_JS)))
+        .replace("href=\"/app.css\"", &format!("href=\"/app.css?v={}\"", tag(APP_CSS)));
+    Box::leak(html.into_boxed_str())
 });
 const APP_JS: &str = include_str!("../web/app.js");
 const APP_CSS: &str = include_str!("../web/app.css");
